@@ -48,6 +48,13 @@ def main(argv=None) -> int:
     pre = cfg.get("preprocess", {}) or {}
     hu_lo, hu_hi = (float(x) for x in pre.get("hu_clip", [-1000.0, 1000.0]))
     target_spacing = [float(s) for s in pre.get("target_spacing", [1.0, 1.0, 1.0])]
+    # cache 影像类型：uint16 = 已归一化到 [0,1] 后按 1/65535 量化（默认）；
+    #                float32 = 未归一化的 HU（clip 到 hu_clip 之后）
+    expect_out_dtype = str(pre.get("image_out_dtype", "uint16")).lower()
+    if expect_out_dtype == "uint16":
+        expect_nib_dtype, val_lo, val_hi, val_desc = "uint16", 0.0, 65535.0, "归一化值 [0,1]（×65535）"
+    else:
+        expect_nib_dtype, val_lo, val_hi, val_desc = "float32", hu_lo, hu_hi, f"HU [{hu_lo}, {hu_hi}]"
 
     cache_dir = resolve_path(args.cache_dir or paths.get("cache", "cache"))
     image_dir, label_dir = cache_dir / "image", cache_dir / "label"
@@ -84,17 +91,27 @@ def main(argv=None) -> int:
 
         per_slice = lab.reshape(-1, lab.shape[2]).sum(axis=0)
         uniq = np.unique(lab)
+        img_dtype = str(img.get_data_dtype())
+        if img_dtype == "uint16":
+            value_range = (0.0, 1.0)
+        elif img_dtype in ("float32", "float64"):
+            value_range = (float(arr.min()), float(arr.max()))
+        else:
+            value_range = (float("nan"), float("nan"))
+
         row = {
             "case": case,
             "shape_zyx": tuple(int(s) for s in arr.shape),
             "spacing": zooms,
-            "dtype": str(img.get_data_dtype()),
+            "dtype": img_dtype,
             "label_dtype": str(lab_img.get_data_dtype()),
             "label_values": uniq.tolist()[:5],
             "tumor_voxels": int((lab > 0).sum()),
             "tumor_slices": int((per_slice > 0).sum()),
             "img_min": round(float(arr.min()), 2),
             "img_max": round(float(arr.max()), 2),
+            "value_min": round(value_range[0], 4),
+            "value_max": round(value_range[1], 4),
             "nan": int(np.count_nonzero(~np.isfinite(np.asarray(arr, dtype=np.float32)))),
         }
         rows.append(row)
@@ -104,13 +121,16 @@ def main(argv=None) -> int:
         if zooms != tuple(round(s, 4) for s in target_spacing) or lab_zooms != zooms:
             problems.append(f"case {case}：spacing image={zooms} label={lab_zooms}，"
                             f"期望 {tuple(round(s, 4) for s in target_spacing)}")
+        if img_dtype != expect_nib_dtype:
+            problems.append(f"case {case}：image dtype={img_dtype}，"
+                            f"与 config 的 image_out_dtype={expect_out_dtype} 不符")
         if len(uniq) and (int(uniq.max()) > 1 or int(uniq.min()) < 0):
             problems.append(f"case {case}：label 取值 {uniq.tolist()[:5]} 不是 0/1 二值")
         if row["nan"]:
             problems.append(f"case {case}：影像里有 {row['nan']} 个非有限值")
-        if row["img_min"] < hu_lo - 1e-3 or row["img_max"] > hu_hi + 1e-3:
-            problems.append(f"case {case}：影像范围 [{row['img_min']}, {row['img_max']}] "
-                            f"超出全局窗 [{hu_lo}, {hu_hi}]")
+        if row["img_min"] < val_lo - 1e-3 or row["img_max"] > val_hi + 1e-3:
+            problems.append(f"case {case}：影像取值 [{row['img_min']}, {row['img_max']}] "
+                            f"超出期望范围 {val_desc}")
         if case in {str(c) for c in manifest_cases}:
             rec = manifest_cases[int(case)]
             if list(row["shape_zyx"]) != [int(s) for s in rec["shape_zyx"]]:
@@ -138,6 +158,9 @@ def main(argv=None) -> int:
         "voxels_total": sum(int(np.prod(r["shape_zyx"])) for r in rows),
         "img_min_overall": min((r["img_min"] for r in rows), default=None),
         "img_max_overall": max((r["img_max"] for r in rows), default=None),
+        "image_out_dtype": expect_out_dtype,
+        "value_range_expected": val_desc,
+        "quant_step_hu": round((hu_hi - hu_lo) / 65535.0, 6) if expect_out_dtype == "uint16" else None,
         "problems": problems,
         "rows": rows,
     }
@@ -153,15 +176,20 @@ def main(argv=None) -> int:
     LOGGER.info("面内尺寸分布：%s", summary["inplane_shapes"])
     LOGGER.info("切片数范围：%d - %d；含肿瘤切片合计 %d",
                 summary["n_slices_min"], summary["n_slices_max"], summary["tumor_slices_total"])
-    LOGGER.info("影像值域（全体）：[%s, %s]", summary["img_min_overall"], summary["img_max_overall"])
+    LOGGER.info("影像原始值域（全体）：[%s, %s]，期望 %s",
+                summary["img_min_overall"], summary["img_max_overall"], val_desc)
+    if summary["quant_step_hu"] is not None:
+        LOGGER.info("uint16 量化步长：%.6f HU/级（越小越好，理论下限由 hu_clip 跨度决定）",
+                    summary["quant_step_hu"])
+        LOGGER.info("  即 dataset.py 里 image.float()/65535 得到 [0,1]，等价于 HU 窗 [-1000,1000]")
 
     if not args.quiet:
         LOGGER.info("")
-        LOGGER.info("case | shape_zyx | spacing | dtype | label 值 | tumor_voxels | tumor_slices | img_min | img_max")
+        LOGGER.info("case | shape_zyx | spacing | dtype | label 值 | tumor_voxels | tumor_slices | 归一化后 [0,1] 值域")
         for r in rows:
-            LOGGER.info("%s | %s | %s | %s | %s | %d | %d | %s | %s",
+            LOGGER.info("%s | %s | %s | %s | %s | %d | %d | [%s, %s]",
                         r["case"], r["shape_zyx"], r["spacing"], r["dtype"], r["label_values"],
-                        r["tumor_voxels"], r["tumor_slices"], r["img_min"], r["img_max"])
+                        r["tumor_voxels"], r["tumor_slices"], r["value_min"], r["value_max"])
 
     LOGGER.info("体检报告：%s", rel_to_root(json_path))
     if problems:

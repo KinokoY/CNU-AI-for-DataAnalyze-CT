@@ -2,10 +2,10 @@
 
 整体功能：剔除 data/exclude_cases.json 中的病例（48-52 几何错位）→ 把地板值 padding 夹到 -1000 →
         统一 RAS → 重采样到 1x1x1mm（影像线性 / 掩膜最近邻）→ 按全局窗 clip(-1000,1000) →
-        影像存 float16 HU、掩膜只保留 label 2 存 uint8 到 cache/，同时产出可粘贴的统计报告。
+        影像按缓存口径转成归一化 uint16、掩膜只保留 label 2 存 uint8 到 cache/，同时产出可粘贴的统计报告。
 前后接口：上游是 data/volume-<id>.nii + segmentation-<id>.nii 与 configs/default.yaml；
         下游给 scripts/make_splits.py 提供 reports/preprocess_stats.json、给 src/dataset.py 提供 cache/
-        （cache 里是未归一化的 HU，归一化到 [0,1] 在 dataset.py 里做）。
+        （cache 里影像是 uint16 的 [0,1] 归一化值，除以 65535 即为 [0,1]）。
 用法：在仓库根目录执行 ``python scripts/preprocess.py``；快速自检 ``python scripts/preprocess.py --debug``。
 """
 
@@ -59,7 +59,7 @@ DEFAULTS = {
     "floor_margin": 1.0,
     "hu_clip": [-1000.0, 1000.0],
     "floor_clamp_value": -1000.0,
-    "image_out_dtype": "float16",
+    "image_out_dtype": "uint16",
 }
 
 
@@ -240,7 +240,11 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     hu_lo, hu_hi = (float(x) for x in pre["hu_clip"])
     margin = float(pre["floor_margin"])
     clamp_to = float(pre["floor_clamp_value"])
-    out_dtype = str(pre["image_out_dtype"])
+    out_dtype = str(pre["image_out_dtype"]).lower()
+    if out_dtype not in ("float32", "uint16"):
+        # SimpleITK 没有 float16 像素类型；这里显式拦掉错误配置而不是留到 WriteImage 才炸
+        raise ValueError(f"preprocess.image_out_dtype 只支持 'float32' 或 'uint16'，收到 {out_dtype!r}"
+                         f"（注意 SimpleITK 没有 float16 像素类型）")
 
     rec: dict = {"case": case_id, "status": "OK", "error": ""}
     step(f"读取影像 {vol_path.name}")
@@ -318,16 +322,28 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     #    所以这里不需要转成 nibabel 的 (x,y,z) 视图。
     mask_sitk = sitk.GetImageFromArray(seg_arr.astype(np.uint8))
     mask_sitk.CopyInformation(seg_rs)
-    image_for_origin = sitk.GetImageFromArray(img_arr.astype(np.float32))
-    image_for_origin.CopyInformation(img_rs)
     seg_labels = seg_img = seg_rs = None  # 大对象尽早释放，降低峰值内存
+
+    if out_dtype == "float32":
+        # 直接存 clip 后的 HU，归一化留给 dataset.py
+        image_to_write = sitk.GetImageFromArray(img_arr.astype(np.float32))
+    else:
+        # 存「已归一化」的 uint16：窗内 HU 线性映射到 [0,1] 后按 1/65535 量化。
+        # 这样 cache 与训练口径完全一致（dataset.py 只需 /65535 还原到 [0,1]），
+        # 且 uint16 是 SITK/NIfTI 原生支持的类型（SITK 没有 float16 像素类型）。
+        norm_arr = (img_arr.astype(np.float32) - hu_lo) / max(1e-6, (hu_hi - hu_lo))
+        np.clip(norm_arr, 0.0, 1.0, out=norm_arr)
+        image_to_write = sitk.GetImageFromArray(np.rint(norm_arr * 65535.0).astype(np.uint16))
+        rec["image_quant_step_hu"] = round(float((hu_hi - hu_lo) / 65535.0), 6)
+    image_to_write.CopyInformation(img_rs)
+
     # 影像与掩膜使用同一套 origin（都前移到前景最小角），下游重建整卷时按索引对齐即可，
     # 不必再关心 affine：两卷的世界坐标差是常数偏移。
-    image_with_origin, shift_ijk = crop_origin_to_nonzero(image_for_origin, seg_arr)
+    image_with_origin, shift_ijk = crop_origin_to_nonzero(image_to_write, seg_arr)
     mask_with_origin, _ = crop_origin_to_nonzero(mask_sitk, seg_arr)
     rec["origin_shift_ijk"] = list(shift_ijk)
 
-    step("写 cache（SITK native (z,y,x) 布局）")
+    step(f"写 cache（SITK native (z,y,x) 布局，image dtype={image_with_origin.GetPixelIDTypeAsString()}）")
     image_dir = cache_dir / "image"
     label_dir = cache_dir / "label"
     image_dir.mkdir(parents=True, exist_ok=True)
@@ -336,8 +352,7 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     image_writer = sitk.ImageFileWriter()
     image_writer.SetFileName(str(image_dir / f"{case_id}.nii.gz"))
     image_writer.SetUseCompression(True)
-    image_writer.Execute(sitk.Cast(image_with_origin, sitk.sitkFloat32)
-                         if out_dtype == "float32" else sitk.Cast(image_with_origin, sitk.sitkFloat16))
+    image_writer.Execute(image_with_origin)
 
     label_writer = sitk.ImageFileWriter()
     label_writer.SetFileName(str(label_dir / f"{case_id}.nii.gz"))
@@ -521,6 +536,11 @@ def main(argv=None) -> int:
     cfg = load_config(args.config, args.overrides)
     pre = dict(DEFAULTS)
     pre.update(cfg.get("preprocess", {}) or {})
+    # 早失败：配置里写错类型时不要等到第 1 例处理到最后一步才炸
+    if str(pre["image_out_dtype"]).lower() not in ("float32", "uint16"):
+        LOGGER.error("preprocess.image_out_dtype 只支持 'float32' 或 'uint16'，收到 %r"
+                     "（注意 SimpleITK 没有 float16 像素类型）", pre["image_out_dtype"])
+        return 2
     paths = cfg.get("paths", {}) or {}
 
     data_dir = resolve_path(args.data_dir or paths.get("data", "data"))

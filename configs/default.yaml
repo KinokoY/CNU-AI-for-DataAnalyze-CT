@@ -20,7 +20,10 @@ preprocess:
   floor_margin: 1.0               # 与体素最小值相差不超过该值的体素视为「卷外 padding 地板」
   hu_clip: [-1000.0, 1000.0]      # 全局窗：地板值（-1024/-2048/-3024）夹到 -1000，上界 1000
   floor_clamp_value: -1000.0      # 地板体素夹到的目标值
-  image_out_dtype: float16        # cache 中影像以 float16 存 HU（归一化在 dataset.py 里做）
+  image_out_dtype: uint16         # cache 影像类型：只支持 float32 / uint16
+                                  #   uint16 时把窗内 HU 线性映射到 [0,1] 后按 1/65535 量化存储
+                                  #   （1 步长约 0.03 HU，精度优于 int16 方案），dataset.py 里 /65535 还原
+                                  #   注意：SimpleITK 没有 float16 像素类型，不要填 float16
 
 # ---------- 模型 ----------
 model:
