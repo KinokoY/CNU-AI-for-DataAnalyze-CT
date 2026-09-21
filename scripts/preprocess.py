@@ -131,12 +131,24 @@ def load_as_float(volume_path: Path):
 
 def load_mask_binary(seg_path: Path, label: int = 2):
     """读取掩膜并只保留指定 label（默认 2 = 肿瘤），返回 uint8 的 0/1 掩膜图。"""
+    return mask_from_label(load_seg_labels(seg_path), label)
+
+
+def load_seg_labels(seg_path: Path):
+    """读取原始掩膜为 uint8 标签图（保留 0/1/2 原值），用于统计原始标签分布。"""
     import SimpleITK as sitk
 
     seg = sitk.ReadImage(str(seg_path))
     if seg.GetPixelID() != sitk.sitkUInt8:
         seg = sitk.Cast(seg, sitk.sitkUInt8)
-    return sitk.Cast(sitk.BinaryThreshold(seg, lowerThreshold=label, upperThreshold=label,
+    return seg
+
+
+def mask_from_label(seg_labels, label: int = 2):
+    """把标签图按 ``== label`` 二值化成 uint8 的 0/1 掩膜图。"""
+    import SimpleITK as sitk
+
+    return sitk.Cast(sitk.BinaryThreshold(seg_labels, lowerThreshold=label, upperThreshold=label,
                                           insideValue=1, outsideValue=0),
                      sitk.sitkUInt8)
 
@@ -234,25 +246,31 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     step(f"读取影像 {vol_path.name}")
     vol_img = load_as_float(vol_path)
     step(f"读取掩膜 {seg_path.name}，size={vol_img.GetSize()}")
-    seg_img = load_mask_binary(seg_path, label=2)
+    seg_labels = load_seg_labels(seg_path)          # 原始标签图（0/1/2），用于统计与取 label 2
+    seg_img = mask_from_label(seg_labels, label=2)  # 只用 label 2 的二值掩膜
 
     rec["original_shape"] = tuple(int(s) for s in vol_img.GetSize())
     rec["original_spacing"] = tuple(round(float(s), 4) for s in vol_img.GetSpacing())
     rec["original_orientation"] = "".join(sitk.DICOMOrientImageFilter_GetOrientationFromDirectionCosines(vol_img.GetDirection()))
 
-    # 1) 地板值 padding：在原始整数域上判定，避免插值把地板值摊开
+    # 1) 地板值 padding：在原始整数域上判定，避免插值把地板值摊开。
+    #    注意：GetArrayViewFromImage 返回的是指向 SITK 图像内部缓冲区的视图，
+    #    若把 ReadImage 的结果写成临时对象（sitk.GetArrayViewFromImage(sitk.ReadImage(...))），
+    #    临时图像会被立刻回收，视图随即悬空 —— 读它的内容就是段错误。
+    #    这里统一用 GetArrayFromImage（返回独立拷贝），统计完立刻 del，内存占用可控。
     step("统计地板值")
-    raw = sitk.GetArrayViewFromImage(sitk.ReadImage(str(vol_path)))
-    floor_value, n_floor = floor_stats(np.asarray(raw), margin)
+    raw_arr = sitk.GetArrayFromImage(vol_img)  # vol_img 仍在作用域内，且此处为拷贝
+    floor_value, n_floor = floor_stats(raw_arr, margin)
     rec["floor_value"] = floor_value
     rec["floor_voxels"] = n_floor
-    rec["floor_fraction"] = float(n_floor / max(1, raw.size))
-    del raw
+    rec["floor_fraction"] = float(n_floor / max(1, raw_arr.size))
+    del raw_arr
+
     step("统计掩膜原始标签分布")
-    rec["n_labels_in_mask_raw"] = None
-    seg_arr_raw = sitk.GetArrayViewFromImage(sitk.ReadImage(str(seg_path)))
-    labels, counts = np.unique(np.asarray(seg_arr_raw), return_counts=True)
+    seg_arr_raw = sitk.GetArrayFromImage(seg_labels)
+    labels, counts = np.unique(seg_arr_raw, return_counts=True)
     rec["mask_label_counts_raw"] = {int(v): int(c) for v, c in zip(labels.tolist(), counts.tolist())}
+    n_label2_raw = int(rec["mask_label_counts_raw"].get(2, 0))
     del seg_arr_raw
 
     step(f"地板夹取（floor={floor_value}，比例 {rec['floor_fraction']:.4f}）")
@@ -273,9 +291,24 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     rec["clip_high_fraction"] = float(np.count_nonzero(img_arr > hu_hi) / max(1, img_arr.size))
     np.clip(img_arr, hu_lo, hu_hi, out=img_arr)
 
-    step("掩膜取 label 2 并转 uint8")
+    step("掩膜二值化（seg_img 已是 0/1，取 >0）并转 uint8")
     seg_arr = np.asarray(sitk.GetArrayFromImage(seg_rs))
-    seg_arr = (seg_arr == 2).astype(np.uint8)
+    seg_arr = (seg_arr > 0).astype(np.uint8)
+    if seg_arr.size and int(seg_arr.max()) > 1:
+        raise RuntimeError(f"case {case_id} 的二值掩膜出现 >1 的取值 {np.unique(seg_arr).tolist()}，"
+                           f"说明 label 2 的筛选环节口径不一致")
+    n_label2_rs = int(np.count_nonzero(seg_arr))
+    # 结构自检：原始有 label 2 的病例，重采样后不应该是空的（空说明朝向/网格处理有 bug）
+    if n_label2_raw > 0 and n_label2_rs == 0:
+        raise RuntimeError(f"case {case_id} 原始 label 2 有 {n_label2_raw} 个体素，"
+                           f"但 1mm 重采样后前景为 0 —— 朝向/RAS 重定向处理有误")
+    if n_label2_raw > 0:
+        ratio = n_label2_rs / max(1, n_label2_raw)
+        rec["label2_voxels_resampled"] = n_label2_rs
+        rec["label2_voxel_ratio"] = round(float(ratio), 6)
+        if not (0.2 <= ratio <= 5.0):
+            LOGGER.warning("case %d 的 label 2 体素数在重采样前后变化异常：%d -> %d（比例 %.3f），"
+                           "请检查该例的 spacing", case_id, n_label2_raw, n_label2_rs, ratio)
 
     # 5) 落盘：SITK 数组轴序为 (z, y, x)，转置成 nibabel 的 (x, y, z) 再写，
     #    这样下游 nib.load(...).dataobj[..., z] 直接就是一层冠状切片。
@@ -286,7 +319,12 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     mask_sitk.CopyInformation(seg_rs)
     image_for_origin = sitk.GetImageFromArray(img_out.astype(np.float32))
     image_for_origin.CopyInformation(img_rs)
-    image_with_origin, _ = crop_origin_to_nonzero(image_for_origin, seg_out)
+    seg_labels = seg_img = seg_rs = None  # 大对象尽早释放，降低峰值内存
+    # 影像与掩膜使用同一套 origin（都前移到前景最小角），下游重建整卷时按索引对齐即可，
+    # 不必再关心 affine：两卷的世界坐标差是常数偏移。
+    image_with_origin, shift_ijk = crop_origin_to_nonzero(image_for_origin, seg_out)
+    mask_with_origin, _ = crop_origin_to_nonzero(mask_sitk, seg_out)
+    rec["origin_shift_ijk"] = list(shift_ijk)
 
     step("转置轴序 (z,y,x)->(x,y,z) 并写 cache")
     image_dir = cache_dir / "image"
@@ -303,7 +341,7 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     label_writer = sitk.ImageFileWriter()
     label_writer.SetFileName(str(label_dir / f"{case_id}.nii.gz"))
     label_writer.SetUseCompression(True)
-    label_writer.Execute(sitk.Cast(mask_sitk, sitk.sitkUInt8))
+    label_writer.Execute(sitk.Cast(mask_with_origin, sitk.sitkUInt8))
 
     # 6) 统计：以「像素数 + spacing」为准换算 mm3，不依赖 affine
     voxel_mm3 = float(np.prod([float(s) for s in img_rs.GetSpacing()]))

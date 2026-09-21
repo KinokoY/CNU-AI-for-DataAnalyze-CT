@@ -62,12 +62,12 @@ def main() -> int:
         seg_u8 = sitk.Cast(seg_u8, sitk.sitkUInt8)
     log(f"  seg pixelID={seg_u8.GetPixelIDTypeAsString()} size={seg_u8.GetSize()}")
     mask = sitk.Cast(sitk.BinaryThreshold(seg_u8, 2, 2, 1, 0), sitk.sitkUInt8)
-    log(f"  ok，前景体素数={int(np.count_nonzero(sitk.GetArrayViewFromImage(mask)))}")
+    log(f"  ok，前景体素数={int(np.count_nonzero(sitk.GetArrayFromImage(mask)))}")
     if args.stop_after == "mask":
         return 0
 
     log("step 4/7 floor stats + clamp ...")
-    arr = sitk.GetArrayViewFromImage(raw)
+    arr = sitk.GetArrayFromImage(raw)  # 用 FromImage（拷贝），避免视图生命周期问题
     vmin = float(arr.min())
     n_floor = int(np.count_nonzero(arr <= vmin + 1.0))
     log(f"  floor={vmin} n_floor={n_floor} frac={n_floor / arr.size:.4f}")
@@ -75,7 +75,7 @@ def main() -> int:
     fmask = sitk.BinaryThreshold(vol_img, lowerThreshold=vmin + 1.0,
                                  upperThreshold=float(np.finfo(np.float32).max), insideValue=1, outsideValue=0)
     vol_clamped = sitk.Cast(sitk.Mask(vol_img, fmask, outsideValue=-1000.0), sitk.sitkFloat32)
-    log(f"  ok，clamp 后 min={float(sitk.GetArrayViewFromImage(vol_clamped).min())}")
+    log(f"  ok，clamp 后 min={float(sitk.GetArrayFromImage(vol_clamped).min())}")
     if args.stop_after == "floor":
         return 0
 
