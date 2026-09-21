@@ -113,19 +113,25 @@ def bbox_contains(outer, inner) -> bool:
 
 
 def erode6(mask: np.ndarray) -> np.ndarray:
-    """6 邻域二值腐蚀；用 numpy 实现，避免引入 scipy 依赖。"""
-    out = mask.copy()
-    out[1:, :, :] &= mask[:-1, :, :]
-    out[:-1, :, :] &= mask[1:, :, :]
-    out[:, 1:, :] &= mask[:, :-1, :]
-    out[:, :-1, :] &= mask[:, 1:, :]
-    out[:, :, 1:] &= mask[:, :, :-1]
-    out[:, :, :-1] &= mask[:, :, 1:]
-    return out
+    """6 邻域二值腐蚀；用零填充实现，避免原地切片自比较的错误。
+
+    注意：不要写成 ``out[1:] &= mask[:-1]`` / ``out[:-1] &= mask[1:]`` 这种成对切片——
+    out 是 mask 的副本时，``out[1:]`` 与 ``mask[:-1]`` 索引的是同一批元素，该行是空操作，
+    结果只腐蚀了三个方向、且边界层恒保留（3x3x3 满块会错误地保持 27 个体素而非 1 个）。
+    """
+    m = np.asarray(mask, dtype=bool)
+    pad = np.zeros((m.shape[0] + 2, m.shape[1] + 2, m.shape[2] + 2), dtype=bool)
+    pad[1:-1, 1:-1, 1:-1] = m
+    c = pad[1:-1, 1:-1, 1:-1]
+    return (c
+            & pad[:-2, 1:-1, 1:-1] & pad[2:, 1:-1, 1:-1]
+            & pad[1:-1, :-2, 1:-1] & pad[1:-1, 2:, 1:-1]
+            & pad[1:-1, 1:-1, :-2] & pad[1:-1, 1:-1, 2:])
 
 
 def dilate6(mask: np.ndarray) -> np.ndarray:
-    """6 邻域二值膨胀；边界向外不扩散。"""
+    """6 邻域二值膨胀；边界向外不扩散（已与暴力定义对拍一致）。"""
+    mask = np.asarray(mask, dtype=bool)
     out = mask.copy()
     out[1:, :, :] |= mask[:-1, :, :]
     out[:-1, :, :] |= mask[1:, :, :]
@@ -205,8 +211,8 @@ def inspect_case(case: str, vol_path: str, seg_path: str, skip_affine_fix: bool)
 
     rec["vol_shape"] = tuple(int(s) for s in vimg.shape)
     rec["seg_shape"] = tuple(int(s) for s in simg.shape)
+    rec["shape_match"] = rec["vol_shape"] == rec["seg_shape"]
     zooms = tuple(float(z) for z in vimg.header.get_zooms()[:3])
-    rec["zooms"] = zooms
     rec["voxel_mm3"] = float(np.prod(zooms))
     rec["vol_dtype"] = str(vimg.get_data_dtype())
     rec["seg_dtype"] = str(simg.get_data_dtype())
@@ -216,17 +222,37 @@ def inspect_case(case: str, vol_path: str, seg_path: str, skip_affine_fix: bool)
     rec["affine_maxdiff"] = float(np.max(np.abs(vimg.affine - simg.affine)))
     rec["resampled"] = False
 
-    # 仿射不一致时，把掩膜重采样到影像网格，保证后续所有体素级比较是在同一坐标系里做的
-    if not rec["affine_match"] and not skip_affine_fix and rec["vol_shape"] == rec["seg_shape"]:
-        seg = resample_from_to(simg, vimg, order=0)
-        seg = np.asanyarray(seg.dataobj)
+    # 原始掩膜的标签分布：必须与重采样后的分布一起给出，否则无从判断重采样到底做了什么
+    uniq_raw, counts_raw = np.unique(seg_raw, return_counts=True)
+    rec["labels_raw"] = [(fmt_num(u), int(c)) for u, c in zip(uniq_raw.tolist(), counts_raw.tolist())]
+    rec["shape_mismatch_warned"] = not rec["shape_match"]
+
+    # 仿射不一致时把掩膜重采样到影像网格，保证后续体素级比较在同一坐标系里做。
+    # 注意：不要求 shape 相同——resample_from_to 本来就按目标网格输出，shape 不同更该重采样。
+    if not rec["affine_match"] and not skip_affine_fix:
+        seg = np.asanyarray(resample_from_to(simg, vimg, order=0).dataobj)
         rec["resampled"] = True
     else:
         seg = seg_raw
+        if not rec["affine_match"]:
+            eprint(f"[警告] case {case} 的 affine 不一致且 --skip-affine-fix 生效："
+                   f"以下体素级统计在未对齐的网格上计算，结论不可用。")
+
+    # 物理坐标层面的对齐验证（不依赖重采样）：把原始掩膜前景的包围盒经世界坐标投影回影像索引
+    bb_raw = bbox_of(seg_raw > 0)
+    rec["seg_bbox_raw_index"] = bb_raw
+    rec["seg_bbox_backprojected"] = None
+    if bb_raw is not None:
+        corners = np.array([[bb_raw[d][i] for d in range(3)] for i in (0, 1)], dtype=np.float64)
+        world = nib.affines.apply_affine(simg.affine, corners)
+        back = nib.affines.apply_affine(np.linalg.inv(vimg.affine), world)
+        rec["seg_bbox_backprojected"] = tuple(
+            (int(np.floor(back[:, d].min())), int(np.ceil(back[:, d].max()))) for d in range(3))
 
     uniq, counts = np.unique(seg, return_counts=True)
     rec["labels"] = [(fmt_num(u), int(c)) for u, c in zip(uniq.tolist(), counts.tolist())]
     rec["label_set"] = [int(u) for u in uniq.tolist()]
+    rec["seg_bbox_used"] = bbox_of(seg > 0)
 
     # ---- 身体掩膜：与 probe_data.py 完全相同的口径（整数域 > -900），保证可比 ----
     body = vol > -900
@@ -234,9 +260,12 @@ def inspect_case(case: str, vol_path: str, seg_path: str, skip_affine_fix: bool)
     vmin = float(np.min(vol)) if vol.size else None
     vmax = float(np.max(vol)) if vol.size else None
     rec["vol_min"], rec["vol_max"] = vmin, vmax
-    # 分位数用固定步长采样估计：精度足够，且不会为 3 亿体素的大卷分配整份副本
-    rec["vol_p0.5"] = pct(vol.ravel()[:: 16], 0.5)
-    rec["vol_p99.5"] = pct(vol.ravel()[:: 16], 99.5)
+    # 重采样后的掩膜是否真的落进身体：这是判断"对齐是否正确"的核心证据
+    fg_any = seg > 0
+    if np.count_nonzero(fg_any) > 0:
+        rec["resampled_fg_frac_in_body"] = float(np.count_nonzero(fg_any & body) / np.count_nonzero(fg_any))
+    else:
+        rec["resampled_fg_frac_in_body"] = None
 
     # ---- 逐 label 的强度与形状摘要 ----
     label_info = {}
@@ -311,7 +340,17 @@ def inspect_case(case: str, vol_path: str, seg_path: str, skip_affine_fix: bool)
         hist, edges = np.histogram(vol.ravel()[::16], bins=60,
                                    range=(float(np.percentile(vol, 0.1)), float(np.percentile(vol, 99.9))))
         rec["air_peak"] = float(edges[int(np.argmax(hist))])
-    rec["p1_eq_p25"] = bool(rec.get("vol_p0.5") is not None and rec["body_p1"] == rec["body_p0.5"])
+    # 地板是否被大量体素占满：地板值即该 case 的最低强度，若它占比很高说明发生了饱和/截断。
+    # （不用 p0.5 == p1 这类判据：在饱和数据上它恒为真，没有区分度。）
+    if vmin is not None and vol.size:
+        sampled = vol.ravel()[::16]
+        rec["frac_at_floor"] = float(np.count_nonzero(sampled <= vmin) / max(1, sampled.size))
+        vals, cnts = np.unique(sampled[sampled <= vmin + 4], return_counts=True)
+        order = np.argsort(cnts)[::-1][:6]
+        rec["floor_hist"] = [(fmt_num(vals[i]), int(cnts[i])) for i in order]
+    else:
+        rec["frac_at_floor"] = None
+        rec["floor_hist"] = []
 
     # 供“整数域 vs HU 域”判断：空气地板值相对 -1000 / -1024 的位置
     rec["floor_offset_vs_1000"] = None if vmin is None else float(vmin + 1000.0)
@@ -358,24 +397,39 @@ def report_labels(recs: list) -> None:
         if vols_:
             print(f"label {lab}: 出现 {n_cases}/{len(recs)} 个 case | vol_cm3 中位={fmt_num(np.median(vols_))} "
                   f"范围={fmt_num(min(vols_))}-{fmt_num(max(vols_))} | 强度中位={fmt_num(np.median(meds)) if meds else 'NA'}")
-    print("判读：体积大且强度落在软组织范围(~40-70HU 增强肝)的是器官（肝脏）；体积小得多的是其中的病灶。")
+    body_med = [r["body_p1"] for r in recs if r["status"] == "OK" and r.get("body_p1") is not None]
+    if body_med:
+        print(f"参考：body 掩膜内 p1 中位 = {fmt_num(np.median(body_med))}（用于判断各 label 是否明显高于空气/伪影）")
+    print("判读（不在未定标的前提下假定 HU 数值）：")
+    print("  体积数百 cm³ 以上、强度聚类集中在软组织区间的那一类 → 器官（肝脏）。")
+    print("  体积明显更小、且强度分布与该器官有可辨差异的那一类 → 器官内病灶。")
+    print("  具体是不是标准 HU 请看 [4] 节的 vol_min/floor_hist：本数据 min 可达 -3024，不能直接按 -1000~1000 解读。")
 
 
 def report_nesting(recs: list) -> None:
     hr("[2] label 嵌套关系：小 label 是否完全落在大 label 内部（决定性证据）")
-    print("case | labels | small | large | n_small | n_large | frac_small_in_large | bbox_contains | vol_ratio | ring_outside_body | small_erode1_survival")
+    print("case | labels | small | large | n_small | n_large | frac_small_in_large | bbox_contains | vol_ratio | ring_outside_body | small_erode1_survival | 判定")
     any_two = False
+    verdicts = collections.Counter()
     for r in recs:
         if r["status"] != "OK" or not r.get("relation"):
             continue
         any_two = True
         rel = r["relation"]
+        # 两条判据同时成立才算嵌套，避免只看交集就下结论
+        inter, n_small = rel["intersection"], max(1, rel["n_small"])
+        nested = rel["frac_small_in_large"] >= 0.99 and inter >= 0.99 * n_small
+        exclusive = rel["frac_small_in_large"] <= 0.01 and inter <= 0.01 * n_small
+        verdict = ("嵌套:器官+器官内病灶" if nested
+                   else "互斥/相邻:两个并列结构" if exclusive
+                   else "部分重叠:需人工确认")
+        verdicts[verdict.split(":")[0]] += 1
         print(
             f"{r['case']} | {r['label_set']} | label {rel['small']} | label {rel['large']} | "
             f"{rel['n_small']} | {rel['n_large']} | {fmt_num(rel['frac_small_in_large'])} | "
             f"{fmt_num(rel['bbox_contains'])} | {fmt_num(rel['vol_ratio_small_over_large'])} | "
             f"{fmt_num(rel.get('frac_small_ring_outside_body'))} | "
-            f"{fmt_num(rel.get('small_erode1_survival'))}"
+            f"{fmt_num(rel.get('small_erode1_survival'))} | {verdict}"
         )
     if not any_two:
         print("（没有同时含两个前景 label 的 case）")
@@ -388,8 +442,13 @@ def report_nesting(recs: list) -> None:
         print(f"n_two_label_cases={len(fracs)}")
         print(f"frac_small_in_large: min={fmt_num(min(fracs))} median={fmt_num(np.median(fracs))} max={fmt_num(max(fracs))}")
         print(f"vol_ratio_small/large: min={fmt_num(min(ratios))} median={fmt_num(np.median(ratios))} max={fmt_num(max(ratios))}")
-        print(f"label 相交体素: max={max(inter)}（若全为 0 说明两类互斥，属于嵌套标注而非多标签重叠）")
-        print("判读：frac_small_in_large 接近 1 且相交为 0 → 小 label 是大器官内部的独立病灶（肝脏+肿瘤）。")
+        print(f"label 相交体素: max={max(inter)}（两类互斥时为 0；嵌套标注时相交应等于小 label 体素数）")
+        print(f"逐 case 判定汇总 = {dict(verdicts)}")
+        print("判读（两条判据必须同时看，不要只看交集）：")
+        print("  frac_small_in_large 接近 1 且 交集 ≈ n_small → 小 label 完全落在大 label 内部（器官 + 器官内病灶）")
+        print("  frac_small_in_large 接近 0 且 交集 ≈ 0      → 两类互斥/相邻（是两个并列结构，或标注时把病灶从器官里挖掉了）")
+        print("  其他情形                                      → 部分重叠，标注层级需人工确认")
+        print("注意：互斥本身不能区分『肝内血管』与『从肝脏中挖掉的肿瘤』，需结合体积量级与强度差综合判断。")
     print()
     print("--- 大 label 是否为实心器官 ---")
     print("case | big_label | bbox_fill | erode1_survival")
@@ -437,14 +496,17 @@ def report_scale_task(recs: list) -> None:
 
 def report_intensity_scaling(recs: list) -> None:
     hr("[4] 强度定标：整数域与 HU 域的对照（决定归一化与裁剪）")
-    print("case | dtype | vol_min | vol_max | body_p0.5 | body_p1 | body_p99 | body_p99.5 | floor+1000 | floor+1024")
+    print("case | vol_dtype | seg_dtype | vol_min | vol_max | air_peak | body_p0.5 | body_p1 | body_p99 | body_p99.5 | floor+1000 | floor+1024 | frac_at_floor | floor_hist(值:数)")
     for r in recs:
         if r["status"] != "OK":
             continue
+        fh = ",".join(f"{v}:{c}" for v, c in r.get("floor_hist", [])[:4])
         print(
-            f"{r['case']} | {r['vol_dtype']} | {fmt_num(r['vol_min'])} | {fmt_num(r['vol_max'])} | "
+            f"{r['case']} | {r['vol_dtype']} | {r.get('seg_dtype')} | {fmt_num(r['vol_min'])} | {fmt_num(r['vol_max'])} | "
+            f"{fmt_num(r.get('air_peak'))} | "
             f"{fmt_num(r['body_p0.5'])} | {fmt_num(r['body_p1'])} | {fmt_num(r['body_p99'])} | "
-            f"{fmt_num(r['body_p99.5'])} | {fmt_num(r['floor_offset_vs_1000'])} | {fmt_num(r['floor_offset_vs_1024'])}"
+            f"{fmt_num(r['body_p99.5'])} | {fmt_num(r['floor_offset_vs_1000'])} | {fmt_num(r['floor_offset_vs_1024'])} | "
+            f"{fmt_num(r.get('frac_at_floor'))} | {fh}"
         )
     print()
     print("--- 聚合：空气地板值分布（-1000 附近即为标准 HU 口径）---")
@@ -452,14 +514,19 @@ def report_intensity_scaling(recs: list) -> None:
     print(f"vol_min 取值分布 = {dict(floors)}")
     offs = [abs(r["floor_offset_vs_1000"]) for r in recs if r["status"] == "OK"]
     print(f"|vol_min + 1000| 中位 = {fmt_num(np.median(offs))}")
+    fracs = [r["frac_at_floor"] for r in recs if r["status"] == "OK" and r.get("frac_at_floor") is not None]
+    if fracs:
+        print(f"frac_at_floor: min={fmt_num(min(fracs))} median={fmt_num(np.median(fracs))} max={fmt_num(max(fracs))}")
     print("判读：")
     print("  若多数 case 的 vol_min 落在 -1024/-1000 附近 → 基本是 HU 口径（可能整体偏了 24）。")
     print("  若出现 -2048/-3024 等 2 倍/3 倍关系 → 该 case 是另一套缩放（如窗外重建值或含 padding），需单独裁剪。")
+    print("  frac_at_floor 高（如 >10%）说明该 case 有大量体素被压到地板，属饱和；此类 case 的极值不可当组织强度用。")
     print()
     print("--- 判读说明 ---")
     print("如需看某 case 的强度直方图形状（空气峰/软组织峰位置），可对单个 case 跑：")
     print("  python scripts/probe_labels.py --limit-cases 1")
-    print("其中 body_p0.5 / body_p99.5 已给出身体内的极值区间，供选归一化窗口使用。")
+    print("注意：body_p* 是「body 掩膜内」的分位数，而 body 掩膜用 vol > -900 定义，")
+    print("      在非标准 HU 数据上会含空气，故上述数值不能直接当肝实质强度使用。")
 
 
 def report_affine(recs: list) -> None:
@@ -469,14 +536,24 @@ def report_affine(recs: list) -> None:
         print("所有 case 的 volume 与 segmentation 仿射一致，无需特殊处理。")
         return
     print(f"仿射不一致 case 数 = {len(mism)} -> {[r['case'] for r in mism]}")
-    print("case | vol_axcodes | seg_axcodes | affine_maxdiff | resampled | 重采样后 label 分布")
+    print("case | vol_axcodes | seg_axcodes | affine_maxdiff | resampled | 原始 label 分布 | 重采样后 label 分布 | 重采样后前景落在 body 内比例")
     for r in mism:
         print(f"{r['case']} | {r['vol_axcodes']} | {r['seg_axcodes']} | {fmt_num(r['affine_maxdiff'])} | "
-              f"{fmt_num(r['resampled'])} | {r['labels']}")
+              f"{fmt_num(r['resampled'])} | {r.get('labels_raw')} | {r['labels']} | "
+              f"{fmt_num(r.get('resampled_fg_frac_in_body'))}")
     print()
-    print("判读：shape 相同但 affine 不同，且 axcodes 一个是 LAS 一个是 RAS，说明掩膜与影像的 x 轴翻转，")
-    print("      物理坐标相差几十厘米；必须按 affine 对齐（nibabel resample_from_to / MONAI 的 spacing 变换），")
-    print("      不能直接按数组下标配对。本节的 label 分布即为对齐后重新统计的结果。")
+    print("--- 物理坐标验证（不依赖重采样是否正确）---")
+    print("case | 原始掩膜前景包围盒(掩膜索引) | 反投影到影像索引 | 实际用于统计的包围盒(影像索引)")
+    for r in mism:
+        print(f"{r['case']} | {bbox_str(r.get('seg_bbox_raw_index'))} | "
+              f"{bbox_str(r.get('seg_bbox_backprojected'))} | {bbox_str(r.get('seg_bbox_used'))}")
+    print()
+    print("判读（必须三件事一起看，缺一不可）：")
+    print("  1) 原始与重采样后的 label 体素数：若某类体素数大幅减少，说明掩膜没覆盖住影像网格，重采样会丢标注。")
+    print("  2) 反投影包围盒 vs 掩膜索引包围盒：若数值接近，说明差异近似纯轴向翻转（重采样可行）；")
+    print("     若相差一个平移量，说明掩膜可能来自另一次扫描/另一套网格，此时重采样是错误口径，应剔除该 case。")
+    print("  3) 重采样后前景落在 body 内的比例：接近 1 才说明对齐成功；明显偏低说明对错了位置。")
+    print("不要只凭 axcodes（LAS/RAS）就断定是 x 轴翻转——那只是坐标轴方向，不包含平移信息。")
 
 
 def report_duplicates(recs: list) -> None:

@@ -65,6 +65,8 @@ SEG_PATTERNS = (re.compile(r"^segmentation[-_](\d+)$"),)
 
 # CT 场景下"明显属于空气"的 HU 阈值，仅用于给出一个参考口径，不是硬编码假设
 CT_AIR_HU = -900.0
+# 阈值敏感性对比用的候选阈值：数据若不是标准 HU，单一阈值会显著改变"身体"范围
+BODY_THRESHOLDS = (-900.0, -700.0, -500.0, -300.0, -150.0)
 # 掩膜包围盒是否包含在身体包围盒内的容差（体素）
 BBOX_TOL = 2
 
@@ -312,9 +314,28 @@ def inspect_pair(case: str, vol_path: str, seg_path: str) -> dict:
 
     # ---- 数据 ----
     vol = load_array(vol_path)
-    seg_arr = load_array(seg_path)
+    seg_arr_raw = load_array(seg_path)
 
-    # ---- 标签取值 ----
+    # 仿射不一致时，先把掩膜重采样到影像网格，否则后续所有"用掩膜当索引去取影像强度"的统计
+    # 都是在两套不同坐标系上按下标硬配（case 48-52 正是这种情况：volume=LAS / mask=RAS）。
+    rec["resampled_to_vol"] = False
+    if not rec["affine_match"]:
+        rec["resampled_to_vol"] = True
+        try:
+            from nibabel.processing import resample_from_to
+
+            seg_arr = np.asanyarray(resample_from_to(seg, img, order=0).dataobj)
+        except Exception as exc:  # noqa: BLE001 - 重采样失败时明确降级并标注，不静默错配
+            eprint(f"[警告] case {case} 的掩膜重采样失败（{type(exc).__name__}: {exc}），"
+                   f"该 case 的体素级强度/几何统计不可信。")
+            seg_arr = seg_arr_raw
+            rec["resampled_to_vol"] = False
+    else:
+        seg_arr = seg_arr_raw
+
+    # ---- 标签取值（原始掩膜，未经重采样，用于核对重采样是否丢标注）----
+    uniq_raw, counts_raw = np.unique(seg_arr_raw, return_counts=True)
+    rec["seg_values_raw"] = [(fmt_num(u), int(c)) for u, c in zip(uniq_raw.tolist(), counts_raw.tolist())]
     uniq, counts = np.unique(seg_arr, return_counts=True)
     rec["seg_values"] = [(fmt_num(u), int(c)) for u, c in zip(uniq.tolist(), counts.tolist())]
     rec["n_unique_labels"] = int(len(uniq))
@@ -325,10 +346,25 @@ def inspect_pair(case: str, vol_path: str, seg_path: str) -> dict:
     rec["seg_negative"] = bool(rec["seg_min"] is not None and rec["seg_min"] < 0)
     rec["seg_fractional"] = bool(not rec["seg_is_integer"])
 
-    # 前景（>0）与"类 1"（==1，若有）
+    # 前景 = 所有 >0 的标签合并（**不是**肿瘤！label 语义未定时必须按此口径理解）
     fg = seg_arr > 0
     rec["fg_voxels"] = int(np.count_nonzero(fg))
     rec["fg_fraction_total"] = float(rec["fg_voxels"] / max(1, seg_arr.size))
+
+    # 逐前景标签统计：26 号脚本把 label1+label2 合并后叫 "tumor"，导致把肝脏体积当成肿瘤体积
+    label_stats = {}
+    for lab in [int(u) for u in uniq.tolist() if u > 0]:
+        m = seg_arr == lab
+        n = int(np.count_nonzero(m))
+        st = {"n": n, "vol_cm3": (n * total_vol_mm3 / 1000.0) if total_vol_mm3 else None,
+              "name": "lesion_label" if lab == 2 else f"label{lab}"}
+        if n > 0:
+            vv = np.asarray(vol)[m]
+            if vv.size:
+                st["intensity_p50"] = float(np.percentile(vv.astype(np.float64), 50))
+        label_stats[lab] = st
+    rec["label_stats"] = label_stats
+    rec["fg_label_count"] = len(label_stats)
 
     # ---- 图像强度统计 ----
     v = np.asarray(vol)
@@ -345,33 +381,71 @@ def inspect_pair(case: str, vol_path: str, seg_path: str) -> dict:
     rec["vol_percentiles"] = global_percentiles(vf, None, qs)
     rec["pct_qs"] = qs
 
-    # 身体掩膜：CT 场景优先用空气阈值（HU < -900 视为空气）；
-    # 若影像本身非负（无符号数据/已是窗内值），则退化为 >0。
+    # 非空气掩膜（原名"身体区域"，但在非标准 HU 数据上这个叫法会误导，见下面 [4] 节的多阈值对比）。
+    # CT 场景优先用空气阈值；若影像本身非负（无符号数据/已是窗内值），则退化为 >0。
     vol_min = rec.get("vol_min", 0)
     if (not rec["vol_dtype_is_float"]) and vol_min is not None and vol_min >= 0:
         body = v > 0
+        rec["body_threshold"] = 0
     else:
         body = v > CT_AIR_HU
+        rec["body_threshold"] = CT_AIR_HU
     body = body & finite
     rec["body_voxels"] = int(np.count_nonzero(body))
     rec["body_fraction_total"] = float(rec["body_voxels"] / max(1, v.size))
     rec["body_percentiles"] = global_percentiles(v, body, qs)
     rec["fg_percentiles"] = global_percentiles(v, fg, qs) if rec["fg_voxels"] > 0 else [None] * len(qs)
 
-    # ---- 归一化参考：身体区域 z-score 参数 ----
-    if rec["body_voxels"] > 0:
-        bv = v[body].astype(np.float64)
-        rec["body_mean"] = float(bv.mean())
-        rec["body_std"] = float(bv.std())
-        rec["zscore_clip_lo"] = float(np.percentile(bv, 0.5))
-        rec["zscore_clip_hi"] = float(np.percentile(bv, 99.5))
+    # 阈值敏感性：本数据 min 可到 -3024，说明未必是标准 HU，单一 -900 阈值会显著改变"身体"范围。
+    # 给出多个阈值下的体素数占比，便于判断该阈值是否把空气算进了身体。
+    rec["body_threshold_sensitivity"] = []
+    for thr in BODY_THRESHOLDS:
+        if vol_min is not None and thr <= vol_min:
+            rec["body_threshold_sensitivity"].append((thr, None))
+        else:
+            rec["body_threshold_sensitivity"].append(
+                (thr, float(np.count_nonzero((v > thr) & finite) / max(1, v.size))))
+    # 地板值自适应：地板之上 200 通常已越过空气峰，可作为一个自动兜底阈值
+    rec["body_threshold_adaptive"] = None
+    if vol_min is not None and vol_min < -1100:
+        adapt = float(vol_min + 200)
+        rec["body_threshold_adaptive"] = adapt
+        rec["body_voxels_adaptive"] = int(np.count_nonzero((v > adapt) & finite))
+        rec["body_fraction_adaptive"] = float(rec["body_voxels_adaptive"] / max(1, v.size))
     else:
-        rec["body_mean"] = rec["body_std"] = None
+        rec["body_voxels_adaptive"] = None
+        rec["body_fraction_adaptive"] = None
+
+    # ---- 归一化参考：组织区域（排除空气）的 z-score 参数 ----
+    # 用自适应阈值（地板+200）把空气挡在外面；未触发自适应时退回默认阈值。
+    # 直接对 body 算 mean/std 会把空气算进去，导致窗宽被拉宽（本数据 body_p1 中位 -892 即为证据）。
+    tissue_thr = rec.get("body_threshold_adaptive")
+    if tissue_thr is None:
+        tissue_thr = rec.get("body_threshold", CT_AIR_HU)
+    rec["tissue_threshold"] = tissue_thr
+    tissue = (v > tissue_thr) & finite
+    if np.count_nonzero(tissue) > 0:
+        tv = v[tissue].astype(np.float64)
+        rec["tissue_mean"] = float(tv.mean())
+        rec["tissue_std"] = float(tv.std())
+        rec["zscore_clip_lo"] = float(np.percentile(tv, 0.5))
+        rec["zscore_clip_hi"] = float(np.percentile(tv, 99.5))
+    else:
+        rec["tissue_mean"] = rec["tissue_std"] = None
         rec["zscore_clip_lo"] = rec["zscore_clip_hi"] = None
+
+    # ---- 重采样正确性验证：重采样后的前景是否真的落进非空气掩膜内 ----
+    # 这是判断"仿射对齐是否真的成功"的核心证据；只打印"已重采样"是无法证明对齐正确的。
+    if rec.get("resampled_to_vol"):
+        n_fg = int(np.count_nonzero(fg))
+        rec["resampled_fg_frac_in_body"] = (
+            float(np.count_nonzero(fg & body) / n_fg) if n_fg > 0 else None)
+    else:
+        rec["resampled_fg_frac_in_body"] = None
 
     # ---- 逐切片统计 ----
     # 约定：shape 与 zooms 均为 nibabel 轴的原始顺序，对标准 NIfTI 第 3 轴是 Z（头脚方向）。
-    # 4D 两种情况要分开：shape=(X,Y,Z,1)（单通道，常见）与 shape=(X,Y,Z,C>1)（多通道/多时序）。
+    # 4D 两种情况：shape=(X,Y,Z,1)（单通道）与 shape=(X,Y,Z,C>1)（多通道/多时序，另行告警）。
     if vol.ndim == 3:
         axis = 2
     elif vol.ndim == 4:
@@ -427,27 +501,33 @@ def inspect_pair(case: str, vol_path: str, seg_path: str) -> dict:
         rec["fragile_slices_area1"] = None
         rec["fragile_slices_frac"] = None
 
-    # 病灶在体积中的位置（相对坐标，判断是否贴边）
+    # 前景在体积中的位置。
+    # 注意：不要再输出"归一化体素坐标"——30 个 case 有 13 种 spacing 与 3 种方位（含 LAS/RAS 反向），
+    # 体素坐标之间不可比；改为输出物理坐标（mm，影像 affine 的 RAS+ 世界坐标）。
     bb_fg = nonzero_bbox(fg)
     bb_body = nonzero_bbox(body)
     rec["fg_bbox"] = bb_fg
     rec["body_bbox"] = bb_body
     rec["fg_bbox_inside_body"] = bbox_inside(bb_fg, bb_body)
     if bb_fg is not None:
-        cx = [(bb_fg[d][0] + bb_fg[d][1]) / 2.0 for d in range(len(bb_fg))]
-        rec["fg_center_norm"] = tuple(
-            round(cx[d] / max(1, vol.shape[d]), 3) for d in range(len(cx))
-        )
+        cidx = np.array([(bb_fg[d][0] + bb_fg[d][1]) / 2.0 for d in range(3)], dtype=np.float64)
+        rec["fg_center_voxel"] = tuple(round(float(x), 1) for x in cidx)
+        try:
+            world = nib.affines.apply_affine(img.affine, cidx)
+            rec["fg_center_mm"] = tuple(round(float(x), 1) for x in world)
+        except Exception:  # noqa: BLE001
+            rec["fg_center_mm"] = None
     else:
-        rec["fg_center_norm"] = None
+        rec["fg_center_voxel"] = None
+        rec["fg_center_mm"] = None
 
-    # 肿瘤体积 cm^3
+    # 前景合计体积（**所有 >0 标签的合并**，不是肿瘤；label 语义未定时按此口径引用）
     if rec["voxel_mm3"] and rec["fg_voxels"]:
-        rec["tumor_volume_cm3"] = float(rec["fg_voxels"] * rec["voxel_mm3"] / 1000.0)
-        rec["tumor_frac_of_body"] = float(rec["fg_voxels"] / max(1, rec["body_voxels"]))
+        rec["fg_all_labels_cm3"] = float(rec["fg_voxels"] * rec["voxel_mm3"] / 1000.0)
+        rec["fg_all_labels_frac_of_body"] = float(rec["fg_voxels"] / max(1, rec["body_voxels"]))
     else:
-        rec["tumor_volume_cm3"] = None
-        rec["tumor_frac_of_body"] = None
+        rec["fg_all_labels_cm3"] = None
+        rec["fg_all_labels_frac_of_body"] = None
 
     return rec
 
@@ -531,7 +611,7 @@ def report_geometry(recs: list) -> None:
     hr("[3] 几何与头信息（每个 case 一行）")
     p("说明：case 用 intersection 口径（volume 与 segmentation 都存在才计算）。")
     p("")
-    p("case | vol_shape | seg_shape | spacing_mm | dtype(v/s) | axcodes(v/s) | affine_match | max_diff | voxel_mm | size_MB(v/s)")
+    p("case | vol_shape | seg_shape | spacing_mm | dtype(v/s) | axcodes(v/s) | affine_match | max_diff | voxel_mm | size_MB(v/s) | resampled_to_vol | resampled_fg_in_body")
     if any(r.get("status") == "OK_SKIPPED" for r in recs):
         p("注：status=OK_SKIPPED 表示该 case 因 --skip-stats 只读了头信息，seg_* 与误差列显示 NA。")
     for r in recs:
@@ -542,8 +622,11 @@ def report_geometry(recs: list) -> None:
             f"{r['case']} | {r['vol_shape']} | {r.get('seg_shape', 'NA')} | {fmt_tuple(r['vol_zooms'], 4)} | "
             f"{r['vol_dtype']}/{r.get('seg_dtype', 'NA')} | {r.get('vol_axcodes', 'NA')}/{r.get('seg_axcodes', 'NA')} | "
             f"{fmt_num(r.get('affine_match'))} | {fmt_num(r.get('max_affine_diff'))} | {fmt_num(r.get('voxel_mm'))} | "
-            f"{fmt_num(round((r.get('vol_bytes') or 0) / 1e6, 2))}/{fmt_num(round((r.get('seg_bytes') or 0) / 1e6, 2))}"
+            f"{fmt_num(round((r.get('vol_bytes') or 0) / 1e6, 2))}/{fmt_num(round((r.get('seg_bytes') or 0) / 1e6, 2))} | "
+            f"{fmt_num(r.get('resampled_to_vol'))} | {fmt_num(r.get('resampled_fg_frac_in_body'))}"
         )
+    p("注：resampled_to_vol=1 表示该 case 的掩膜 affine 与影像不一致，脚本已把掩膜重采样到影像网格后再统计；")
+    p("    resampled_fg_in_body 是重采样后前景落在非空气掩膜内的比例，接近 1 才说明对齐成功。")
 
     ok = [r for r in recs if r.get("status") == "OK"]
     if not ok:
@@ -608,15 +691,28 @@ def report_intensity(recs: list) -> None:
             f"{fmt_num(r['vol_std'])} | {','.join(fmt_num(x) for x in r['vol_percentiles'])} | {r['vol_nonfinite']}"
         )
     p("")
-    p("--- 身体区域（CT: 体素 > -900HU；无符号数据: 体素 > 0）---")
-    p(f"case | body_voxels | body_frac | mean | std | {qhdr} | body_slices")
+    p(f"--- 非空气掩膜（每 case 使用的阈值见 body_threshold 列；这不是「身体」的严格定义）---")
+    p(f"case | body_threshold | body_voxels | body_frac | mean | std | {qhdr} | body_slices | adaptive_thr | adaptive_frac")
     for r in ok:
         p(
-            f"{r['case']} | {r['body_voxels']} | {fmt_num(r['body_fraction_total'])} | {fmt_num(r.get('body_mean'))} | "
-            f"{fmt_num(r.get('body_std'))} | {','.join(fmt_num(x) for x in r['body_percentiles'])} | {r['body_slices']}"
+            f"{r['case']} | {fmt_num(r.get('body_threshold'))} | {r['body_voxels']} | "
+            f"{fmt_num(r['body_fraction_total'])} | {fmt_num(r.get('body_mean'))} | "
+            f"{fmt_num(r.get('body_std'))} | {','.join(fmt_num(x) for x in r['body_percentiles'])} | "
+            f"{r['body_slices']} | {fmt_num(r.get('body_threshold_adaptive'))} | "
+            f"{fmt_num(r.get('body_fraction_adaptive'))}"
         )
+    p("注：mean/std 两列是「非空气掩膜」内的统计，因为该掩膜含空气（见下敏感性表），")
+    p("    不能当作肝实质/软组织的强度统计；归一化请用后面的 tissue_* 列。")
     p("")
-    p("--- 前景/肿瘤区域（只看掩膜内体素的强度）---")
+    p("--- 阈值敏感性：不同阈值下被判为「非空气」的体素占比 ---")
+    p("case | " + " | ".join(f">{fmt_num(t)}" for t, _ in ok[0]["body_threshold_sensitivity"]))
+    for r in ok:
+        cells = ["NA" if frac is None else fmt_num(frac) for _, frac in r["body_threshold_sensitivity"]]
+        p(f"{r['case']} | " + " | ".join(cells))
+    p("判读：若 -900 与 -500 两列的占比相差很大，说明有大量体素落在 [-900,-500) 区间，")
+    p("      在非标准 HU 数据上这通常就是空气被算进了身体，此时 body_mean/body_percentiles 不能当组织强度用。")
+    p("")
+    p("--- 前景（所有 >0 标签的合并；不是肿瘤体积）强度 ---")
     p(f"case | fg_voxels | {qhdr}")
     for r in ok:
         p(
@@ -625,22 +721,42 @@ def report_intensity(recs: list) -> None:
         )
     p("")
     p("--- 聚合（中位数口径，用于选窗/归一化） ---")
-    body_lo = [r["body_percentiles"][1] for r in ok]        # p1
-    body_hi = [r["body_percentiles"][7] for r in ok]        # p99
-    body_med = [r["body_percentiles"][4] for r in ok]       # p50
-    p(f"body_p1_median={fmt_num(np.median(body_lo))} body_p50_median={fmt_num(np.median(body_med))} body_p99_median={fmt_num(np.median(body_hi))}")
+    # 不按固定下标取分位数（qs 顺序一改就会静默取错），改按关键字查找
+    def q_index(recs_list, q):
+        try:
+            return recs_list[0]["pct_qs"].index(q)
+        except ValueError:
+            return None
+
+    for q in (1, 50, 99):
+        idx = q_index(ok, q)
+        if idx is None:
+            continue
+        vals = [r["body_percentiles"][idx] for r in ok if r["body_percentiles"][idx] is not None]
+        if vals:
+            p(f"body_p{q}_median={fmt_num(np.median(vals))}")
     vmin = [r["vol_min"] for r in ok]
     vmax = [r["vol_max"] for r in ok]
     p(f"global_min={fmt_num(min(vmin))} global_max={fmt_num(max(vmax))}")
     p("提示：若 global_min < -1000 或 global_max > 4000，说明强度不是标准 HU，归一化前需确认。")
+    # 组织区域的裁剪窗：用自适应阈值（若触发）排除空气，否则退回默认阈值，避免把空气算进窗内
     lo = [r["zscore_clip_lo"] for r in ok if r.get("zscore_clip_lo") is not None]
     hi = [r["zscore_clip_hi"] for r in ok if r.get("zscore_clip_hi") is not None]
     if lo and hi:
-        p("z-score 裁剪窗参考（body 区域 p0.5 / p99.5 的中位数）："
+        p("z-score 裁剪窗参考（组织区域 p0.5 / p99.5 的中位数）："
           f"lo={fmt_num(np.median(lo))} hi={fmt_num(np.median(hi))} -> "
           "MONAI: ScaleIntensityRangePercentiles(lower=0.5, upper=99.5, b_min=0, b_max=1, clip=True)")
-    p("z-score 参考（对 body 区域）：per-case body_mean/body_std 已在上面列出；"
-      "也可用 ScaleIntensityRangePercentiles 并按 body p1/p99 裁剪离群值。")
+    p("z-score 参考（对组织区域）：per-case tissue_mean/tissue_std 见下表；")
+    p("注意：上面的 body_percentiles 含空气（阈值口径见 body_threshold 与敏感性表），")
+    p("      归一化请用 tissue_* 而不是 body_*，否则窗宽会被空气拉宽。")
+    p("")
+    p("--- 组织区域（高于自适应阈值；用于归一化，不含空气）---")
+    p("case | tissue_threshold | tissue_mean | tissue_std | zscore_clip_lo | zscore_clip_hi")
+    for r in ok:
+        p(
+            f"{r['case']} | {fmt_num(r.get('tissue_threshold'))} | {fmt_num(r.get('tissue_mean'))} | "
+            f"{fmt_num(r.get('tissue_std'))} | {fmt_num(r.get('zscore_clip_lo'))} | {fmt_num(r.get('zscore_clip_hi'))}"
+        )
 
 
 def report_labels(recs: list) -> None:
@@ -649,7 +765,7 @@ def report_labels(recs: list) -> None:
     if not ok:
         p("无可用 case。")
         return
-    p("case | n_labels | values(value:count) | has_bg | integer | negative | fractional")
+    p("case | n_labels | values(value:count) | has_bg | integer | negative | fractional | resampled")
     value_sets = collections.Counter()
     for r in ok:
         vals = r["seg_values"]
@@ -658,8 +774,16 @@ def report_labels(recs: list) -> None:
         p(
             f"{r['case']} | {r['n_unique_labels']} | {vs} | "
             f"{fmt_num(r['has_background'])} | {fmt_num(r['seg_is_integer'])} | "
-            f"{fmt_num(r['seg_negative'])} | {fmt_num(r['seg_fractional'])}"
+            f"{fmt_num(r['seg_negative'])} | {fmt_num(r['seg_fractional'])} | "
+            f"{fmt_num(r.get('resampled_to_vol'))}"
         )
+    p("")
+    p("--- 逐前景标签的体积与强度（这是判断 label 语义的关键，务必与 [6] 节的分开看）---")
+    p("case | label | voxels | vol_cm3 | intensity_p50")
+    for r in ok:
+        for lab in sorted(r.get("label_stats", {})):
+            st = r["label_stats"][lab]
+            p(f"{r['case']} | label {lab} | {st['n']} | {fmt_num(st.get('vol_cm3'))} | {fmt_num(st.get('intensity_p50'))}")
     p("")
     p("--- 聚合 ---")
     p(f"unique_value_set_patterns={len(value_sets)}")
@@ -670,60 +794,76 @@ def report_labels(recs: list) -> None:
     p(f"all_integer={fmt_num(all(r['seg_is_integer'] for r in ok))}")
     p(f"any_negative={fmt_num(any(r['seg_negative'] for r in ok))}")
     p(f"any_empty_mask={fmt_num(any(r['fg_voxels'] == 0 for r in ok))}")
+    # 逐标签聚合中位数
+    for lab in (1, 2):
+        vols = [r["label_stats"][lab]["vol_cm3"] for r in ok
+                if lab in r.get("label_stats", {}) and r["label_stats"][lab].get("vol_cm3") is not None]
+        n_cases = sum(1 for r in ok if lab in r.get("label_stats", {}))
+        if vols:
+            p(f"label {lab}: 出现 {n_cases}/{len(ok)} 个 case | vol_cm3 中位={fmt_num(np.median(vols))} "
+              f"范围={fmt_num(min(vols))}-{fmt_num(max(vols))}")
+    # 重采样是否丢标注
+    resampled = [r for r in ok if r.get("resampled_to_vol")]
+    if resampled:
+        p(f"经重采样对齐的 case 数 = {len(resampled)} -> {[r['case'] for r in resampled]}")
+        p("case | 原始 label 分布 | 重采样后 label 分布")
+        for r in resampled:
+            p(f"{r['case']} | {r.get('seg_values_raw')} | {r.get('seg_values')}")
+        p("判读：若某标签的重采样后体素数明显少于原始值，说明该掩膜未覆盖住影像网格，重采样会丢标注。")
     if all_vals and set(all_vals) <= {"0", "1"}:
-        p("结论：二分类掩膜（0=背景，1=肿瘤/病灶）。")
+        p("结论：二分类掩膜（0=背景，1=某单一结构）。")
     elif all_vals and set(all_vals) <= {"0", "1", "2"}:
-        p("结论：最多三类。请在报告里确认 1/2 的语义（例如 1=肝脏 2=肿瘤，或 1=肿瘤 2=其他）。")
+        p("结论：取值含 0/1/2。**本脚本不做语义判定**：1 与 2 谁是肝脏、谁是肿瘤，")
+        p("      必须看上面的逐标签体积/强度，并用 scripts/probe_labels.py 判定嵌构关系。")
+        p("      切勿把 label>0 的合并体积当肿瘤体积（那通常主要来自最大的那个器官标签）。")
     else:
         p("结论：取值超出 {0,1,2}，需人工确认标签定义。")
 
 
 def report_scale(recs: list) -> None:
-    hr("[6] 任务规模：肿瘤体积、切片覆盖、patch 可行性")
+    hr("[6] 任务规模：前景覆盖、切片分布、patch 可行性")
     ok = [r for r in recs if r["status"] == "OK"]
     if not ok:
         p("无可用 case。")
         return
-    p("case | tumor_voxels | tumor_cm3 | frac_of_body | fg_slices/total | fg_slice_range | area_min/med/max | area1_frac | fg_in_body | center_norm")
+    p("重要口径声明：下表 fg_* = **所有 label>0 的合并前景**，不是肿瘤体积；")
+    p("              逐标签体积见 [5] 节，label 语义判定见 scripts/probe_labels.py。")
+    p("case | fg_voxels | fg_all_labels_cm3 | fg/非空气掩膜 | fg_slices/total | fg_slice_range | area_min/med/max | area1_frac | fg_in_body | center_mm")
     for r in ok:
         rng = "NA"
         if r["fg_first_slice"] is not None:
             rng = f"{r['fg_first_slice']}-{r['fg_last_slice']}"
         p(
-            f"{r['case']} | {r['fg_voxels']} | {fmt_num(r.get('tumor_volume_cm3'))} | "
-            f"{fmt_num(r.get('tumor_frac_of_body'))} | {r['fg_slices']}/{r['n_slices']} | {rng} | "
+            f"{r['case']} | {r['fg_voxels']} | {fmt_num(r.get('fg_all_labels_cm3'))} | "
+            f"{fmt_num(r.get('fg_all_labels_frac_of_body'))} | {r['fg_slices']}/{r['n_slices']} | {rng} | "
             f"{fmt_num(r.get('fg_area_min'))}/{fmt_num(r.get('fg_area_median'))}/{fmt_num(r.get('fg_area_max'))} | "
-            f"{fmt_num(r.get('fragile_slices_frac'))} | {fmt_num(r['fg_bbox_inside_body'])} | {r.get('fg_center_norm')}"
+            f"{fmt_num(r.get('fragile_slices_frac'))} | {fmt_num(r['fg_bbox_inside_body'])} | {r.get('fg_center_mm')}"
         )
     p("")
     p("--- 聚合 ---")
     fgs = np.array([r["fg_voxels"] for r in ok], dtype=np.float64)
-    cm3 = np.array([r["tumor_volume_cm3"] for r in ok if r.get("tumor_volume_cm3") is not None], dtype=np.float64)
+    cm3 = np.array([r["fg_all_labels_cm3"] for r in ok if r.get("fg_all_labels_cm3") is not None], dtype=np.float64)
     p(f"fg_voxels: min={int(fgs.min())} median={int(np.median(fgs))} mean={fmt_num(fgs.mean())} max={int(fgs.max())}")
     if cm3.size:
-        p(f"tumor_cm3: min={fmt_num(cm3.min())} median={fmt_num(np.median(cm3))} mean={fmt_num(cm3.mean())} max={fmt_num(cm3.max())}")
-        p(f"pct_cases_with_tumor_under_1cm3={fmt_num(round(float(np.mean(cm3 < 1.0)), 3))}")
+        p(f"fg_all_labels_cm3: min={fmt_num(cm3.min())} median={fmt_num(np.median(cm3))} mean={fmt_num(cm3.mean())} max={fmt_num(cm3.max())}")
+        p("判读：该体积若在 1000~1800 cm³ 量级，几乎可以肯定主要是肝脏（成人肝的典型体积），而非肿瘤；")
+        p("      肝内病灶通常远小于此，请以 [5] 节的逐标签体积为准。")
     ratios = [r["fg_slices"] / max(1, r["n_slices"]) for r in ok]
     p(f"fg_slice_ratio: min={fmt_num(min(ratios))} median={fmt_num(np.median(ratios))} max={fmt_num(max(ratios))}")
     p(f"cases_with_bbox_outside_body={[r['case'] for r in ok if not r['fg_bbox_inside_body']]}")
     p(f"body_slice_ratio_median={fmt_num(np.median([r['body_slices'] / max(1, r['n_slices']) for r in ok]))}")
     p("")
-    p("--- 掩膜语义合理性自检（防止把肝脏/器官掩膜误当病灶）---")
-    cov = [r.get("tumor_frac_of_body") for r in ok if r.get("tumor_frac_of_body") is not None]
-    if cov:
-        p(f"fg_over_body_ratio: min={fmt_num(min(cov))} median={fmt_num(np.median(cov))} max={fmt_num(max(cov))}")
-        big = [r["case"] for r in ok if (r.get("tumor_frac_of_body") or 0) > 0.35]
-        p(f"cases_where_mask_covers_over_35pct_of_body={big}")
-        p("判读：肝肿瘤通常只占身体的 0.1%~5%；若多数 case 远高于此，掩膜很可能是肝脏/器官而非病灶。")
+    p("--- 强度对比（用于判断任务是否可学）---")
     contrast = []
     for r in ok:
-        if r.get("fg_percentiles") and r["fg_percentiles"][4] is not None and r.get("body_mean") is not None:
-            std = r.get("body_std") or 0.0
+        if r.get("fg_percentiles") and r["fg_percentiles"][4] is not None and r.get("tissue_mean") is not None:
+            std = r.get("tissue_std") or 0.0
             if std > 0:
-                contrast.append((r["fg_percentiles"][4] - r["body_mean"]) / std)
+                contrast.append((r["fg_percentiles"][4] - r["tissue_mean"]) / std)
     if contrast:
-        p(f"fg_median_minus_body_mean_in_body_std: min={fmt_num(min(contrast))} median={fmt_num(np.median(contrast))} max={fmt_num(max(contrast))}")
-        p("判读：该值为前景中位强度相对身体均值的 z 分数；明显偏离 0 说明病灶与肝实质有强度差，任务可学。")
+        p(f"fg_median_minus_tissue_mean_in_tissue_std: min={fmt_num(min(contrast))} median={fmt_num(np.median(contrast))} max={fmt_num(max(contrast))}")
+        p("判读：这是「全部前景合并」相对组织均值的偏离，主要反映肝脏而非病灶；")
+        p("      要判断病灶-肝实质对比度，必须分标签算（见 probe_labels.py 的逐 label 强度）。")
     m = [r["case"] for r in ok if r["body_voxels"] == 0]
     if m:
         p(f"cases_with_empty_body_mask={m}（空气阈值口径可能不适配该数据，请核对强度范围）")
@@ -747,10 +887,17 @@ def report_conclusion(recs: list, cls: dict) -> None:
     ax = {r["vol_axcodes"] for r in ok}
     dtypes = {r["vol_dtype"] for r in ok}
     seg_dtypes = {r["seg_dtype"] for r in ok}
-    labels = sorted({v for r in ok for v, _ in r["seg_values"]}, key=lambda s: float(s))
-    cm3 = [r["tumor_volume_cm3"] for r in ok if r.get("tumor_volume_cm3") is not None]
+    # 按整数排序，避免非数字标签被 float() 抛 ValueError 而整节崩掉
+    label_ints = sorted({int(v) for r in ok for v, _ in r["seg_values"] if str(v).lstrip("-").isdigit()})
+    labels = [str(x) for x in label_ints]
+    cm3 = [r["fg_all_labels_cm3"] for r in ok if r.get("fg_all_labels_cm3") is not None]
+    n_fg_labels = max((r.get("fg_label_count", 0) for r in ok), default=0)
+    missing_fg = [r["case"] for r in ok if r.get("fg_label_count", 0) < n_fg_labels]
     p(f"n_cases={len(ok)}")
-    p(f"mask_semantics={'binary' if labels == ['0', '1'] else 'multiclass'}")
+    p(f"mask_semantics={'binary' if label_ints == [0, 1] else 'multiclass'}")
+    p(f"n_foreground_labels={n_fg_labels}（输出通道数应为 {n_fg_labels + 1}：背景 + 各前景标签）")
+    p(f"cases_missing_some_foreground_label={missing_fg if missing_fg else '无'}")
+    p("注意：mask_semantics=multiclass 时，label>0 的合并前景**不是**肿瘤，务必看 [5] 节逐标签体积。")
     p(f"label_values={labels}")
     p(f"volume_dtype={sorted(dtypes)} segmentation_dtype={sorted(seg_dtypes)}")
     p(f"shape_uniform={fmt_num(len(shapes) == 1)} unique_shapes={len(shapes)}")
@@ -758,8 +905,9 @@ def report_conclusion(recs: list, cls: dict) -> None:
     p(f"axcodes={sorted(ax)}")
     p(f"shape_example={ok[0]['vol_shape']}")
     p(f"spacing_example={tuple(round(z, 4) for z in ok[0]['vol_zooms'])}")
-    p(f"tumor_cm3_median={fmt_num(np.median(cm3)) if cm3 else 'NA'}")
+    p(f"fg_all_labels_cm3_median={fmt_num(np.median(cm3)) if cm3 else 'NA'}")
     p(f"foreground_slice_ratio_median={fmt_num(np.median([r['fg_slices'] / max(1, r['n_slices']) for r in ok]))}")
+    p(f"cases_with_affine_mismatch={[r['case'] for r in ok if not r['affine_match']]}")
     p(f"hint=volume-<id>.nii 为影像，segmentation-<id>.nii 为同空间掩膜，配对 id 共 {len(cls['volumes'])} 个 volume / {len(cls['segs'])} 个 segmentation")
 
 
