@@ -1,8 +1,10 @@
 """划分：按肿瘤体积把 20 例含肿瘤病人分层成 5 折，5 例仅肝脏病人只进训练集。
 
-整体功能：读 reports/preprocess_stats.json（或 cache 清单）拿到逐 case 肿瘤体积，先按体积排秩分 5 个体积档，
-        再把每档 4 例贪心分给 5 折，保证每折验证集恰好 4 例且各折体积总和接近；仅肝脏病例进每折的 train。
-前后接口：上游是 scripts/preprocess.py 产出的统计/清单；下游给 src/dataset.py 与 src/train.py 提供 data/splits.json（纳入 git）。
+整体功能：从 cache 清单（或预处理统计）拿到逐 case 肿瘤体积，按体积降序每 5 例构成一个体积档，
+        档内最重的先配给「每例平均已分配体积预算最小」的折，使每折验证集恰好 4 例且各折体积接近；
+        5 例仅肝脏病例固定进每折的 train，永不进验证集。
+前后接口：上游是 scripts/preprocess.py（或 fetch_manifest.py）产出的 cache_manifest.json；
+        下游给 src/dataset.py 与 src/train.py 提供 data/splits.json（纳入 git）。
 用法：在仓库根目录执行 ``python scripts/make_splits.py``，自检通过后把 data/splits.json 提交入库。
 """
 
@@ -38,36 +40,45 @@ except ModuleNotFoundError:  # pragma: no cover
 LOGGER = setup_logger("make_splits")
 
 
-def collect_tumor_volumes(cfg: dict) -> dict:
-    """返回 case_id -> 肿瘤体积(mm3)；优先用预处理统计，缺失时退到 cache 清单。"""
-    paths = cfg.get("paths", {}) or {}
-    stats = load_json(paths.get("preprocess_stats", "reports/preprocess_stats.json"))
-    if stats and stats.get("cases"):
-        out = {}
-        for rec in stats["cases"]:
-            if rec.get("status") != "OK":
-                continue
-            out[int(rec["case"])] = float(rec.get("tumor_volume_mm3", 0.0) or 0.0)
-        if out:
-            return out
+def collect_tumor_volumes(cfg: dict, excluded: set | None = None) -> dict:
+    """返回 case_id -> 肿瘤体积(mm3)。
 
+    优先用 cache 清单：它是「磁盘上真实存在的缓存」的权威记录，且 preprocess.py 与
+    fetch_manifest.py 都会刷新它；仅当清单缺失时才退到预处理统计报告（那份可能来自更早的运行）。
+    """
+    paths = cfg.get("paths", {}) or {}
     manifest = load_json(paths.get("cache_manifest", "cache/cache_manifest.json"))
     if manifest and manifest.get("cases"):
-        LOGGER.warning("未找到预处理统计，改用 cache 清单 %s", rel_to_root(paths.get("cache_manifest", "")))
-        return {int(r["case"]): float(r.get("tumor_volume_mm3", 0.0) or 0.0) for r in manifest["cases"]}
+        volumes = {int(r["case"]): float(r.get("tumor_volume_mm3", 0.0) or 0.0) for r in manifest["cases"]}
+    else:
+        stats = load_json(paths.get("preprocess_stats", "reports/preprocess_stats.json"))
+        if not (stats and stats.get("cases")):
+            raise FileNotFoundError(
+                "既没有 cache/cache_manifest.json 也没有 reports/preprocess_stats.json，"
+                "请先运行 python scripts/preprocess.py")
+        LOGGER.warning("未找到 cache 清单，改用预处理统计报告 %s（可能来自更早的运行，请注意时效）",
+                       rel_to_root(paths.get("preprocess_stats", "")))
+        volumes = {int(rec["case"]): float(rec.get("tumor_volume_mm3", 0.0) or 0.0)
+                   for rec in stats["cases"] if rec.get("status") == "OK"}
 
-    raise FileNotFoundError(
-        "既没有 reports/preprocess_stats.json 也没有 cache/cache_manifest.json，请先运行 python scripts/preprocess.py")
+    if excluded:
+        dropped = sorted(set(volumes) & set(excluded))
+        if dropped:
+            LOGGER.warning("清单里出现了排除清单中的病例，已剔除：%s（清单可能过期，建议重跑 preprocess.py）", dropped)
+            volumes = {c: v for c, v in volumes.items() if c not in excluded}
+    if not volumes:
+        raise ValueError("清单/统计里没有任何可用病例")
+    return volumes
 
 
 def stratify_assign(volumes: dict, n_folds: int, seed: int, verbose: bool = True) -> tuple:
     """按肿瘤体积分层把病例分给各折。
 
-    做法：体积降序后每 ``n_folds`` 例构成一个「体积档」（档内是相邻量级的病例）；档内按体积降序
-    （最重的先排），依次配给「每档平均体积预算最接近」的折（预算 = 该折已分配总体积 / 已分配例数，
-    空折预算记为 +inf 所以最重的病例一定落在空折）。这样每个档内的病例一定落在不同折 → 每折都同时
-    拿到大、中、小病灶；按「例数」而不是「体积余量」做归一，避免了余量变负后退化成任意绑扎。
-    同体积并列者用固定 seed 随机排序，消除 id 与体积的隐性相关。
+    做法：体积降序后每 ``n_folds`` 例构成一个「体积档」（档内是相邻量级的病例，恰好
+    ``n_folds`` 例时每折分到一个）；档内按体积降序，依次配给「每例平均已分配体积预算最小」的折
+    （预算 = 该折已分配总体积 / 已分配例数；空折记为 +inf，排在预算升序的最前面，所以最重的病例
+    一定进空折）。按「例数」而不是「体积余量」归一，可避免余量变负后退化成任意绑扎。
+    只有体积完全相同的并列病例用固定 seed 随机排序，以消除 id 与体积的隐性相关。
     返回 (fold -> [case,...], fold -> 体积合计)。
     """
     rng = random.Random(seed)
@@ -134,7 +145,7 @@ def main(argv=None) -> int:
     exclude_doc = load_json(paths.get("exclude", "data/exclude_cases.json"), default={}) or {}
     excluded = sorted(int(item["case"]) for item in exclude_doc.get("exclude", []))
 
-    volumes = collect_tumor_volumes(cfg)
+    volumes = collect_tumor_volumes(cfg, excluded=set(excluded))
     tumor_cases = sorted([c for c, v in volumes.items() if v > 0.0])
     liver_only = sorted([c for c, v in volumes.items() if v <= 0.0])
     LOGGER.info("可用 %d 例：含肿瘤 %d 例 %s", len(volumes), len(tumor_cases), tumor_cases)
@@ -185,8 +196,8 @@ def main(argv=None) -> int:
         "notes": [
             "划分粒度是病人，不是切片：同一病人的所有切片只会出现在同一侧，避免相邻层泄漏导致 Dice 虚高。",
             "5 例仅肝脏病人固定进每折的 train，用于约束模型假阳性；验证集分母恒为 4 例含肿瘤病人。",
-            "分层做法：按肿瘤体积降序每 5 例一档，档内最重的先配给体积余量最大的折，"
-            "使每折都同时含大、中、小病灶且体积总和接近（见 val_volume_balance）。",
+            "分层做法：按肿瘤体积降序每 n_folds 例构成一个体积档，档内最重的先配给「每例平均已分配"
+            "体积预算最小」的折，使每折都同时含大、中、小病灶且体积总和接近（见 val_volume_balance）。",
             "本文件纳入 git，保证跨轮次、跨机器复现同一划分。",
         ],
     }

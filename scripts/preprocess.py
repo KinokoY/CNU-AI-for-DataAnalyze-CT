@@ -52,7 +52,7 @@ VOLUME_RE = re.compile(r"^volume[-_](\d+)$")
 SEG_RE = re.compile(r"^segmentation[-_](\d+)$")
 NII_SUFFIXES = (".nii.gz", ".nii")
 
-# 与 config 中 preprocess 节同名的默认值，仅用于 --debug 时的兜底
+# 与 config 中 preprocess 节同名的默认值；config 里的值会覆盖它，因此这里只是兜底
 DEFAULTS = {
     "target_spacing": [1.0, 1.0, 1.0],
     "orientation": "RAS",
@@ -99,7 +99,7 @@ def discover_cases(data_dir: Path) -> tuple[dict, dict]:
     return volumes, segs
 
 
-def select_cases(volumes: dict, segs: dict, excluded: set, case_id_min: int = 0) -> list:
+def select_cases(volumes: dict, segs: dict, excluded: set) -> list:
     """取 volume/segmentation 成对且未被剔除的 case id，按数值升序返回。"""
     paired = sorted(set(volumes) & set(segs))
     missing_seg = sorted(set(volumes) - set(segs))
@@ -108,7 +108,7 @@ def select_cases(volumes: dict, segs: dict, excluded: set, case_id_min: int = 0)
         LOGGER.warning("有 volume 但缺 segmentation 的 case（已跳过）：%s", missing_seg)
     if missing_vol:
         LOGGER.warning("有 segmentation 但缺 volume 的 case（已跳过）：%s", missing_vol)
-    selected = [c for c in paired if c not in excluded and c >= case_id_min]
+    selected = [c for c in paired if c not in excluded]
     dropped = [c for c in paired if c in excluded]
     if dropped:
         LOGGER.info("按排除清单剔除 %d 例：%s", len(dropped), dropped)
@@ -127,11 +127,6 @@ def load_as_float(volume_path: Path):
     if img.GetPixelID() != sitk.sitkFloat32:
         img = sitk.Cast(img, sitk.sitkFloat32)
     return img
-
-
-def load_mask_binary(seg_path: Path, label: int = 2):
-    """读取掩膜并只保留指定 label（默认 2 = 肿瘤），返回 uint8 的 0/1 掩膜图。"""
-    return mask_from_label(load_seg_labels(seg_path), label)
 
 
 def load_seg_labels(seg_path: Path):
@@ -170,16 +165,16 @@ def apply_floor_clamp(img, floor_value: float, margin: float, clamp_to: float):
     return sitk.Cast(sitk.Mask(img, mask, outsideValue=float(clamp_to)), sitk.sitkFloat32)
 
 
-def resample_ras_1mm(img, target_spacing, interpolator: int):
-    """先统一到 RAS 方位，再重采样到目标 spacing（影像用线性、掩膜用最近邻）。
+def resample_ras_1mm(img, target_spacing, interpolator: int, orientation: str = "RAS"):
+    """先把方位统一到 ``orientation``（默认 RAS），再重采样到目标 spacing（影像线性、掩膜最近邻）。
 
-    输出网格按「输入物理范围 / target_spacing」计算；因为已经在 RAS 上，direction 是轴对齐的置换矩阵，
-    该窗口就是紧致的，不会出现倾斜包围盒导致的尺寸爆炸（这也是原先把 origin 设成输入端原点后
-    覆盖范围偏移的修法：这里显式给定 size 与 origin，SITK 不再自行推导）。
+    输出网格按「输入物理范围 / target_spacing」计算；因为已经轴对齐，direction 是置换矩阵，
+    该窗口就是紧致的，不会出现倾斜包围盒导致的尺寸爆炸。这里显式给定 size 与 origin，
+    不让 SITK 自行推导输出网格。
     """
     import SimpleITK as sitk
 
-    oriented = sitk.DICOMOrient(img, "RAS")
+    oriented = sitk.DICOMOrient(img, str(orientation))
     original_spacing = oriented.GetSpacing()
     original_size = oriented.GetSize()
     new_size = [int(np.ceil(original_size[i] * abs(original_spacing[i]) / abs(float(target_spacing[i]))))
@@ -198,11 +193,11 @@ def resample_ras_1mm(img, target_spacing, interpolator: int):
 
 
 def crop_origin_to_nonzero(img, arr: np.ndarray):
-    """把输出 origin 前移 fg 最小体素的物理偏移，使「世界坐标 - origin」落回约 [0, 边长)。
+    """把输出 origin 前移到前景体素最小角的物理偏移处，影像与掩膜用同一次偏移。
 
-    动机：DICOMOrient 只改像素轴序，不改 direction 的符号，LAS 影像重定向到 RAS 后
-    origin 会落在图像另一端，缓存里的世界坐标相对 origin 是负值。这里把 origin 显式挪到
-    fg 包围盒的最小角，下游用 slice.tobytes / np 索引重建时不需要再碰 affine。
+    动机：本流程下游只按「数组索引 + spacing」使用缓存，不解释 affine；把两卷（image 与 label）
+    的 origin 统一挪到同一处，是为了让它们的世界坐标差恒为常数偏移，避免以后有人误以为两卷
+    origin 不同、需要额外对齐。前景为空（仅肝脏病例的 label）时不做偏移。
     """
     import SimpleITK as sitk
 
@@ -240,6 +235,7 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     hu_lo, hu_hi = (float(x) for x in pre["hu_clip"])
     margin = float(pre["floor_margin"])
     clamp_to = float(pre["floor_clamp_value"])
+    orientation = str(pre["orientation"])
     out_dtype = str(pre["image_out_dtype"]).lower()
     if out_dtype not in ("float32", "uint16"):
         # SimpleITK 没有 float16 像素类型；这里显式拦掉错误配置而不是留到 WriteImage 才炸
@@ -280,12 +276,12 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     step(f"地板夹取（floor={floor_value}，比例 {rec['floor_fraction']:.4f}）")
     img_clamped = apply_floor_clamp(vol_img, floor_value, margin, clamp_to)
 
-    # 2) RAS + 3) 重采样到 target_spacing（影像线性、掩膜最近邻）
-    step(f"影像 RAS + 重采样到 {target_spacing}")
-    img_rs, _, new_size = resample_ras_1mm(img_clamped, target_spacing, sitk.sitkLinear)
+    # 2) 统一方位 + 3) 重采样到 target_spacing（影像线性、掩膜最近邻）
+    step(f"影像 {orientation} + 重采样到 {target_spacing}")
+    img_rs, _, _ = resample_ras_1mm(img_clamped, target_spacing, sitk.sitkLinear, orientation)
     step(f"影像重采样完成，输出 size={img_rs.GetSize()}")
-    step("掩膜 RAS + 重采样（最近邻）")
-    seg_rs, _, _ = resample_ras_1mm(seg_img, target_spacing, sitk.sitkNearestNeighbor)
+    step(f"掩膜 {orientation} + 重采样（最近邻）")
+    seg_rs, _, _ = resample_ras_1mm(seg_img, target_spacing, sitk.sitkNearestNeighbor, orientation)
     step("掩膜重采样完成")
 
     # 4) 全局窗：先记录窗内饱和比例，再 clip 到 [hu_lo, hu_hi]
@@ -314,15 +310,15 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
             LOGGER.warning("case %d 的 label 2 体素数在重采样前后变化异常：%d -> %d（比例 %.3f），"
                            "请检查该例的 spacing", case_id, n_label2_raw, n_label2_rs, ratio)
 
-    # 5) 落盘（关键约定）：cache 用 SITK/SimpleITK 的 **native (z, y, x)** 布局写盘，
-    #    几何信息（spacing/origin/direction）直接沿用重采样后的图像，因此不需要也不应该做转置：
-    #    一旦对数组做 transpose 再 GetImageFromArray，SITK 会把形状解释成 (91,512,512)，
-    #    与原图的 (512,512,91) 不匹配，CopyInformation 会直接抛错。
-    #    下游 src/dataset.py 只按「数组索引 + spacing」使用这些缓存，不解释 affine，
-    #    所以这里不需要转成 nibabel 的 (x,y,z) 视图。
+    # 5) 落盘：数组保持 SimpleITK 的 (nz, ny, nx) 内存顺序，经 GetImageFromArray 后
+    #    几何信息与 img_rs/seg_rs 完全匹配，因此直接把重采样后的几何照抄过来即可。
+    #    不要在这里对数组做 transpose：那会让图像尺寸与待拷贝的几何不一致，
+    #    CopyInformation 会直接抛错；而下游只需要「索引 + spacing」，转置没有任何收益。
     mask_sitk = sitk.GetImageFromArray(seg_arr.astype(np.uint8))
     mask_sitk.CopyInformation(seg_rs)
-    seg_labels = seg_img = seg_rs = None  # 大对象尽早释放，降低峰值内存
+    seg_rs = None  # 掩膜几何已拷进 mask_sitk，其余大对象尽早释放以降低峰值内存
+    seg_img = None
+    seg_labels = None
 
     if out_dtype == "float32":
         # 直接存 clip 后的 HU，归一化留给 dataset.py
@@ -344,18 +340,15 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     rec["origin_shift_ijk"] = list(shift_ijk)
 
     # 6) 统计：以「像素数 + spacing」为准换算 mm3，不依赖 affine。
-    #    轴序实测结论（由 scripts/probe_axis.py 在远程确认，下游 dataset.py 依赖它）：
+    #    轴序实测结论（scripts/probe_axis.py 在远程确认，下游 dataset.py 依赖它）：
     #      * SimpleITK 内存数组是 (nz, ny, nx)（本函数内 seg_arr / img_arr 就是这个顺序）；
     #      * 写成 .nii.gz 后，用 nibabel 读回得到的是 (nx, ny, nz) —— 两个库互为转置；
     #      * 因此「切片轴在 cache 文件的最后一维」，nib 读回时 a[:, :, k] 才是一层 (ny, nx) 切片。
-    #    放在写盘之前：统计若失败就不该留下看似成功的缓存文件。
+    #    统计放在写盘之前：统计若失败就不该留下看似成功的缓存文件。
     step("统计切片与连通域")
     voxel_mm3 = float(np.prod([float(s) for s in img_rs.GetSpacing()]))
     n_tumor_voxels = int(np.count_nonzero(seg_arr))
-    # 每层前景体素数：SimpleITK 数组是 (nz, ny, nx)，对 (y, x) 求和得到的长度才是 nz。
-    # （依据 scripts/probe_axis.py 的实测：SITK 数组轴序为 (z,y,x)；写盘后 nibabel 读回是 (x,y,z)，两者互为转置。
-    #   原先写成 reshape(-1, shape[2]).sum(axis=0) 等于只对 z 求和，得到的长度是 nx，于是
-    #   "含肿瘤切片数"能超过总切片数 —— 那个数字是错的。）
+    # 每层前景体素数：对 (y, x) 两个轴求和，长度才是 nz
     per_slice = seg_arr.sum(axis=(1, 2))
     tumor_slices = int(np.count_nonzero(per_slice >= 1))
     tiny_slices = int(np.count_nonzero((per_slice >= 1) & (per_slice < 10)))
@@ -369,7 +362,7 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     # 三种形状全部记录下来，避免下游再猜轴序：
     #   sitk_shape_zyx：本函数用的 SimpleITK 内存布局
     #   nib_shape_xyz ：cache 文件（.nii.gz）用 nibabel 读回时的布局，切片轴在最后
-    #   inplane_wh    ：面内尺寸 (ny, nx)；nz 为切片数
+    #   inplane_hw    ：面内尺寸 (ny, nx)；nz 为切片数
     rec["new_shape_zyx"] = tuple(int(s) for s in img_arr.shape)
     rec["new_shape_xyz"] = tuple(int(s) for s in img_arr.shape[::-1])
     rec["inplane_hw"] = (int(img_arr.shape[1]), int(img_arr.shape[2]))
@@ -403,7 +396,8 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
         rec["min_component_mm3"] = 0.0
         rec["component_sizes_voxels"] = []
 
-    step(f"写 cache（SITK native (z,y,x) 布局，image dtype={image_with_origin.GetPixelIDTypeAsString()}）")
+    step(f"写 cache（image dtype={image_with_origin.GetPixelIDTypeAsString()}，"
+         f"数组轴序 (nz,ny,nx)，nibabel 读回为 (nx,ny,nz)）")
     image_dir = cache_dir / "image"
     label_dir = cache_dir / "label"
     image_dir.mkdir(parents=True, exist_ok=True)
@@ -464,10 +458,10 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     return rec
 
 
-def build_aggregate(records: list, pre: dict) -> dict:
+def build_aggregate(records: list, pre: dict, pad_to_multiple: int = 16) -> dict:
     """汇总所有 case：面内尺寸分布、分桶情况、肿瘤切片占比、体积量级。
 
-    尺寸一律用「面内 (ny, nx)」口径：数组是 (nz, ny, nx)，切片数 nz 各例不同、
+    尺寸一律用「面内 (ny, nx)」口径：SimpleITK 数组是 (nz, ny, nx)，切片数 nz 各例不同、
     面内尺寸才是决定分桶与显存的量。
     """
     ok = [r for r in records if r["status"] == "OK"]
@@ -483,7 +477,7 @@ def build_aggregate(records: list, pre: dict) -> dict:
         max_hw[0] = max(max_hw[0], int(shape[0]))
         max_hw[1] = max(max_hw[1], int(shape[1]))
 
-    mult = int(16)
+    mult = int(pad_to_multiple)
     buckets = Counter((int(np.ceil(shape[0] / mult) * mult), int(np.ceil(shape[1] / mult) * mult))
                       for shape in inplane for _ in range(inplane[shape]))
 
@@ -609,6 +603,8 @@ def main(argv=None) -> int:
     cfg = load_config(args.config, args.overrides)
     pre = dict(DEFAULTS)
     pre.update(cfg.get("preprocess", {}) or {})
+    model_cfg = cfg.get("model", {}) or {}
+    pad_to_multiple = int(model_cfg.get("pad_to_multiple", 16))
     # 早失败：配置里写错类型时不要等到第 1 例处理到最后一步才炸
     if str(pre["image_out_dtype"]).lower() not in ("float32", "uint16"):
         LOGGER.error("preprocess.image_out_dtype 只支持 'float32' 或 'uint16'，收到 %r"
@@ -658,7 +654,7 @@ def main(argv=None) -> int:
     import SimpleITK as sitk  # 版本号写进报告供复现
     import nibabel as nib
 
-    aggregate = build_aggregate(records, pre)
+    aggregate = build_aggregate(records, pre, pad_to_multiple=pad_to_multiple)
     report = {
         "cfg_hash": cfg_hash,
         "created_from_config": rel_to_root(resolve_path(args.config)),
@@ -715,6 +711,7 @@ def main(argv=None) -> int:
     LOGGER.info("cache 中 image=%d，label=%d（本次期望 %d 例）", n_written, n_label, len(expected_ids))
 
     ran_without_failure = aggregate["n_cases_failed"] == 0
+    next_step = "python scripts/check_cache.py"
     if args.debug or args.limit > 0:
         LOGGER.info("[部分运行] 未做完整性判定；请用不带 --debug/--limit 的命令跑完整 25 例后再依赖 cache。")
     elif not ran_without_failure:
@@ -734,7 +731,7 @@ def main(argv=None) -> int:
             LOGGER.warning("仅肝脏病例实测 %s，与 docs 预期 %s 不一致（不中断，请在报告中确认）。",
                            sorted(got_liver_only), sorted(liver_only_expected))
         LOGGER.info("完整性自检通过：%d 例全部成功，image/label 文件集合与预期一致。", len(expected_ids))
-        LOGGER.info("建议接着跑：python scripts/check_cache.py（逐例核对几何、标签与值域）")
+        next_step = "python scripts/check_cache.py（再跑 python scripts/make_splits.py）"
 
     if args.debug:
         LOGGER.info("[debug] 单个 case 的完整统计：\n%s", json.dumps(records[0], ensure_ascii=False, indent=2))
@@ -742,7 +739,7 @@ def main(argv=None) -> int:
 
     LOGGER.info("统计报告：%s%s", rel_to_root(json_path), f" 与 {rel_to_root(md_path)}" if md_path else "")
     LOGGER.info("缓存清单：%s", rel_to_root(manifest_path))
-    LOGGER.info("下一步：python scripts/make_splits.py")
+    LOGGER.info("下一步：%s", next_step)
     return 0
 
 

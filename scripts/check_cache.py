@@ -1,9 +1,9 @@
-"""缓存体检：读回 cache/ 下的全部产物，逐项核对几何、标签与归一化幅度是否符合约定。
+"""缓存体检：读回 cache/ 下的全部产物，逐项核对几何、标签与数值口径是否符合约定。
 
-整体功能：对每一例检查 image/label 是否成对、shape 是否一致、spacing 是否为 1mm 三轴相同、
-        label 取值是否只含 {0,1}、有无肿瘤、以及影像 HU 是否落在全局窗内；再把实测结果与
-        cache_manifest.json 的记录逐例比对，不一致就报错并以非零码退出。
-前后接口：上游是 scripts/preprocess.py 产出的 cache/ 与 cache/cache_manifest.json；
+整体功能：对每一例检查 image/label 是否成对、shape 是否一致、spacing 是否为约定的 1mm 三项相同、
+        label 取值是否只含 {0,1}、有无肿瘤、影像数值是否落在约定范围（uint16 时为 [0,65535]），
+        并把实测结果与 cache_manifest.json 逐例比对，不一致就报错并以非零码退出。
+前后接口：上游是 scripts/preprocess.py（或 fetch_manifest.py）产出的 cache/ 与 cache_manifest.json；
         下游给 src/dataset.py / src/train.py 一个"缓存可信"的前置保证。
 用法：仓库根目录执行 ``python scripts/check_cache.py``；只要汇总不要逐例明细就加 ``--quiet``。
 """
@@ -61,6 +61,8 @@ def main(argv=None) -> int:
     if not image_dir.is_dir() or not label_dir.is_dir():
         LOGGER.error("cache 目录不存在或缺子目录：%s", rel_to_root(cache_dir))
         return 2
+    LOGGER.info("期望的缓存口径：image_out_dtype=%s，target_spacing=%s，值域 %s",
+                expect_out_dtype, target_spacing, val_desc)
 
     images = sorted(image_dir.glob("*.nii.gz"), key=lambda p: int(p.name.split(".")[0]))
     labels = sorted(label_dir.glob("*.nii.gz"), key=lambda p: int(p.name.split(".")[0]))
@@ -75,17 +77,17 @@ def main(argv=None) -> int:
 
     manifest = load_json(paths.get("cache_manifest", "cache/cache_manifest.json"), default={}) or {}
     manifest_cases = {int(r["case"]): r for r in manifest.get("cases", [])}
-    plural = cfg.get("model", {}) or {}
     if not manifest_cases:
-        problems.append("没有读到 cache_manifest.json —— 请先完整跑一遍 python scripts/preprocess.py")
+        problems.append("没有读到 cache_manifest.json —— 请先跑 python scripts/fetch_manifest.py，"
+                        "或完整跑一遍 python scripts/preprocess.py")
     else:
         disk_ids = {int(c) for c in img_ids}
         if set(manifest_cases) != disk_ids:
             problems.append(f"清单里的 case 集合与磁盘不一致：磁盘 {sorted(disk_ids)} "
                             f"清单 {sorted(manifest_cases)}（可能是只跑了 --limit/--debug 的部分缓存）")
         if not manifest.get("axis_convention"):
-            LOGGER.warning("清单里没有 axis_convention 字段：它来自更早版本的 preprocess.py，"
-                           "建议重跑 preprocess.py 以刷新清单")
+            LOGGER.warning("清单里没有 axis_convention 字段：它来自更早版本的脚本，"
+                           "请跑 python scripts/fetch_manifest.py 刷新清单")
 
     rows: list = []
     for path in images:
@@ -149,7 +151,7 @@ def main(argv=None) -> int:
         if row["img_min"] < val_lo - 1e-3 or row["img_max"] > val_hi + 1e-3:
             problems.append(f"case {case}：影像取值 [{row['img_min']}, {row['img_max']}] "
                             f"超出期望范围 {val_desc}")
-        if case in {str(c) for c in manifest_cases}:
+        if int(case) in manifest_cases:
             rec = manifest_cases[int(case)]
             if list(row["nib_shape_xyz"]) != [int(s) for s in rec.get("nib_shape_xyz", [])]:
                 problems.append(f"case {case}：nibabel 读回的 shape 与清单不符 "

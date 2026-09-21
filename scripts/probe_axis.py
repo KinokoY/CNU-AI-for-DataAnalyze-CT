@@ -1,9 +1,10 @@
-"""轴序探针：确定缓存文件被 nibabel / SimpleITK 读回时的真实数组形状与切片轴。
+"""轴序探针：确认 cache 文件被 nibabel / SimpleITK 读回时的真实数组形状与切片轴。
 
 整体功能：对同一个 .nii.gz 分别用 SimpleITK 与 nibabel 读取，打印各自的数组形状、spacing 与
         "沿各轴求和得到的前景层数"，从而唯一确定切片轴在数组的哪一维，并检查两个库是否互为转置。
-前后接口：只读 data/ 下的原始 NIfTI 与 cache/ 下的缓存（若存在），不写任何文件。
-用法：仓库根目录执行 ``python scripts/probe_axis.py --case 31``。
+前后接口：只读 data/ 下的原始 NIfTI 与 cache/ 下的缓存（若存在）、以及 cache_manifest.json，不写任何文件。
+用法：当改动过写盘 / 重采样逻辑、或怀疑轴序被破坏时执行 ``python scripts/probe_axis.py --case 31``，
+      用输出的"非零层数"与清单里的 tumor_slices 交叉验证哪一维才是切片轴。
 """
 
 from __future__ import annotations
@@ -82,9 +83,20 @@ def main() -> int:
         manifest = json.loads(mpath.read_text(encoding="utf-8"))
         rec = next((r for r in manifest.get("cases", []) if int(r["case"]) == args.case), None)
         if rec:
-            print(f"\n清单记录 shape_zyx={rec['shape_zyx']} tumor_slices={rec['tumor_slices']}")
-            print(f"清单的 shape 是否等于 nibabel 读回的 shape："
-                  f"{[int(x) for x in rec['shape_zyx']] == [int(x) for x in n_lab.shape]}")
+            nib_expected = rec.get("nib_shape_xyz")
+            sitk_expected = rec.get("sitk_shape_zyx")
+            print(f"\n清单记录 nib_shape_xyz={nib_expected} sitk_shape_zyx={sitk_expected} "
+                  f"tumor_slices={rec['tumor_slices']}")
+            if nib_expected is not None and lab_path.exists():
+                print(f"清单的 nib_shape_xyz 是否等于 nibabel 读回的 shape："
+                      f"{[int(x) for x in nib_expected] == [int(x) for x in n_lab.shape]}")
+            if sitk_expected is None:
+                print("提示：清单缺 sitk_shape_zyx/nib_shape_xyz（来自更早的脚本），"
+                      "请跑 python scripts/fetch_manifest.py 刷新")
+        else:
+            print(f"\n清单里没有 case {args.case} 的记录")
+    else:
+        print(f"\n[跳过] 清单不存在：{mpath}")
 
     print("\n判读：哪个轴的『非零层数』与清单 tumor_slices 接近且不超过它，切片轴就是那一维；")
     print("      nz 为切片数，ny/nx 为面内尺寸。")

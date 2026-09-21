@@ -42,14 +42,17 @@ python scripts/preprocess.py
 | 文件 | 说明 |
 | --- | --- |
 | `cache/image/*.nii.gz`、`cache/label/*.nii.gz` | 每例两个文件，共 25 例 |
-| `cache/cache_manifest.json` | 训练启动时校验 cache 与配置是否匹配 |
+| `cache/cache_manifest.json` | 训练启动时校验 cache 与配置是否匹配；**只存在于远程**（不入库） |
 | `reports/preprocess_stats.json` / `.md` | 逐 case 统计 + 尺寸分布汇总（**贴回这个 .md**） |
+
+> 清单过期但缓存有效时，不必重跑预处理：`python scripts/fetch_manifest.py` 会从磁盘重建清单（只读、秒级）。
 
 期望输出（日志尾部）：
 
 ```
 cache 中 image=25，label=25
-下一步：python scripts/make_splits.py
+完整性自检通过：25 例全部成功，image/label 文件集合与预期一致。
+下一步：python scripts/check_cache.py（再跑 python scripts/make_splits.py）
 ```
 
 自检要点：
@@ -74,7 +77,7 @@ python scripts/check_cache.py
 ```
 
 逐例核对：image/label 是否成对、shape 是否一致、spacing 是否为约定的 1mm、
-label 是否只含 {0,1}、有无肿瘤、影像值是否落在全局窗内，并把实测与 `cache_manifest.json`
+label 是否只含 {0,1}、有无肿瘤、影像数值是否落在约定范围，并把实测与 `cache_manifest.json`
 逐例比对；有任何不一致会打印 `发现 N 个问题` 并以退出码 1 结束。
 
 期望输出：
@@ -147,6 +150,9 @@ python -m src.train --fold 0 --debug --set train.batch_size=4 --set train.epochs
 
 ## 4. 运行产物与 git 边界
 
-- **不入库**：`cache/`、`reports/`、`runs/`（已加入 `.gitignore`），以及所有 `*.pt` / `*.nii.gz`。
+- **不入库且只存在于远程**：`cache/`（含 `cache_manifest.json`）、`reports/`、`runs/`，以及所有 `*.pt` / `*.nii.gz`。
+  数据受保密协议约束不能下载，所以本地仓库看不到这些文件；后续编码所需的关键数字都记在
+  `docs/preprocess_notes.md` 里。
 - **入库**：`data/splits.json`、`data/exclude_cases.json`、`configs/*.yaml`、`src/*.py`、`scripts/*.py`、`docs/*.md`。
+  注意：`data/splits.json` 由远程运行 `make_splits.py` 生成，**必须在远程提交并 push 回来**，本地才会有。
 - 随机种子固定为 `train.seed`（默认 42），预处理/划分/训练/评估四处的口径见各自脚本头部注释。
