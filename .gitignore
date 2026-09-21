@@ -1,6 +1,7 @@
-# ===== 数据（原始/中间/输出数据一律不入库，仅保留目录占位）=====
+# ===== 数据（原始/中间/输出数据一律不入库，仅保留目录占位与说明）=====
 data/*
 !data/.gitkeep
+!data/README.md
 
 # ===== Python =====
 __pycache__/
@@ -41,6 +42,7 @@ tmp/
 temp/
 *.tmp
 *.bak
+probe_report.txt
 
 # ===== 编辑器与 IDE =====
 .vscode/
