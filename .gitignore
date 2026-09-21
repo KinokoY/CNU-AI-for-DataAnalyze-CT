@@ -1,0 +1,62 @@
+# ===== 数据（原始/中间/输出数据一律不入库，仅保留目录占位）=====
+data/*
+!data/.gitkeep
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+venv/
+.venv/
+env/
+ENV/
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ===== 模型与大型产物 =====
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.pth
+*.onnx
+*.ckpt
+*.parquet
+*.feather
+*.sqlite
+*.db
+
+# ===== 日志与临时文件 =====
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.bak
+
+# ===== 编辑器与 IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== 操作系统 =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== 密钥与环境变量 =====
+.env
+.env.*
+*.pem
+*.key
+credentials.json
