@@ -343,27 +343,13 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     mask_with_origin, _ = crop_origin_to_nonzero(mask_sitk, seg_arr)
     rec["origin_shift_ijk"] = list(shift_ijk)
 
-    step(f"写 cache（SITK native (z,y,x) 布局，image dtype={image_with_origin.GetPixelIDTypeAsString()}）")
-    image_dir = cache_dir / "image"
-    label_dir = cache_dir / "label"
-    image_dir.mkdir(parents=True, exist_ok=True)
-    label_dir.mkdir(parents=True, exist_ok=True)
-
-    image_writer = sitk.ImageFileWriter()
-    image_writer.SetFileName(str(image_dir / f"{case_id}.nii.gz"))
-    image_writer.SetUseCompression(True)
-    image_writer.Execute(image_with_origin)
-
-    label_writer = sitk.ImageFileWriter()
-    label_writer.SetFileName(str(label_dir / f"{case_id}.nii.gz"))
-    label_writer.SetUseCompression(True)
-    label_writer.Execute(sitk.Cast(mask_with_origin, sitk.sitkUInt8))
-
     # 6) 统计：以「像素数 + spacing」为准换算 mm3，不依赖 affine。
     #    数组轴序约定（全文一致，下游 dataset.py 依赖它）：
     #      cache 文件里数组形状是 (nz, ny, nx)，np 索引 a[k, j, i] 对应物理坐标
     #      (i*d0, j*d1, k*d2)（d = target_spacing），即 a[k] 是一层 (ny, nx) 切片；
     #      "面内尺寸" = (ny, nx)，"切片数" = nz。
+    #    放在写盘之前：统计若失败就不该留下看似成功的缓存文件。
+    step("统计切片与连通域")
     voxel_mm3 = float(np.prod([float(s) for s in img_rs.GetSpacing()]))
     n_tumor_voxels = int(np.count_nonzero(seg_arr))
     per_slice = seg_arr.reshape(-1, seg_arr.shape[2]).sum(axis=0)  # 每个 z 层的前景体素数
@@ -382,12 +368,16 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     rec["has_tumor"] = bool(n_tumor_voxels > 0)
 
     if n_tumor_voxels > 0:
-        # 6 邻域连通域（与你要求的「孤立块」口径一致），逐块体素数换算成 mm3
-        cc = sitk.ConnectedComponent(sitk.Cast(mask_sitk, sitk.sitkUInt8), fullyConnected=False)
-        stats = sitk.LabelShapeStatisticsImageFilter()
-        stats.Execute(cc)
-        sizes = [int(stats.GetNumberOfPixels(i)) for i in stats.GetLabels()]
-        rec["n_components"] = len(sizes)
+        # 6 邻域连通域。用 scipy.ndimage.label 而不是 sitk.ConnectedComponent：
+        # 后者的 fullyConnected 关键字在 SimpleITK 各版本间命名不一致（2.5.6 上直接 TypeError），
+        # scipy 是环境既有依赖、行为稳定，且 6 邻域口径与评估阶段的后处理一致。
+        from scipy import ndimage
+
+        structure = ndimage.generate_binary_structure(seg_arr.ndim, 1)  # 1 = 6 邻域
+        labeled, n_components = ndimage.label(seg_arr, structure=structure)
+        component_sizes = np.bincount(labeled.ravel())[1:]  # 跳过 label 0（背景）
+        sizes = [int(x) for x in component_sizes.tolist() if x > 0]
+        rec["n_components"] = int(n_components)
         rec["min_component_voxels"] = int(min(sizes)) if sizes else 0
         rec["min_component_mm3"] = round(float(min(sizes) * voxel_mm3), 4) if sizes else 0.0
         rec["component_sizes_voxels"] = sorted(sizes, reverse=True)[:10]
@@ -396,6 +386,22 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
         rec["min_component_voxels"] = 0
         rec["min_component_mm3"] = 0.0
         rec["component_sizes_voxels"] = []
+
+    step(f"写 cache（SITK native (z,y,x) 布局，image dtype={image_with_origin.GetPixelIDTypeAsString()}）")
+    image_dir = cache_dir / "image"
+    label_dir = cache_dir / "label"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    label_dir.mkdir(parents=True, exist_ok=True)
+
+    image_writer = sitk.ImageFileWriter()
+    image_writer.SetFileName(str(image_dir / f"{case_id}.nii.gz"))
+    image_writer.SetUseCompression(True)
+    image_writer.Execute(image_with_origin)
+
+    label_writer = sitk.ImageFileWriter()
+    label_writer.SetFileName(str(label_dir / f"{case_id}.nii.gz"))
+    label_writer.SetUseCompression(True)
+    label_writer.Execute(sitk.Cast(mask_with_origin, sitk.sitkUInt8))
 
     return rec
 
@@ -630,14 +636,26 @@ def main(argv=None) -> int:
     manifest_path = save_json(manifest, paths.get("cache_manifest", "cache/cache_manifest.json"))
 
     # ---- 自检 ----
-    n_written = len(list((cache_dir / "image").glob("*.nii.gz"))) if (cache_dir / "image").is_dir() else 0
-    n_label = len(list((cache_dir / "label").glob("*.nii.gz"))) if (cache_dir / "label").is_dir() else 0
-    LOGGER.info("cache 中 image=%d，label=%d", n_written, n_label)
-    if n_written != len(cases) or n_label != len(cases):
-        LOGGER.error("cache 文件数与待处理 case 数不一致（期望 %d），请检查上方的失败记录。", len(cases))
-        return 3
+    expected_ids = {str(int(c)) for c in cases}
+    present_img = {p.name.split(".")[0] for p in (cache_dir / "image").glob("*.nii.gz")} \
+        if (cache_dir / "image").is_dir() else set()
+    present_lab = {p.name.split(".")[0] for p in (cache_dir / "label").glob("*.nii.gz")} \
+        if (cache_dir / "label").is_dir() else set()
+    n_written, n_label = len(present_img), len(present_lab)
+    LOGGER.info("cache 中 image=%d，label=%d（本次期望 %d 例）", n_written, n_label, len(expected_ids))
 
-    if not args.debug and args.limit == 0:
+    ran_without_failure = aggregate["n_cases_failed"] == 0
+    if args.debug or args.limit > 0:
+        LOGGER.info("[部分运行] 未做完整性判定；请用不带 --debug/--limit 的命令跑完整 25 例后再依赖 cache。")
+    elif not ran_without_failure:
+        LOGGER.error("有 %d 例处理失败（%s），cache 不完整，请修复后重跑；"
+                     "不要用当前 cache 进入训练。", aggregate["n_cases_failed"], aggregate["failed_cases"])
+        return 3
+    else:
+        if present_img != expected_ids or present_lab != expected_ids:
+            LOGGER.error("cache 文件集合与预期 case 不一致：缺 %s，多 %s",
+                         sorted(expected_ids - present_img), sorted(present_img - expected_ids))
+            return 3
         if aggregate["n_cases_ok"] != 25:
             LOGGER.warning("可用 case 数为 %d，与 docs/data.md 的 25 例预期不一致，请核对排除清单与数据目录。",
                            aggregate["n_cases_ok"])
@@ -645,7 +663,10 @@ def main(argv=None) -> int:
         if liver_only_expected and got_liver_only != liver_only_expected:
             LOGGER.warning("仅肝脏病例实测 %s，与 docs 预期 %s 不一致（不中断，请在报告中确认）。",
                            sorted(got_liver_only), sorted(liver_only_expected))
-    else:
+        LOGGER.info("完整性自检通过：%d 例全部成功，image/label 文件集合与预期一致。", len(expected_ids))
+        LOGGER.info("建议接着跑：python scripts/check_cache.py（逐例核对几何、标签与值域）")
+
+    if args.debug:
         LOGGER.info("[debug] 单个 case 的完整统计：\n%s", json.dumps(records[0], ensure_ascii=False, indent=2))
         LOGGER.info("[debug] 未做 25 例与仅肝病例的预期核对。")
 
