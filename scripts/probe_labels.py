@@ -153,23 +153,33 @@ def strip_suffix(name: str) -> str:
 
 
 def collect_pairs(data_dir: str) -> tuple:
-    """返回 (volumes, segs, 未配对列表)，均为 case_id -> 相对路径。"""
+    """返回 (volumes, segs, 未配对列表)，均为 case_id -> 文件名。"""
     vols, segs, unmatched = {}, {}, []
     if not os.path.isdir(data_dir):
         return vols, segs, unmatched
+
+    def first_match(patterns, stem):
+        """按顺序尝试每个正则，返回第一个匹配到的 case id；都不匹配则返回 None。"""
+        for pat in patterns:
+            m = pat.match(stem)
+            if m:
+                return m.group(1)
+        return None
+
     for fn in sorted(os.listdir(data_dir)):
         if not fn.lower().endswith((".nii", ".nii.gz")):
             continue
         stem = strip_suffix(fn)
-        for pat, bucket in ((VOLUME_PATTERNS, vols), (SEG_PATTERNS, segs)):
-            m = pat.match(stem)
-            if m:
-                cid = m.group(1)
-                if cid in bucket:
-                    unmatched.append(f"{fn} (重复的 {stem})")
-                else:
-                    bucket[cid] = fn
-                break
+        for patterns, bucket, kind in ((VOLUME_PATTERNS, vols, "volume"),
+                                       (SEG_PATTERNS, segs, "segmentation")):
+            cid = first_match(patterns, stem)
+            if cid is None:
+                continue
+            if cid in bucket:
+                unmatched.append(f"{fn} (重复的 {kind} {cid}，已有 {bucket[cid]})")
+            else:
+                bucket[cid] = fn
+            break
         else:
             unmatched.append(fn)
     return vols, segs, unmatched
@@ -224,8 +234,9 @@ def inspect_case(case: str, vol_path: str, seg_path: str, skip_affine_fix: bool)
     vmin = float(np.min(vol)) if vol.size else None
     vmax = float(np.max(vol)) if vol.size else None
     rec["vol_min"], rec["vol_max"] = vmin, vmax
-    rec["vol_p0.5"] = pct(vol.ravel()[:: max(1, vol.size // 2_000_000)], 0.5)
-    rec["vol_p99.5"] = pct(vol.ravel()[:: max(1, vol.size // 2_000_000)], 99.5)
+    # 分位数用固定步长采样估计：精度足够，且不会为 3 亿体素的大卷分配整份副本
+    rec["vol_p0.5"] = pct(vol.ravel()[:: 16], 0.5)
+    rec["vol_p99.5"] = pct(vol.ravel()[:: 16], 99.5)
 
     # ---- 逐 label 的强度与形状摘要 ----
     label_info = {}
@@ -241,14 +252,17 @@ def inspect_case(case: str, vol_path: str, seg_path: str, skip_affine_fix: bool)
     rec["label_info"] = label_info
 
     # 身体内强度分位数，用于判断“整数域 vs HU 域”
-    body_idx = np.nonzero(body.ravel())[0]
-    if body_idx.size > 400_000:
-        body_idx = body_idx[:: body_idx.size // 400_000]
-    bvals = vol.ravel()[body_idx].astype(np.float64)
-    rec["body_p0.5"] = float(np.percentile(bvals, 0.5))
-    rec["body_p99.5"] = float(np.percentile(bvals, 99.5))
-    rec["body_p1"] = float(np.percentile(bvals, 1))
-    rec["body_p99"] = float(np.percentile(bvals, 99))
+    # 用固定步长在身体掩膜上采样，避免 np.nonzero 为大卷生成上亿条索引
+    bvals = vol.ravel()[::16][body.ravel()[::16]].astype(np.float64)
+    if bvals.size > 2_000_000:
+        bvals = bvals[:: max(1, bvals.size // 2_000_000)]
+    if bvals.size == 0:
+        rec["body_p0.5"] = rec["body_p99.5"] = rec["body_p1"] = rec["body_p99"] = None
+    else:
+        rec["body_p0.5"] = float(np.percentile(bvals, 0.5))
+        rec["body_p99.5"] = float(np.percentile(bvals, 99.5))
+        rec["body_p1"] = float(np.percentile(bvals, 1))
+        rec["body_p99"] = float(np.percentile(bvals, 99))
 
     # ---- label 之间的嵌套 / 相交关系（只对两个前景 label 有意义） ----
     fg_labels = [l for l in rec["label_set"] if l > 0]
@@ -273,13 +287,11 @@ def inspect_case(case: str, vol_path: str, seg_path: str, skip_affine_fix: bool)
         ring = dilate6(msmall) & ~msmall
         if np.count_nonzero(ring) > 0:
             rel["frac_small_ring_outside_body"] = float(np.count_nonzero(ring & ~body) / np.count_nonzero(ring))
-        # 小 label 是否中空（更像血管/环形结构）
-        core = erode6(msmall)
-        if np.count_nonzero(core) > 0:
-            rel["frac_small_inner_body"] = float(np.count_nonzero(core & body) / np.count_nonzero(core))
+        # 小 label 的实心度：腐蚀一圈后留存比例（薄环状结构会接近 0）
+        rel["small_erode1_survival"] = float(np.count_nonzero(erode6(msmall)) / max(1, nsmall))
     rec["relation"] = rel
 
-    # ---- 大 label 的“填充度”：判断它是不是肝脏那种实心器官 ----
+    # ---- 大 label 的“实心度”：判断它是不是肝脏那种实心器官 ----
     if len(fg_labels) >= 1:
         big = max(fg_labels, key=lambda l: label_info[l]["n"])
         mbig = seg == big
@@ -288,15 +300,15 @@ def inspect_case(case: str, vol_path: str, seg_path: str, skip_affine_fix: bool)
             cube = int(np.prod([bb[d][1] - bb[d][0] + 1 for d in range(3)]))
             rec["big_label"] = big
             rec["big_label_bbox_fill"] = float(label_info[big]["n"] / max(1, cube))
-        # 中空判定：内部体素里有多少比例也是该 label（实心器官应接近 1）
+        # 实心度：腐蚀一圈后仍留存的体素比例。实心团块应远大于 0（成片留存），
+        # 薄壁/环状/血管样结构腐蚀一圈后几乎全部消失。
         core = erode6(mbig)
-        if np.count_nonzero(core) > 0:
-            rec["big_label_core_is_self"] = float(np.count_nonzero(core & mbig) / np.count_nonzero(core))
+        rec["big_label_erode1_survival"] = float(np.count_nonzero(core) / max(1, int(np.count_nonzero(mbig))))
 
     # ---- HU 定标线索 ----
     rec["air_peak"] = None
     if vol.size:
-        hist, edges = np.histogram(vol.ravel()[:: max(1, vol.size // 3_000_000)], bins=60,
+        hist, edges = np.histogram(vol.ravel()[::16], bins=60,
                                    range=(float(np.percentile(vol, 0.1)), float(np.percentile(vol, 99.9))))
         rec["air_peak"] = float(edges[int(np.argmax(hist))])
     rec["p1_eq_p25"] = bool(rec.get("vol_p0.5") is not None and rec["body_p1"] == rec["body_p0.5"])
@@ -351,7 +363,7 @@ def report_labels(recs: list) -> None:
 
 def report_nesting(recs: list) -> None:
     hr("[2] label 嵌套关系：小 label 是否完全落在大 label 内部（决定性证据）")
-    print("case | labels | small | large | n_small | n_large | frac_small_in_large | bbox_contains | vol_ratio | ring_outside_body")
+    print("case | labels | small | large | n_small | n_large | frac_small_in_large | bbox_contains | vol_ratio | ring_outside_body | small_erode1_survival")
     any_two = False
     for r in recs:
         if r["status"] != "OK" or not r.get("relation"):
@@ -362,7 +374,8 @@ def report_nesting(recs: list) -> None:
             f"{r['case']} | {r['label_set']} | label {rel['small']} | label {rel['large']} | "
             f"{rel['n_small']} | {rel['n_large']} | {fmt_num(rel['frac_small_in_large'])} | "
             f"{fmt_num(rel['bbox_contains'])} | {fmt_num(rel['vol_ratio_small_over_large'])} | "
-            f"{fmt_num(rel.get('frac_small_ring_outside_body'))}"
+            f"{fmt_num(rel.get('frac_small_ring_outside_body'))} | "
+            f"{fmt_num(rel.get('small_erode1_survival'))}"
         )
     if not any_two:
         print("（没有同时含两个前景 label 的 case）")
@@ -379,12 +392,14 @@ def report_nesting(recs: list) -> None:
         print("判读：frac_small_in_large 接近 1 且相交为 0 → 小 label 是大器官内部的独立病灶（肝脏+肿瘤）。")
     print()
     print("--- 大 label 是否为实心器官 ---")
+    print("case | big_label | bbox_fill | erode1_survival")
     for r in recs:
         if r["status"] != "OK" or "big_label" not in r:
             continue
         print(f"{r['case']} | label {r['big_label']} | bbox_fill={fmt_num(r.get('big_label_bbox_fill'))} | "
-              f"core_is_self={fmt_num(r.get('big_label_core_is_self'))}")
-    print("判读：bbox_fill 0.3-0.7、core_is_self≈1 是实心器官（肝脏）的特征；接近 0 的空心结构更像血管/环状物。")
+              f"erode1_survival={fmt_num(r.get('big_label_erode1_survival'))}")
+    print("判读：bbox_fill 0.3-0.7 且 erode1_survival 明显大于 0（成片留存）是实心器官（肝脏）特征；")
+    print("      erode1_survival 接近 0 说明是薄壁/环状/血管样结构，不是实心器官。")
 
 
 def report_scale_task(recs: list) -> None:

@@ -115,13 +115,6 @@ def global_percentiles(arr: np.ndarray, mask: np.ndarray | None, qs) -> list:
     return [float(np.percentile(flat, q)) for q in qs]
 
 
-def voxel_volume_mm3(zooms) -> float:
-    v = 1.0
-    for z in zooms:
-        v *= float(z)
-    return v
-
-
 def nonzero_bbox(mask: np.ndarray):
     """返回掩膜的紧凑包围盒，格式 ((x0,x1),(y0,y1),(z0,z1))（闭区间，体素索引）。"""
     idx = np.nonzero(mask)
@@ -137,12 +130,6 @@ def bbox_inside(inner, outer, tol: int = BBOX_TOL) -> bool:
         inner[d][0] >= outer[d][0] - tol and inner[d][1] <= outer[d][1] + tol
         for d in range(len(inner))
     )
-
-
-def bbox_str(bb) -> str:
-    if bb is None:
-        return "NA"
-    return "[" + " ".join(f"{a}:{b}" for a, b in bb) + "]"
 
 
 # --------------------------------------------------------------------------------------
