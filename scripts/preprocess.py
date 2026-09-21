@@ -344,17 +344,18 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     rec["origin_shift_ijk"] = list(shift_ijk)
 
     # 6) 统计：以「像素数 + spacing」为准换算 mm3，不依赖 affine。
-    #    数组轴序约定（全文一致，下游 dataset.py 依赖它）：
-    #      cache 文件里数组形状是 (nz, ny, nx)，np 索引 a[k, j, i] 对应物理坐标
-    #      (i*d0, j*d1, k*d2)（d = target_spacing），即 a[k] 是一层 (ny, nx) 切片；
-    #      "面内尺寸" = (ny, nx)，"切片数" = nz。
+    #    轴序实测结论（由 scripts/probe_axis.py 在远程确认，下游 dataset.py 依赖它）：
+    #      * SimpleITK 内存数组是 (nz, ny, nx)（本函数内 seg_arr / img_arr 就是这个顺序）；
+    #      * 写成 .nii.gz 后，用 nibabel 读回得到的是 (nx, ny, nz) —— 两个库互为转置；
+    #      * 因此「切片轴在 cache 文件的最后一维」，nib 读回时 a[:, :, k] 才是一层 (ny, nx) 切片。
     #    放在写盘之前：统计若失败就不该留下看似成功的缓存文件。
     step("统计切片与连通域")
     voxel_mm3 = float(np.prod([float(s) for s in img_rs.GetSpacing()]))
     n_tumor_voxels = int(np.count_nonzero(seg_arr))
-    # 每层前景体素数：数组是 (nz, ny, nx)，必须对 (y, x) 两个轴求和，得到的长度才是 nz。
-    # （原先写成 reshape(-1, shape[2]).sum(axis=0)，等于只对 z 求和、得到长度 nx=512 的数组，
-    #   于是"含肿瘤切片数"能超过总切片数 —— 那个数字是错的。）
+    # 每层前景体素数：SimpleITK 数组是 (nz, ny, nx)，对 (y, x) 求和得到的长度才是 nz。
+    # （依据 scripts/probe_axis.py 的实测：SITK 数组轴序为 (z,y,x)；写盘后 nibabel 读回是 (x,y,z)，两者互为转置。
+    #   原先写成 reshape(-1, shape[2]).sum(axis=0) 等于只对 z 求和，得到的长度是 nx，于是
+    #   "含肿瘤切片数"能超过总切片数 —— 那个数字是错的。）
     per_slice = seg_arr.sum(axis=(1, 2))
     tumor_slices = int(np.count_nonzero(per_slice >= 1))
     tiny_slices = int(np.count_nonzero((per_slice >= 1) & (per_slice < 10)))
@@ -365,7 +366,13 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
         raise RuntimeError(f"case {case_id} 的 per-slice 数组长度 {int(per_slice.size)} "
                            f"与切片数 {int(img_arr.shape[0])} 不一致")
 
+    # 三种形状全部记录下来，避免下游再猜轴序：
+    #   sitk_shape_zyx：本函数用的 SimpleITK 内存布局
+    #   nib_shape_xyz ：cache 文件（.nii.gz）用 nibabel 读回时的布局，切片轴在最后
+    #   inplane_wh    ：面内尺寸 (ny, nx)；nz 为切片数
     rec["new_shape_zyx"] = tuple(int(s) for s in img_arr.shape)
+    rec["new_shape_xyz"] = tuple(int(s) for s in img_arr.shape[::-1])
+    rec["inplane_hw"] = (int(img_arr.shape[1]), int(img_arr.shape[2]))
     rec["new_spacing"] = tuple(round(float(s), 4) for s in img_rs.GetSpacing())
     rec["voxel_mm3"] = round(voxel_mm3, 6)
     rec["n_slices"] = int(img_arr.shape[0])
@@ -437,6 +444,23 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
         raise RuntimeError(f"case {case_id}：回读含肿瘤切片数 {written_slices} "
                            f"与记录的 {rec['tumor_slices']} 不一致")
 
+    # 8) 再用 nibabel 读一次，确认「下游 dataset.py 实际会看到什么」：
+    #    nib 的数组是 SITK 的转置，切片轴在最后一维；这一步把该约定钉进每例的运行时校验，
+    #    避免以后改动写盘逻辑时又悄悄换掉轴序。
+    import nibabel as nib
+
+    nib_arr = np.asanyarray(nib.load(str(label_dir / f"{case_id}.nii.gz")).dataobj)
+    if tuple(nib_arr.shape) != rec["new_shape_xyz"]:
+        raise RuntimeError(f"case {case_id}：nibabel 读回 shape {tuple(nib_arr.shape)} "
+                           f"与记录的 {rec['new_shape_xyz']} 不一致（轴序约定被破坏）")
+    nib_slices = int(np.count_nonzero(nib_arr.sum(axis=(0, 1)) >= 1))
+    if nib_slices != rec["tumor_slices"]:
+        raise RuntimeError(f"case {case_id}：nibabel 口径下含肿瘤切片数 {nib_slices} "
+                           f"与记录的 {rec['tumor_slices']} 不一致")
+    if int(nib_arr.sum()) != rec["tumor_voxels"]:
+        raise RuntimeError(f"case {case_id}：nibabel 读回肿瘤体素数 {int(nib_arr.sum())} "
+                           f"与记录的 {rec['tumor_voxels']} 不一致")
+
     return rec
 
 
@@ -476,7 +500,9 @@ def build_aggregate(records: list, pre: dict) -> dict:
     floor_values = Counter(r["floor_value"] for r in ok)
 
     return {
-        "axis_convention": "cache 数组形状为 (nz, ny, nx)；a[k] 是一层 (ny, nx) 切片，k 为切片索引",
+        "axis_convention": ("cache 文件用 nibabel 读回时形状为 (nx, ny, nz)（等价 (W, H, Z)），"
+                            "切片轴在最后一维：a[:, :, k] 是一层 (ny, nx) 切片；"
+                            "SimpleITK 读回时是它的转置 (nz, ny, nx)。两库互为转置（probe_axis.py 实测）。"),
         "n_cases_ok": len(ok),
         "n_cases_failed": len(failed),
         "failed_cases": [r["case"] for r in failed],
@@ -513,7 +539,7 @@ def build_markdown(report: dict) -> str:
     """把统计报告渲染成可直接粘贴的 markdown。"""
     agg = report["aggregate"]
     columns = ["case", "original_shape", "original_spacing", "original_orientation", "floor_value",
-               "floor_fraction", "new_shape_zyx", "new_spacing", "n_slices", "tumor_slices",
+               "floor_fraction", "new_shape_zyx", "new_shape_xyz", "n_slices", "tumor_slices",
                "tumor_slice_ratio", "label2_voxel_ratio", "n_components", "min_component_voxels",
                "min_component_mm3", "tumor_volume_mm3", "clip_low_fraction"]
     lines: list = []
@@ -528,6 +554,8 @@ def build_markdown(report: dict) -> str:
     lines.append(f"- 全局窗 hu_clip：{agg['hu_clip']}（地板值分布：{agg['floor_values']}）")
     lines.append("")
     lines.append(f"- 轴序约定：{agg['axis_convention']}")
+    lines.append("- 逐 case 的 `new_shape_zyx` 是 SimpleITK 内存布局，"
+                 "`new_shape_xyz` 是 nibabel 读回 cache 文件时的布局（下游 dataset.py 用后者）。")
     lines.append("")
     lines.append("## 1. 面内尺寸分布（决定 batch、分桶与显存）")
     lines.append("")
@@ -655,10 +683,13 @@ def main(argv=None) -> int:
         "cases": [
             {
                 "case": int(r["case"]),
-                "shape_zyx": [int(s) for s in r["new_shape_zyx"]],
+                "sitk_shape_zyx": [int(s) for s in r["new_shape_zyx"]],
+                "nib_shape_xyz": [int(s) for s in r["new_shape_xyz"]],
+                "inplane_hw": [int(s) for s in r["inplane_hw"]],
                 "spacing": list(r["new_spacing"]),
                 "n_slices": int(r["n_slices"]),
                 "tumor_slices": int(r["tumor_slices"]),
+                "tumor_voxels": int(r["tumor_voxels"]),
                 "tumor_volume_mm3": float(r["tumor_volume_mm3"]),
                 "has_tumor": bool(r["has_tumor"]),
                 "n_components": int(r["n_components"]),

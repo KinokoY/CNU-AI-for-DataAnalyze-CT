@@ -27,12 +27,13 @@ python scripts/preprocess.py
 做什么：剔除 48-52 → 地板值 padding 夹到 -1000 → 统一 RAS → 重采样到 1×1×1mm（影像线性 / 掩膜最近邻）
 → `clip(-1000,1000)` → `cache/image/<case>.nii.gz`（**uint16，已归一化**）+ `cache/label/<case>.nii.gz`（uint8，仅 label 2）。
 
-**缓存约定（下游 dataset.py 依赖，不要改动）**：
+**缓存约定（下游 dataset.py 依赖，经 `scripts/probe_axis.py` 在远程实测确认，不要改动）**：
 
-- 轴序：沿用 SimpleITK native `(z, y, x)` 布局，`np.asanyarray(nib.load(p).dataobj)` 的形状是 `(nz, ny, nx)`，
-  `a[k]` 就是一层 `(ny, nx)` 切片；"面内尺寸" = `(ny, nx)`、"切片数" = `nz`。
-  下游只按「数组索引 + spacing」使用缓存，不解释 affine。
-- 影像数值：`uint16`，把 HU 窗 `[-1000, 1000]` 线性映射到 `[0, 1]` 后按 `1/65535` 量化存储。
+- **轴序**：cache 文件是标准的 **nibabel `(x, y, z)`** 布局，**切片轴在最后一维**：
+  `nib.load(p).dataobj` 形状为 `(nx, ny, nz)`，`a[:, :, k]` 是一层 `(ny, nx)` 切片。
+  SimpleITK 读同一个文件得到的是它的转置 `(nz, ny, nx)`——两库互为转置，**不要混用**。
+  下游按「数组索引 + spacing」使用缓存，不解释 affine。
+- **影像数值**：`uint16`，把 HU 窗 `[-1000, 1000]` 线性映射到 `[0, 1]` 后按 `1/65535` 量化存储。
   **dataset.py 里 `image.float() / 65535.0` 即得到 [0,1] 输入**，1 个量化步长 ≈ 0.0305 HU。
   （SimpleITK 没有 float16 像素类型；如需存原始 HU 可把 `preprocess.image_out_dtype` 设为 `float32`。）
 
@@ -87,7 +88,17 @@ case 数：25；含肿瘤 20 例；仅肝脏 5 例
 ```
 
 判读：**含肿瘤必须是 20 例**（若为 0 说明标签口径又错了），**spacing 必须全为 (1,1,1)**，
-**image dtype 必须是 uint16**、归一化值域落在 `[0,1]`（乘 65535 后不超过 65535）。
+**image dtype 必须是 uint16**、归一化值域落在 `[0,1]`（乘 65535 后不超过 65535），
+**每例 tumor_slices <= n_slices**。
+
+### 1.2 轴序确认（只在改动写盘逻辑后才需要重跑）
+
+```bash
+python scripts/probe_axis.py --case 31
+```
+
+用途：确认 cache 文件被 nibabel / SimpleITK 读回时的真实形状与切片轴。
+它同时打印沿每个轴求和得到的"非零层数"，用清单里的 `tumor_slices` 交叉验证哪一维是切片轴。
 
 ---
 

@@ -97,11 +97,12 @@ def main(argv=None) -> int:
         zooms = tuple(round(float(z), 4) for z in img.header.get_zooms()[:3])
         lab_zooms = tuple(round(float(z), 4) for z in lab_img.header.get_zooms()[:3])
 
-        # 数组是 (nz, ny, nx)：对 (y, x) 求和得到每层前景体素数
-        per_slice = lab.sum(axis=(1, 2))
-        if int(per_slice.size) != int(lab.shape[0]):
+        # 轴序实测（scripts/probe_axis.py）：nibabel 读回的数组是 (nx, ny, nz)，
+        # 切片轴在最后一维，所以每层前景体素数要对 (x, y) 求和。
+        per_slice = lab.sum(axis=(0, 1))
+        if int(per_slice.size) != int(lab.shape[2]):
             problems.append(f"case {case}：per-slice 长度 {int(per_slice.size)} "
-                            f"与切片数 {int(lab.shape[0])} 不一致")
+                            f"与切片数 {int(lab.shape[2])} 不一致")
         uniq = np.unique(lab)
         img_dtype = str(img.get_data_dtype())
         if img_dtype == "uint16":
@@ -113,7 +114,9 @@ def main(argv=None) -> int:
 
         row = {
             "case": case,
-            "shape_zyx": tuple(int(s) for s in arr.shape),
+            "nib_shape_xyz": tuple(int(s) for s in arr.shape),
+            "inplane_hw": (int(lab.shape[1]), int(lab.shape[0])),
+            "n_slices": int(lab.shape[2]),
             "spacing": zooms,
             "dtype": img_dtype,
             "label_dtype": str(lab_img.get_data_dtype()),
@@ -128,8 +131,8 @@ def main(argv=None) -> int:
         }
         rows.append(row)
 
-        if row["tumor_slices"] > int(lab.shape[0]):
-            problems.append(f"case {case}：含肿瘤切片数 {row['tumor_slices']} 超过总切片数 {int(lab.shape[0])}")
+        if row["tumor_slices"] > int(lab.shape[2]):
+            problems.append(f"case {case}：含肿瘤切片数 {row['tumor_slices']} 超过总切片数 {int(lab.shape[2])}")
 
         if tuple(arr.shape) != tuple(lab.shape):
             problems.append(f"case {case}：image shape {arr.shape} != label shape {lab.shape}")
@@ -148,11 +151,15 @@ def main(argv=None) -> int:
                             f"超出期望范围 {val_desc}")
         if case in {str(c) for c in manifest_cases}:
             rec = manifest_cases[int(case)]
-            if list(row["shape_zyx"]) != [int(s) for s in rec["shape_zyx"]]:
-                problems.append(f"case {case}：shape 与清单不符 {row['shape_zyx']} vs {rec['shape_zyx']}")
+            if list(row["nib_shape_xyz"]) != [int(s) for s in rec.get("nib_shape_xyz", [])]:
+                problems.append(f"case {case}：nibabel 读回的 shape 与清单不符 "
+                                f"{row['nib_shape_xyz']} vs {rec.get('nib_shape_xyz')}")
             if int(row["tumor_slices"]) != int(rec["tumor_slices"]):
                 problems.append(f"case {case}：含肿瘤切片数 {row['tumor_slices']} "
                                 f"与清单 {rec['tumor_slices']} 不符")
+            if int(row["tumor_voxels"]) != int(rec.get("tumor_voxels", row["tumor_voxels"])):
+                problems.append(f"case {case}：肿瘤体素数 {row['tumor_voxels']} "
+                                f"与清单 {rec.get('tumor_voxels')} 不符")
 
     n_tumor = sum(1 for r in rows if r["tumor_voxels"] > 0)
     dtypes = Counter(r["dtype"] for r in rows)
@@ -166,11 +173,12 @@ def main(argv=None) -> int:
         "image_dtypes": dict(dtypes),
         "spacings": {str(k): v for k, v in Counter(r["spacing"] for r in rows).items()},
         "inplane_shapes": {str(k): v for k, v in
-                           Counter((r["shape_zyx"][1], r["shape_zyx"][2]) for r in rows).items()},
-        "n_slices_min": min((r["shape_zyx"][0] for r in rows), default=0),
-        "n_slices_max": max((r["shape_zyx"][0] for r in rows), default=0),
+                           Counter(tuple(r["inplane_hw"]) for r in rows).items()},
+        "n_slices_min": min((r["n_slices"] for r in rows), default=0),
+        "n_slices_max": max((r["n_slices"] for r in rows), default=0),
         "tumor_slices_total": sum(r["tumor_slices"] for r in rows),
-        "voxels_total": sum(int(np.prod(r["shape_zyx"])) for r in rows),
+        "voxels_total": sum(int(np.prod(r["nib_shape_xyz"])) for r in rows),
+        "axis_convention": "nibabel 读回为 (nx, ny, nz)，切片轴在最后一维；SimpleITK 读回是其转置",
         "img_min_overall": min((r["img_min"] for r in rows), default=None),
         "img_max_overall": max((r["img_max"] for r in rows), default=None),
         "image_out_dtype": expect_out_dtype,
@@ -200,11 +208,13 @@ def main(argv=None) -> int:
 
     if not args.quiet:
         LOGGER.info("")
-        LOGGER.info("case | shape_zyx | spacing | dtype | label 值 | tumor_voxels | tumor_slices | 归一化后 [0,1] 值域")
+        LOGGER.info("case | nib_shape_xyz | inplane_hw | n_slices | spacing | dtype | label 值 | "
+                    "tumor_voxels | tumor_slices | 归一化后 [0,1] 值域")
         for r in rows:
-            LOGGER.info("%s | %s | %s | %s | %s | %d | %d | [%s, %s]",
-                        r["case"], r["shape_zyx"], r["spacing"], r["dtype"], r["label_values"],
-                        r["tumor_voxels"], r["tumor_slices"], r["value_min"], r["value_max"])
+            LOGGER.info("%s | %s | %s | %d | %s | %s | %s | %d | %d | [%s, %s]",
+                        r["case"], r["nib_shape_xyz"], r["inplane_hw"], r["n_slices"], r["spacing"],
+                        r["dtype"], r["label_values"], r["tumor_voxels"], r["tumor_slices"],
+                        r["value_min"], r["value_max"])
 
     LOGGER.info("体检报告：%s", rel_to_root(json_path))
     if problems:
