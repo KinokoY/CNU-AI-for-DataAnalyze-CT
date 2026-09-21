@@ -412,6 +412,31 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     label_writer.SetUseCompression(True)
     label_writer.Execute(sitk.Cast(mask_with_origin, sitk.sitkUInt8))
 
+    # 7) 回读自校验：从刚写的文件独立复算一遍关键量，确认落盘内容与内存统计一致。
+    #    目的是让"体积/切片数这类统计量"不再依赖人眼判断是否合理 —— 写错轴、写错量都会当场暴露。
+    written = sitk.ReadImage(str(label_dir / f"{case_id}.nii.gz"))
+    written_arr = np.asarray(sitk.GetArrayFromImage(written))
+    written_spacing = [float(s) for s in written.GetSpacing()]
+    written_voxel_mm3 = float(np.prod(written_spacing))
+    written_tumor_voxels = int(np.count_nonzero(written_arr))
+    if tuple(written_arr.shape) != rec["new_shape_zyx"]:
+        raise RuntimeError(f"case {case_id}：回读 label 的 shape {tuple(written_arr.shape)} "
+                           f"与记录的 {rec['new_shape_zyx']} 不一致")
+    if abs(written_voxel_mm3 - rec["voxel_mm3"]) > 1e-6:
+        raise RuntimeError(f"case {case_id}：回读 voxel_mm3={written_voxel_mm3} "
+                           f"与记录的 {rec['voxel_mm3']} 不一致")
+    if written_tumor_voxels != rec["tumor_voxels"]:
+        raise RuntimeError(f"case {case_id}：回读肿瘤体素数 {written_tumor_voxels} "
+                           f"与记录的 {rec['tumor_voxels']} 不一致")
+    written_volume = round(float(written_tumor_voxels * written_voxel_mm3), 4)
+    if abs(written_volume - rec["tumor_volume_mm3"]) > 1e-3:
+        raise RuntimeError(f"case {case_id}：回读肿瘤体积 {written_volume} "
+                           f"与记录的 {rec['tumor_volume_mm3']} 不一致")
+    written_slices = int(np.count_nonzero(written_arr.sum(axis=(1, 2)) >= 1))
+    if written_slices != rec["tumor_slices"]:
+        raise RuntimeError(f"case {case_id}：回读含肿瘤切片数 {written_slices} "
+                           f"与记录的 {rec['tumor_slices']} 不一致")
+
     return rec
 
 
