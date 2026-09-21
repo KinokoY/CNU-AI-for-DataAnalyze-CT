@@ -75,9 +75,17 @@ def main(argv=None) -> int:
 
     manifest = load_json(paths.get("cache_manifest", "cache/cache_manifest.json"), default={}) or {}
     manifest_cases = {int(r["case"]): r for r in manifest.get("cases", [])}
-    if manifest_cases and set(manifest_cases) != {int(c) for c in img_ids}:
-        problems.append(f"清单里的 case 集合与磁盘不一致：磁盘 {sorted(int(c) for c in img_ids)} "
-                        f"清单 {sorted(manifest_cases)}")
+    plural = cfg.get("model", {}) or {}
+    if not manifest_cases:
+        problems.append("没有读到 cache_manifest.json —— 请先完整跑一遍 python scripts/preprocess.py")
+    else:
+        disk_ids = {int(c) for c in img_ids}
+        if set(manifest_cases) != disk_ids:
+            problems.append(f"清单里的 case 集合与磁盘不一致：磁盘 {sorted(disk_ids)} "
+                            f"清单 {sorted(manifest_cases)}（可能是只跑了 --limit/--debug 的部分缓存）")
+        if not manifest.get("axis_convention"):
+            LOGGER.warning("清单里没有 axis_convention 字段：它来自更早版本的 preprocess.py，"
+                           "建议重跑 preprocess.py 以刷新清单")
 
     rows: list = []
     for path in images:
