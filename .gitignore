@@ -2,6 +2,11 @@
 data/*
 !data/.gitkeep
 !data/README.md
+!data/splits.json
+!data/exclude_cases.json
+cache/
+reports/
+runs/
 
 # ===== Python =====
 __pycache__/

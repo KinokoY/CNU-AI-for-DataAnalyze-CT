@@ -1,0 +1,540 @@
+"""预处理：把 data/ 下的原始 volume/segmentation 转成 1mm RAS 的 cache，并统计逐 case 事实。
+
+整体功能：剔除 data/exclude_cases.json 中的病例（48-52 几何错位）→ 把地板值 padding 夹到 -1000 →
+        统一 RAS → 重采样到 1x1x1mm（影像线性 / 掩膜最近邻）→ 按全局窗 clip(-1000,1000) →
+        影像存 float16 HU、掩膜只保留 label 2 存 uint8 到 cache/，同时产出可粘贴的统计报告。
+前后接口：上游是 data/volume-<id>.nii + segmentation-<id>.nii 与 configs/default.yaml；
+        下游给 scripts/make_splits.py 提供 reports/preprocess_stats.json、给 src/dataset.py 提供 cache/
+        （cache 里是未归一化的 HU，归一化到 [0,1] 在 dataset.py 里做）。
+用法：在仓库根目录执行 ``python scripts/preprocess.py``；快速自检 ``python scripts/preprocess.py --debug``。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+import numpy as np
+
+try:  # 允许从仓库根直接 python scripts/preprocess.py 运行
+    from src.utils import (
+        config_fingerprint,
+        format_kv_table,
+        load_config,
+        load_json,
+        rel_to_root,
+        resolve_path,
+        save_json,
+        save_report,
+        setup_logger,
+    )
+except ModuleNotFoundError:  # pragma: no cover - 兜底：把仓库根塞进 sys.path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from src.utils import (  # type: ignore
+        config_fingerprint,
+        format_kv_table,
+        load_config,
+        load_json,
+        rel_to_root,
+        resolve_path,
+        save_json,
+        save_report,
+        setup_logger,
+    )
+
+LOGGER = setup_logger("preprocess")
+
+VOLUME_RE = re.compile(r"^volume[-_](\d+)$")
+SEG_RE = re.compile(r"^segmentation[-_](\d+)$")
+NII_SUFFIXES = (".nii.gz", ".nii")
+
+# 与 config 中 preprocess 节同名的默认值，仅用于 --debug 时的兜底
+DEFAULTS = {
+    "target_spacing": [1.0, 1.0, 1.0],
+    "orientation": "RAS",
+    "floor_margin": 1.0,
+    "hu_clip": [-1000.0, 1000.0],
+    "floor_clamp_value": -1000.0,
+    "image_out_dtype": "float16",
+}
+
+
+# --------------------------------------------------------------------------------------
+# 文件发现
+# --------------------------------------------------------------------------------------
+
+def strip_nii_suffix(name: str) -> str:
+    """去掉 .nii / .nii.gz 后缀，返回文件名主干。"""
+    low = name.lower()
+    for suffix in NII_SUFFIXES:
+        if low.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def discover_cases(data_dir: Path) -> tuple[dict, dict]:
+    """扫描数据目录，返回 (volumes, segmentations)：case_id(int) -> 绝对路径。"""
+    volumes: dict = {}
+    segs: dict = {}
+    if not data_dir.is_dir():
+        raise FileNotFoundError(f"数据目录不存在：{data_dir}（用 --data-dir 指定）")
+
+    for path in sorted(data_dir.iterdir()):
+        if not path.is_file():
+            continue
+        stem = strip_nii_suffix(path.name)
+        if not stem:
+            continue
+        mv = VOLUME_RE.match(stem)
+        if mv:
+            volumes.setdefault(int(mv.group(1)), path)
+            continue
+        ms = SEG_RE.match(stem)
+        if ms:
+            segs.setdefault(int(ms.group(1)), path)
+    return volumes, segs
+
+
+def select_cases(volumes: dict, segs: dict, excluded: set, case_id_min: int = 0) -> list:
+    """取 volume/segmentation 成对且未被剔除的 case id，按数值升序返回。"""
+    paired = sorted(set(volumes) & set(segs))
+    missing_seg = sorted(set(volumes) - set(segs))
+    missing_vol = sorted(set(segs) - set(volumes))
+    if missing_seg:
+        LOGGER.warning("有 volume 但缺 segmentation 的 case（已跳过）：%s", missing_seg)
+    if missing_vol:
+        LOGGER.warning("有 segmentation 但缺 volume 的 case（已跳过）：%s", missing_vol)
+    selected = [c for c in paired if c not in excluded and c >= case_id_min]
+    dropped = [c for c in paired if c in excluded]
+    if dropped:
+        LOGGER.info("按排除清单剔除 %d 例：%s", len(dropped), dropped)
+    return selected
+
+
+# --------------------------------------------------------------------------------------
+# 单个 case 的几何处理
+# --------------------------------------------------------------------------------------
+
+def load_as_float(volume_path: Path):
+    """读取影像为 float32 的 SimpleITK 图像（保持原 spacing/origin/direction）。"""
+    import SimpleITK as sitk
+
+    img = sitk.ReadImage(str(volume_path))
+    if img.GetPixelID() != sitk.sitkFloat32:
+        img = sitk.Cast(img, sitk.sitkFloat32)
+    return img
+
+
+def load_mask_binary(seg_path: Path, label: int = 2):
+    """读取掩膜并只保留指定 label（默认 2 = 肿瘤），返回 uint8 的 0/1 掩膜图。"""
+    import SimpleITK as sitk
+
+    seg = sitk.ReadImage(str(seg_path))
+    if seg.GetPixelID() != sitk.sitkUInt8:
+        seg = sitk.Cast(seg, sitk.sitkUInt8)
+    return sitk.Cast(sitk.BinaryThreshold(seg, lowerThreshold=label, upperThreshold=label,
+                                          insideValue=1, outsideValue=0),
+                     sitk.sitkUInt8)
+
+
+def floor_stats(arr: np.ndarray, margin: float) -> tuple[float, int]:
+    """返回 (地板值, 地板体素数)：与最小值相差不超过 margin 的体素视为卷外 padding。"""
+    vmin = float(arr.min())
+    n_floor = int(np.count_nonzero(arr <= vmin + float(margin)))
+    return vmin, n_floor
+
+
+def apply_floor_clamp(img, floor_value: float, margin: float, clamp_to: float):
+    """把地板体素（<= floor_value + margin）夹到 clamp_to，其余保持不变。"""
+    import SimpleITK as sitk
+
+    mask = sitk.BinaryThreshold(img, lowerThreshold=float(floor_value) + float(margin),
+                                upperThreshold=float(np.finfo(np.float32).max),
+                                insideValue=1, outsideValue=0)
+    return sitk.Cast(sitk.Mask(img, mask, outsideValue=float(clamp_to)), sitk.sitkFloat32)
+
+
+def resample_ras_1mm(img, target_spacing, interpolator: int):
+    """先统一到 RAS 方位，再重采样到目标 spacing（影像用线性、掩膜用最近邻）。"""
+    import SimpleITK as sitk
+
+    oriented = sitk.DICOMOrient(img, "RAS")
+    original_spacing = oriented.GetSpacing()
+    original_size = oriented.GetSize()
+    new_size = [int(round(original_size[i] * (original_spacing[i] / float(target_spacing[i]))))
+                for i in range(3)]
+    new_size = [max(1, n) for n in new_size]
+
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetOutputSpacing([float(s) for s in target_spacing])
+    resampler.SetSize(new_size)
+    resampler.SetOutputDirection(oriented.GetDirection())
+    resampler.SetOutputOrigin(oriented.GetOrigin())
+    resampler.SetTransform(sitk.Transform(3, sitk.sitkIdentity))
+    resampler.SetInterpolator(interpolator)
+    resampler.SetDefaultPixelValue(0.0)
+    return resampler.Execute(oriented), oriented, new_size
+
+
+def crop_origin_to_nonzero(img, arr: np.ndarray):
+    """把输出 origin 前移 fg 最小体素的物理偏移，使「世界坐标 - origin」落回约 [0, 边长)。
+
+    动机：DICOMOrient 只改像素轴序，不改 direction 的符号，LAS 影像重定向到 RAS 后
+    origin 会落在图像另一端，缓存里的世界坐标相对 origin 是负值。这里把 origin 显式挪到
+    fg 包围盒的最小角，下游用 slice.tobytes / np 索引重建时不需要再碰 affine。
+    """
+    import SimpleITK as sitk
+
+    idx = np.nonzero(arr > 0)
+    if idx[0].size == 0:
+        return img, (0, 0, 0)
+    ijk_min = [int(idx[0].min()), int(idx[1].min()), int(idx[2].min())]
+    direction = np.asarray(img.GetDirection(), dtype=np.float64).reshape(3, 3)
+    spacing = np.asarray(img.GetSpacing(), dtype=np.float64)
+    offset = direction @ (direction.T @ (spacing * np.asarray(ijk_min, dtype=np.float64)))
+    new_origin = np.asarray(img.GetOrigin(), dtype=np.float64) + offset
+    out = sitk.Image(img)
+    out.SetOrigin([float(x) for x in new_origin])
+    return out, tuple(ijk_min)
+
+
+# --------------------------------------------------------------------------------------
+# 主流程
+# --------------------------------------------------------------------------------------
+
+def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, pre: dict) -> dict:
+    """处理一个 case：地板夹取 → RAS → 1mm 重采样 → 全局窗 → 落盘 cache，返回该 case 的统计。"""
+    import SimpleITK as sitk
+
+    target_spacing = [float(s) for s in pre["target_spacing"]]
+    hu_lo, hu_hi = (float(x) for x in pre["hu_clip"])
+    margin = float(pre["floor_margin"])
+    clamp_to = float(pre["floor_clamp_value"])
+    out_dtype = str(pre["image_out_dtype"])
+
+    rec: dict = {"case": case_id, "status": "OK", "error": ""}
+    vol_img = load_as_float(vol_path)
+    seg_img = load_mask_binary(seg_path, label=2)
+
+    rec["original_shape"] = tuple(int(s) for s in vol_img.GetSize())
+    rec["original_spacing"] = tuple(round(float(s), 4) for s in vol_img.GetSpacing())
+    rec["original_orientation"] = "".join(sitk.DICOMOrientImageFilter_GetOrientationFromDirectionCosines(vol_img.GetDirection()))
+
+    # 1) 地板值 padding：在原始整数域上判定，避免插值把地板值摊开
+    raw = sitk.GetArrayViewFromImage(sitk.ReadImage(str(vol_path)))
+    floor_value, n_floor = floor_stats(np.asarray(raw), margin)
+    rec["floor_value"] = floor_value
+    rec["floor_voxels"] = n_floor
+    rec["floor_fraction"] = float(n_floor / max(1, raw.size))
+    del raw
+    rec["n_labels_in_mask_raw"] = None
+    seg_arr_raw = sitk.GetArrayViewFromImage(sitk.ReadImage(str(seg_path)))
+    labels, counts = np.unique(np.asarray(seg_arr_raw), return_counts=True)
+    rec["mask_label_counts_raw"] = {int(v): int(c) for v, c in zip(labels.tolist(), counts.tolist())}
+    del seg_arr_raw
+
+    img_clamped = apply_floor_clamp(vol_img, floor_value, margin, clamp_to)
+
+    # 2) RAS + 3) 重采样到 target_spacing（影像线性、掩膜最近邻）
+    img_rs, _, new_size = resample_ras_1mm(img_clamped, target_spacing, sitk.sitkLinear)
+    seg_rs, _, _ = resample_ras_1mm(seg_img, target_spacing, sitk.sitkNearestNeighbor)
+
+    # 4) 全局窗：先记录窗内饱和比例，再 clip 到 [hu_lo, hu_hi]
+    img_arr = sitk.GetArrayFromImage(img_rs).astype(np.float32, copy=False)
+    rec["clip_low_fraction"] = float(np.count_nonzero(img_arr < hu_lo) / max(1, img_arr.size))
+    rec["clip_high_fraction"] = float(np.count_nonzero(img_arr > hu_hi) / max(1, img_arr.size))
+    np.clip(img_arr, hu_lo, hu_hi, out=img_arr)
+
+    seg_arr = np.asarray(sitk.GetArrayFromImage(seg_rs))
+    seg_arr = (seg_arr == 2).astype(np.uint8)
+
+    # 5) 落盘：SITK 数组轴序为 (z, y, x)，转置成 nibabel 的 (x, y, z) 再写，
+    #    这样下游 nib.load(...).dataobj[..., z] 直接就是一层冠状切片。
+    img_out = np.ascontiguousarray(img_arr.transpose(2, 1, 0))
+    seg_out = np.ascontiguousarray(seg_arr.transpose(2, 1, 0))
+
+    mask_sitk = sitk.GetImageFromArray(seg_out.astype(np.uint8))
+    mask_sitk.CopyInformation(seg_rs)
+    image_for_origin = sitk.GetImageFromArray(img_out.astype(np.float32))
+    image_for_origin.CopyInformation(img_rs)
+    image_with_origin, _ = crop_origin_to_nonzero(image_for_origin, seg_out)
+
+    image_dir = cache_dir / "image"
+    label_dir = cache_dir / "label"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    label_dir.mkdir(parents=True, exist_ok=True)
+
+    image_writer = sitk.ImageFileWriter()
+    image_writer.SetFileName(str(image_dir / f"{case_id}.nii.gz"))
+    image_writer.SetUseCompression(True)
+    image_writer.Execute(sitk.Cast(image_with_origin, sitk.sitkFloat32)
+                         if out_dtype == "float32" else sitk.Cast(image_with_origin, sitk.sitkFloat16))
+
+    label_writer = sitk.ImageFileWriter()
+    label_writer.SetFileName(str(label_dir / f"{case_id}.nii.gz"))
+    label_writer.SetUseCompression(True)
+    label_writer.Execute(sitk.Cast(mask_sitk, sitk.sitkUInt8))
+
+    # 6) 统计：以「像素数 + spacing」为准换算 mm3，不依赖 affine
+    voxel_mm3 = float(np.prod([float(s) for s in img_rs.GetSpacing()]))
+    n_tumor_voxels = int(np.count_nonzero(seg_out))
+    per_slice = seg_out.reshape(-1, seg_out.shape[2]).sum(axis=0)  # 每个 z 层的前景体素数
+    tumor_slices = int(np.count_nonzero(per_slice >= 1))
+    tiny_slices = int(np.count_nonzero((per_slice >= 1) & (per_slice < 10)))
+
+    rec["new_shape"] = tuple(int(s) for s in img_out.shape)
+    rec["new_spacing"] = tuple(round(float(s), 4) for s in img_rs.GetSpacing())
+    rec["voxel_mm3"] = round(voxel_mm3, 6)
+    rec["n_slices"] = int(img_out.shape[2])
+    rec["tumor_slices"] = tumor_slices
+    rec["tumor_slice_ratio"] = round(float(tumor_slices / max(1, rec["n_slices"])), 6)
+    rec["tiny_tumor_slices"] = tiny_slices
+    rec["tumor_voxels"] = n_tumor_voxels
+    rec["tumor_volume_mm3"] = round(float(n_tumor_voxels * voxel_mm3), 4)
+    rec["has_tumor"] = bool(n_tumor_voxels > 0)
+
+    if n_tumor_voxels > 0:
+        # 6 邻域连通域（与你要求的「孤立块」口径一致），逐块体素数换算成 mm3
+        cc = sitk.ConnectedComponent(sitk.Cast(mask_sitk, sitk.sitkUInt8), fullyConnected=False)
+        stats = sitk.LabelShapeStatisticsImageFilter()
+        stats.Execute(cc)
+        sizes = [int(stats.GetNumberOfPixels(i)) for i in stats.GetLabels()]
+        rec["n_components"] = len(sizes)
+        rec["min_component_voxels"] = int(min(sizes)) if sizes else 0
+        rec["min_component_mm3"] = round(float(min(sizes) * voxel_mm3), 4) if sizes else 0.0
+        rec["component_sizes_voxels"] = sorted(sizes, reverse=True)[:10]
+    else:
+        rec["n_components"] = 0
+        rec["min_component_voxels"] = 0
+        rec["min_component_mm3"] = 0.0
+        rec["component_sizes_voxels"] = []
+
+    return rec
+
+
+def build_aggregate(records: list, pre: dict) -> dict:
+    """汇总所有 case：尺寸分布、分桶情况、肿瘤切片占比、体积量级。"""
+    ok = [r for r in records if r["status"] == "OK"]
+    failed = [r for r in records if r["status"] != "OK"]
+    shapes = Counter(tuple(r["new_shape"]) for r in ok)
+    spacings = Counter(tuple(r["new_spacing"]) for r in ok)
+    orig_spacings = Counter(tuple(r["original_spacing"]) for r in ok)
+    orig_orientations = Counter(r["original_orientation"] for r in ok)
+
+    max_hw = [0, 0]
+    for shape in shapes:
+        max_hw[0] = max(max_hw[0], int(shape[0]))
+        max_hw[1] = max(max_hw[1], int(shape[1]))
+
+    mult = int(16)
+    buckets = Counter((int(np.ceil(shape[0] / mult) * mult), int(np.ceil(shape[1] / mult) * mult))
+                      for shape in shapes for _ in range(shapes[shape]))
+
+    tumor_slices = sum(int(r["tumor_slices"]) for r in ok)
+    total_slices = sum(int(r["n_slices"]) for r in ok)
+    with_tumor = [r["case"] for r in ok if r["has_tumor"]]
+    liver_only = [r["case"] for r in ok if not r["has_tumor"]]
+    volumes = [float(r["tumor_volume_mm3"]) for r in ok if r["has_tumor"]]
+    floor_values = Counter(r["floor_value"] for r in ok)
+
+    return {
+        "n_cases_ok": len(ok),
+        "n_cases_failed": len(failed),
+        "failed_cases": [r["case"] for r in failed],
+        "cases": [r["case"] for r in ok],
+        "cases_with_tumor": with_tumor,
+        "cases_liver_only": liver_only,
+        "n_cases_with_tumor": len(with_tumor),
+        "n_cases_liver_only": len(liver_only),
+        "image_shapes": {"x".join(str(v) for v in k): v for k, v in sorted(shapes.items())},
+        "unique_image_shapes": len(shapes),
+        "max_hw": max_hw,
+        "pad_to_multiple": mult,
+        "size_buckets": {"x".join(str(v) for v in k): v for k, v in sorted(buckets.items())},
+        "n_size_buckets": len(buckets),
+        "new_spacing": {"x".join(str(v) for v in k): v for k, v in sorted(spacings.items())},
+        "original_spacings": {"x".join(str(v) for v in k): v for k, v in sorted(orig_spacings.items())},
+        "original_orientations": dict(orig_orientations),
+        "floor_values": {str(k): v for k, v in sorted(floor_values.items())},
+        "total_slices": total_slices,
+        "tumor_slices": tumor_slices,
+        "tumor_slice_ratio_overall": round(float(tumor_slices / max(1, total_slices)), 6),
+        "tumor_volume_mm3_min": round(min(volumes), 4) if volumes else None,
+        "tumor_volume_mm3_median": round(float(np.median(volumes)), 4) if volumes else None,
+        "tumor_volume_mm3_max": round(max(volumes), 4) if volumes else None,
+        "target_spacing": [float(s) for s in pre["target_spacing"]],
+        "hu_clip": [float(x) for x in pre["hu_clip"]],
+    }
+
+
+def build_markdown(report: dict) -> str:
+    """把统计报告渲染成可直接粘贴的 markdown。"""
+    agg = report["aggregate"]
+    columns = ["case", "original_shape", "original_spacing", "original_orientation", "floor_value",
+               "floor_fraction", "new_shape", "new_spacing", "n_slices", "tumor_slices",
+               "tumor_slice_ratio", "n_components", "min_component_voxels", "min_component_mm3",
+               "tumor_volume_mm3", "clip_low_fraction"]
+    lines: list = []
+    lines.append("# 预处理统计报告（scripts/preprocess.py）")
+    lines.append("")
+    lines.append(f"- 配置指纹 cfg_hash：`{report.get('cfg_hash', 'NA')}`")
+    lines.append(f"- 排除病例：{report.get('excluded_cases')}")
+    lines.append(f"- 成功 {agg['n_cases_ok']} 例，失败 {agg['n_cases_failed']} 例 {agg['failed_cases']}")
+    lines.append(f"- 含肿瘤 {agg['n_cases_with_tumor']} 例：{agg['cases_with_tumor']}")
+    lines.append(f"- 仅肝脏 {agg['n_cases_liver_only']} 例：{agg['cases_liver_only']}")
+    lines.append(f"- 目标 spacing：{agg['target_spacing']}；实际达到：{agg['new_spacing']}")
+    lines.append(f"- 全局窗 hu_clip：{agg['hu_clip']}（地板值分布：{agg['floor_values']}）")
+    lines.append("")
+    lines.append("## 1. 切片尺寸分布（决定 batch 与分桶）")
+    lines.append("")
+    lines.append(f"- 唯一尺寸数：{agg['unique_image_shapes']}；尺寸 -> case 数：{agg['image_shapes']}")
+    lines.append(f"- 最大 H×W：{agg['max_hw']}；按 pad_to_multiple={agg['pad_to_multiple']} 分桶："
+                 f"{agg['size_buckets']}（共 {agg['n_size_buckets']} 个桶）")
+    lines.append("")
+    lines.append("## 2. 切片级前景占比（采样器依据）")
+    lines.append("")
+    lines.append(f"- 总切片 {agg['total_slices']}，含肿瘤切片 {agg['tumor_slices']}，"
+                 f"占比 {agg['tumor_slice_ratio_overall']:.4f}")
+    lines.append(f"- 肿瘤体积 mm3：min={agg['tumor_volume_mm3_min']} "
+                 f"median={agg['tumor_volume_mm3_median']} max={agg['tumor_volume_mm3_max']}")
+    lines.append("")
+    lines.append("## 3. 逐 case 明细")
+    lines.append("")
+    lines.append(format_kv_table(report["cases"], columns))
+    lines.append("")
+    lines.append("## 4. 判读提示")
+    lines.append("")
+    lines.append("- `new_shape` 不唯一是正常的：面内 spacing 0.666-0.9766 重采样到 1mm 后会得到不同面内尺寸；"
+                 "下游不做任何 resize，只按桶 padding 到 16 的整数倍。")
+    lines.append("- `n_components` > 1 或 `min_component_voxels` 很小，说明存在孤立小病灶，"
+                 "评估阶段的 3D 后处理阈值（eval.min_lesion_mm3）要据此判断。")
+    lines.append("- `tumor_slices` 为 0 的 case 就是仅肝脏病例，只进训练集、不进验证集。")
+    return "\n".join(lines) + "\n"
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="CT 预处理：统一 spacing/朝向、剪裁地板值、落盘 cache 并统计")
+    parser.add_argument("--config", default="configs/default.yaml", help="配置文件，默认 configs/default.yaml")
+    parser.add_argument("--data-dir", default=None, help="覆盖 data/ 位置")
+    parser.add_argument("--cache-dir", default=None, help="覆盖 cache/ 位置")
+    parser.add_argument("--debug", action="store_true", help="只处理第一个 case，打印详细中间量后退出")
+    parser.add_argument("--set", dest="overrides", action="append", default=None,
+                        help="覆盖配置项，如 --set preprocess.target_spacing=[1,1,1]（可多次）")
+    args = parser.parse_args(argv)
+
+    cfg = load_config(args.config, args.overrides)
+    pre = dict(DEFAULTS)
+    pre.update(cfg.get("preprocess", {}) or {})
+    paths = cfg.get("paths", {}) or {}
+
+    data_dir = resolve_path(args.data_dir or paths.get("data", "data"))
+    cache_dir = resolve_path(args.cache_dir or paths.get("cache", "cache"))
+    exclude_path = resolve_path(paths.get("exclude", "data/exclude_cases.json"))
+
+    exclude_doc = load_json(exclude_path, default={}) or {}
+    excluded = {int(item["case"]) for item in exclude_doc.get("exclude", [])}
+    liver_only_expected = set(int(x) for x in exclude_doc.get("liver_only_expected", []))
+
+    volumes, segs = discover_cases(data_dir)
+    LOGGER.info("数据目录 %s：volume=%d，segmentation=%d", rel_to_root(data_dir), len(volumes), len(segs))
+
+    cases = select_cases(volumes, segs, excluded)
+    if args.debug:
+        cases = cases[:1]
+        LOGGER.info("[debug] 只处理 1 个 case：%s", cases)
+    if not cases:
+        LOGGER.error("没有任何可处理的 case，请检查 --data-dir 与排除清单。")
+        return 2
+
+    cfg_hash = config_fingerprint(cfg, drop=["paths", "train", "model", "eval"])
+    records: list = []
+    for i, case_id in enumerate(cases, 1):
+        LOGGER.info("[%d/%d] case %d ...", i, len(cases), case_id)
+        try:
+            rec = process_case(case_id, volumes[case_id], segs[case_id], cache_dir, pre)
+        except Exception as exc:  # noqa: BLE001 - 单 case 失败不中断整体
+            LOGGER.exception("case %d 处理失败：%s", case_id, exc)
+            rec = {"case": case_id, "status": "FAILED", "error": f"{type(exc).__name__}: {exc}"}
+        records.append(rec)
+        if rec["status"] == "OK":
+            LOGGER.info("    shape %s -> %s，含肿瘤切片 %d/%d，肿瘤体积 %.1f mm3",
+                        tuple(rec["original_shape"]), tuple(rec["new_shape"]),
+                        rec["tumor_slices"], rec["n_slices"], rec["tumor_volume_mm3"])
+
+    import SimpleITK as sitk  # 版本号写进报告供复现
+    import nibabel as nib
+
+    aggregate = build_aggregate(records, pre)
+    report = {
+        "cfg_hash": cfg_hash,
+        "created_from_config": rel_to_root(resolve_path(args.config)),
+        "data_dir": rel_to_root(data_dir),
+        "cache_dir": rel_to_root(cache_dir),
+        "excluded_cases": sorted(excluded),
+        "preprocess": {k: pre[k] for k in DEFAULTS},
+        "env": {"python": sys.version.split()[0], "numpy": np.__version__,
+                "SimpleITK": sitk.Version_VersionString(), "nibabel": nib.__version__},
+        "aggregate": aggregate,
+        "cases": records,
+    }
+
+    stats_path = resolve_path(paths.get("preprocess_stats", "reports/preprocess_stats.json"))
+    json_path, md_path = save_report(report, stats_path, md_builder=build_markdown)
+
+    manifest = {
+        "cfg_hash": cfg_hash,
+        "cache_dir": rel_to_root(cache_dir),
+        "preprocess": {k: pre[k] for k in DEFAULTS},
+        "cases": [
+            {
+                "case": int(r["case"]),
+                "shape": list(r["new_shape"]),
+                "spacing": list(r["new_spacing"]),
+                "n_slices": int(r["n_slices"]),
+                "tumor_slices": int(r["tumor_slices"]),
+                "tumor_volume_mm3": float(r["tumor_volume_mm3"]),
+                "has_tumor": bool(r["has_tumor"]),
+                "n_components": int(r["n_components"]),
+                "min_component_mm3": float(r["min_component_mm3"]),
+            }
+            for r in records if r["status"] == "OK"
+        ],
+        "aggregate": {k: aggregate[k] for k in
+                      ("n_cases_ok", "n_cases_with_tumor", "n_cases_liver_only", "cases_with_tumor",
+                       "cases_liver_only", "image_shapes", "max_hw", "size_buckets", "n_size_buckets",
+                       "total_slices", "tumor_slices", "tumor_slice_ratio_overall", "new_spacing")},
+    }
+    manifest_path = save_json(manifest, paths.get("cache_manifest", "cache/cache_manifest.json"))
+
+    # ---- 自检 ----
+    n_written = len(list((cache_dir / "image").glob("*.nii.gz"))) if (cache_dir / "image").is_dir() else 0
+    n_label = len(list((cache_dir / "label").glob("*.nii.gz"))) if (cache_dir / "label").is_dir() else 0
+    LOGGER.info("cache 中 image=%d，label=%d", n_written, n_label)
+    if n_written != len(cases) or n_label != len(cases):
+        LOGGER.error("cache 文件数与待处理 case 数不一致（期望 %d），请检查上方的失败记录。", len(cases))
+        return 3
+
+    if not args.debug:
+        if aggregate["n_cases_ok"] != 25:
+            LOGGER.warning("可用 case 数为 %d，与 docs/data.md 的 25 例预期不一致，请核对排除清单与数据目录。",
+                           aggregate["n_cases_ok"])
+        got_liver_only = set(aggregate["cases_liver_only"])
+        if liver_only_expected and got_liver_only != liver_only_expected:
+            LOGGER.warning("仅肝脏病例实测 %s，与 docs 预期 %s 不一致（不中断，请在报告中确认）。",
+                           sorted(got_liver_only), sorted(liver_only_expected))
+    else:
+        LOGGER.info("[debug] 单个 case 的完整统计：\n%s", json.dumps(records[0], ensure_ascii=False, indent=2))
+        LOGGER.info("[debug] 未做 25 例与仅肝病例的预期核对。")
+
+    LOGGER.info("统计报告：%s%s", rel_to_root(json_path), f" 与 {rel_to_root(md_path)}" if md_path else "")
+    LOGGER.info("缓存清单：%s", rel_to_root(manifest_path))
+    LOGGER.info("下一步：python scripts/make_splits.py")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

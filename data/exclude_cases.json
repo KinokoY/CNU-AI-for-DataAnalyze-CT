@@ -1,0 +1,38 @@
+{
+  "exclude": [
+    {
+      "case": 48,
+      "reason": "掩膜与影像 affine 不一致（affine_maxdiff=293.5）：掩膜被施加平面内 180 度旋转加平移，按 affine 重采样后前景变成 0 个体素",
+      "evidence": "docs/data.md 5.1"
+    },
+    {
+      "case": 49,
+      "reason": "掩膜与影像 affine 不一致（affine_maxdiff=592）：重采样后前景变成 0 个体素",
+      "evidence": "docs/data.md 5.1"
+    },
+    {
+      "case": 50,
+      "reason": "掩膜与影像 affine 不一致（affine_maxdiff=633.75）：重采样后前景变成 0 个体素",
+      "evidence": "docs/data.md 5.1"
+    },
+    {
+      "case": 51,
+      "reason": "掩膜与影像 affine 不一致（affine_maxdiff=641.2）：重采样后仅保留 28% 体素，且前景只有 12% 落在非空气掩膜内、强度中位 -1002 HU（在空气里）",
+      "evidence": "docs/data.md 5.1"
+    },
+    {
+      "case": 52,
+      "reason": "掩膜与影像 affine 不一致（affine_maxdiff=652）：重采样后前景变成 0 个体素",
+      "evidence": "docs/data.md 5.1"
+    }
+  ],
+  "excluded_count": 5,
+  "included_cases": [31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 53, 54, 55, 56, 57, 58, 59, 60],
+  "included_count": 25,
+  "liver_only_expected": [32, 34, 38, 41, 47],
+  "notes": [
+    "实际纳入的 25 例以预处理阶段磁盘上真实存在的文件为准（data/ 由 --data-dir 决定），本清单只做剔除与预期核对。",
+    "liver_only_expected 来自 docs/data.md 第 3 节（26 例含 label 1、21 例含 label 2，仅 label 1 的 5 例为 32/34/38/41/47），脚本会据此发警告而不会中断。",
+    "48-52 若将来完成配准修复，只需从 exclude 移除并重跑 preprocess.py 与 make_splits.py。"
+  ]
+}

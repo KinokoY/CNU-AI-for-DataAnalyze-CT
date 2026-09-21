@@ -1,0 +1,55 @@
+# 基础版（2D 肿瘤分割闭环）总配置。
+# 所有路径均相对仓库根目录，禁止写绝对路径；任何脚本都用 --config 覆盖本文件。
+# 覆盖方式：--config configs/default.yaml --set train.batch_size=4（可多次 --set）。
+
+# ---------- 路径 ----------
+paths:
+  data: data                      # 原始 volume-<id>.nii / segmentation-<id>.nii 所在目录
+  cache: cache                    # 预处理产物：cache/image/<case>.nii.gz + cache/label/<case>.nii.gz
+  cache_manifest: cache/cache_manifest.json
+  splits: data/splits.json        # 5 折归属，纳入 git
+  exclude: data/exclude_cases.json
+  preprocess_stats: reports/preprocess_stats.json
+  reports: reports                # 评估与统计产物（不入库）
+  runs: runs                      # checkpoint / 日志（不入库）
+
+# ---------- 预处理 ----------
+preprocess:
+  target_spacing: [1.0, 1.0, 1.0] # 统一到 1mm 各向同性；重采样后不再做任何 resize
+  orientation: RAS                # 统一方位，等价 nibabel 的 as_closest_canonical
+  floor_margin: 1.0               # 与体素最小值相差不超过该值的体素视为「卷外 padding 地板」
+  hu_clip: [-1000.0, 1000.0]      # 全局窗：地板值（-1024/-2048/-3024）夹到 -1000，上界 1000
+  floor_clamp_value: -1000.0      # 地板体素夹到的目标值
+  image_out_dtype: float16        # cache 中影像以 float16 存 HU（归一化在 dataset.py 里做）
+
+# ---------- 模型 ----------
+model:
+  in_channels: 1
+  out_channels: 2                 # 0=背景, 1=肿瘤（label 1 肝脏已置 0）
+  encoder_channels: [32, 64, 128, 256]
+  norm: batch
+  pad_to_multiple: 16             # U-Net 4 级下采样 = 2^4，前向内部 pad 到 16 的整数倍再 crop 回
+  encoder_pretrained: null        # 基础版 null；进阶版可填 "resnet18" / "resnet34"
+  pretrained_weights_path: null   # 本地权重文件绝对路径（离线加载，不走网络）
+
+# ---------- 训练 ----------
+train:
+  batch_size: 8                   # 第 1 轮实测尺寸后再定稿；--debug 会打印显存占用供标定
+  num_workers: 8                  # 远程 52 核，8 worker × lru_cache(8) 句柄可控
+  lr: 0.001
+  weight_decay: 0.0001
+  scheduler: cosine               # CosineAnnealingLR
+  epochs: 200
+  early_stop_patience: 20         # 按验证集「整卷肿瘤 Dice」早停
+  amp: bf16                       # A100 支持 bf16
+  pos_ratio_target: 0.30          # batch 内含肿瘤切片的目标占比（原始约 6%）
+  val_every: 1
+  grad_clip_norm: 0.0             # >0 时对梯度做裁剪
+  seed: 42
+
+# ---------- 评估 ----------
+eval:
+  min_lesion_mm3: 50.0            # 3D 后处理：删掉小于该体积的孤立连通块
+  detect_min_mm3: 10.0            # 病灶级检出：单病灶 >= 该体积即算检出
+  connectivity: 1                 # 连通域邻域：1 = 6 邻域，2 = 18，3 = 26
+  save_pred: false                # true 时把预测卷存到 runs/fold<k>/pred/<case>.nii.gz
