@@ -1,39 +1,39 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""CT 数据探针：一次性打印出推进分割任务所需的全部数据事实。
+r"""CT 数据探针：只读地打印数据目录的全部结构与内容事实，用于在看不到数据的情况下推进分割任务。
 
-用途
-----
-在远程平台（conda 环境 ``unet``）对 ``data/`` 目录跑一次，把 *全部* stdout 原样贴回本地。
-脚本只读数据、不写数据、不改动任何文件，输出是**纯文本**，便于直接复制粘贴。
-
-设计原则
---------
-* 只依赖 numpy + nibabel（远程环境已装）。不 import torch / SimpleITK / scipy，避免激活问题。
-* 逐行 ``key=value`` 输出，方便用户与 Agent 阅读、grep、以及后续生成 ``docs/data.md``。
-* 关键事实每个 case 一行（canonical case id 用 intersection 口径，见下），其余为聚合摘要。
-* 任何单个文件损坏/读失败都不会中断整体，记 ``status=READ_ERROR`` 继续跑。
-
-它回答哪些问题
---------------
-1. 目录真实结构：文件名是不是 ``volume-N.nii`` / ``segmentation-N.nii``，有没有嵌套目录/DICOM/孤儿文件。
-2. 编号配对：volume 与 segmentation 的 case id 集合是否一致，N 是多少。
-3. 几何是否对齐：shape / spacing / affine / 方位轴序 / origin / 方向余弦，volume 与 mask 是否严格一致。
-4. 强度分布：整幅与身体区域（body）的 min/max/percentile，给归一化（z-score / 窗宽窗位）提供依据。
-5. 标签语义：mask 里到底有哪些取值、各占多少体素、是 0/1 还是 0/1/2 多类、有没有小数或负值。
-6. 任务规模：每个 case 的肿瘤体素数、体积(cm^3)、占身体比例、最多一张切片里的病灶面积。
-7. 训练可行性：shape 不一致程度、可用的 patch 尺寸、空切片/退化切片（首尾连续空层）、小碎片占比、
-   掩膜包围盒是否落在身体包围盒内（能发现错配/错位）。
+数据受保密协议约束只存在于远程平台，本地无数据可用，因此需要由用户在本项目根目录执行本脚本，
+并把完整 stdout 贴回，作为撰写 ``docs/data.md`` 与后续数据处理 / 训练的实测依据。
 
 用法
 ----
-::
+在本项目根目录（默认当前 Linux 工作目录就是项目根）执行::
 
+    # 主用法：扫描 ./data，打印全部 7 节报告
+    python scripts/probe_data.py
+
+    # 显式指定数据目录（默认即为 data）
     python scripts/probe_data.py --data-dir data
-    python scripts/probe_data.py --data-dir data --write-doc /tmp/probe_output.txt
-    python scripts/probe_data.py --data-dir data --limit-cases 3      # 快速自检（只扫 3 个 case）
 
-退出码 0 表示脚本自身跑完（不代表数据没问题）；只要成功列出文件就返回 0。
+参数说明与默认值：
+
+===================================  ==================================================
+``--data-dir PATH``                  数据目录，默认 ``data``；相对路径相对当前工作目录
+``--vol-pattern REGEX``              影像文件名正则（不含扩展名），默认 ``^volume[-_](\d+)$``
+``--seg-pattern REGEX``              掩膜文件名正则（不含扩展名），默认 ``^segmentation[-_](\d+)$``
+``--limit-cases N``                  只检查前 N 个 case，默认 ``0`` 表示全部（快速自检用）
+``--skip-stats``                     只看文件系统与头信息，不读体素（秒级返回，但无强度/标签/规模）
+``--write-doc PATH``                 额外把完整输出写入该文件；**不要写进仓库**，用完请删除
+``-h`` / ``--help``                  打印参数帮助
+===================================  ==================================================
+
+其他说明：
+
+* **脚本只读数据**，不写入、不修改任何数据文件；进度与警告走 stderr，报告正文走 stdout。
+* 输出为逐行 ``key=value`` 纯文本（中文列名，数字保持原文），可直接整段复制粘贴。
+* 退出码：``0`` 脚本跑完（不代表数据没问题）；``2`` 命令行参数或正则非法。
+* 单个 case 读取失败不会中断整体，该 case 记为 ``status=READ_ERROR`` 并继续。
+* 约 30 个 case 全量读取体素需数十秒；请把**完整 stdout 原样贴回**，用于生成 ``docs/data.md``。
 """
 
 from __future__ import annotations
@@ -818,6 +818,7 @@ def main(argv=None) -> int:
         p(f"numpy={np.__version__} nibabel={nib.__version__}")
         p(f"cwd={os.getcwd()}")
         p("脚本只读数据，不写入任何数据文件。")
+        p("运行方式：在项目根目录执行 python scripts/probe_data.py（详见脚本文件头 docstring）。")
 
         fs = scan_filesystem(args.data_dir)
         report_filesystem(fs)
@@ -880,8 +881,8 @@ def main(argv=None) -> int:
             p("    这些 case 不能直接用于有监督训练，需人工确认。")
 
         p()
-        p("[!] 本报告可能包含数据样本的路径与统计量；请只贴回终端文本，")
-        p("    不要用 --write-doc 把报告文件落在仓库里（probe_report.txt 已加入 .gitignore，用完请删除）。")
+        p("[!] 本报告是撰写 docs/data.md 的实测依据：请把 stdout 整段原样贴回对话。")
+        p("    不要用 --write-doc 把报告文件落在仓库里（probe_report.txt 已加入 .gitignore，写完请删除）。")
         hr("报告结束", "-")
         p("请把以上全部 stdout 原样贴回，用于撰写 docs/data.md。")
     finally:

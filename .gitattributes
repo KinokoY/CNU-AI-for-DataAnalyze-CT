@@ -1,0 +1,22 @@
+# 仓库统一行尾：文本与脚本一律 LF（远程平台是 Linux，避免 CRLF 造成的整文件 diff 与执行问题）
+* text=auto eol=lf
+
+# 明确按文本处理的文件类型
+*.py   text eol=lf
+*.sh   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+
+# 明确按二进制处理的文件类型（不做行尾转换、不做 diff）
+*.nii      binary
+*.nii.gz   binary
+*.dcm      binary
+*.pt       binary
+*.pth      binary
+*.h5       binary
+*.ckpt     binary
+*.png      binary
+*.jpg      binary
