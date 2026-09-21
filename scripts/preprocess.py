@@ -310,23 +310,24 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
             LOGGER.warning("case %d 的 label 2 体素数在重采样前后变化异常：%d -> %d（比例 %.3f），"
                            "请检查该例的 spacing", case_id, n_label2_raw, n_label2_rs, ratio)
 
-    # 5) 落盘：SITK 数组轴序为 (z, y, x)，转置成 nibabel 的 (x, y, z) 再写，
-    #    这样下游 nib.load(...).dataobj[..., z] 直接就是一层冠状切片。
-    img_out = np.ascontiguousarray(img_arr.transpose(2, 1, 0))
-    seg_out = np.ascontiguousarray(seg_arr.transpose(2, 1, 0))
-
-    mask_sitk = sitk.GetImageFromArray(seg_out.astype(np.uint8))
+    # 5) 落盘（关键约定）：cache 用 SITK/SimpleITK 的 **native (z, y, x)** 布局写盘，
+    #    几何信息（spacing/origin/direction）直接沿用重采样后的图像，因此不需要也不应该做转置：
+    #    一旦对数组做 transpose 再 GetImageFromArray，SITK 会把形状解释成 (91,512,512)，
+    #    与原图的 (512,512,91) 不匹配，CopyInformation 会直接抛错。
+    #    下游 src/dataset.py 只按「数组索引 + spacing」使用这些缓存，不解释 affine，
+    #    所以这里不需要转成 nibabel 的 (x,y,z) 视图。
+    mask_sitk = sitk.GetImageFromArray(seg_arr.astype(np.uint8))
     mask_sitk.CopyInformation(seg_rs)
-    image_for_origin = sitk.GetImageFromArray(img_out.astype(np.float32))
+    image_for_origin = sitk.GetImageFromArray(img_arr.astype(np.float32))
     image_for_origin.CopyInformation(img_rs)
     seg_labels = seg_img = seg_rs = None  # 大对象尽早释放，降低峰值内存
     # 影像与掩膜使用同一套 origin（都前移到前景最小角），下游重建整卷时按索引对齐即可，
     # 不必再关心 affine：两卷的世界坐标差是常数偏移。
-    image_with_origin, shift_ijk = crop_origin_to_nonzero(image_for_origin, seg_out)
-    mask_with_origin, _ = crop_origin_to_nonzero(mask_sitk, seg_out)
+    image_with_origin, shift_ijk = crop_origin_to_nonzero(image_for_origin, seg_arr)
+    mask_with_origin, _ = crop_origin_to_nonzero(mask_sitk, seg_arr)
     rec["origin_shift_ijk"] = list(shift_ijk)
 
-    step("转置轴序 (z,y,x)->(x,y,z) 并写 cache")
+    step("写 cache（SITK native (z,y,x) 布局）")
     image_dir = cache_dir / "image"
     label_dir = cache_dir / "label"
     image_dir.mkdir(parents=True, exist_ok=True)
@@ -343,17 +344,21 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     label_writer.SetUseCompression(True)
     label_writer.Execute(sitk.Cast(mask_with_origin, sitk.sitkUInt8))
 
-    # 6) 统计：以「像素数 + spacing」为准换算 mm3，不依赖 affine
+    # 6) 统计：以「像素数 + spacing」为准换算 mm3，不依赖 affine。
+    #    数组轴序约定（全文一致，下游 dataset.py 依赖它）：
+    #      cache 文件里数组形状是 (nz, ny, nx)，np 索引 a[k, j, i] 对应物理坐标
+    #      (i*d0, j*d1, k*d2)（d = target_spacing），即 a[k] 是一层 (ny, nx) 切片；
+    #      "面内尺寸" = (ny, nx)，"切片数" = nz。
     voxel_mm3 = float(np.prod([float(s) for s in img_rs.GetSpacing()]))
-    n_tumor_voxels = int(np.count_nonzero(seg_out))
-    per_slice = seg_out.reshape(-1, seg_out.shape[2]).sum(axis=0)  # 每个 z 层的前景体素数
+    n_tumor_voxels = int(np.count_nonzero(seg_arr))
+    per_slice = seg_arr.reshape(-1, seg_arr.shape[2]).sum(axis=0)  # 每个 z 层的前景体素数
     tumor_slices = int(np.count_nonzero(per_slice >= 1))
     tiny_slices = int(np.count_nonzero((per_slice >= 1) & (per_slice < 10)))
 
-    rec["new_shape"] = tuple(int(s) for s in img_out.shape)
+    rec["new_shape_zyx"] = tuple(int(s) for s in img_arr.shape)
     rec["new_spacing"] = tuple(round(float(s), 4) for s in img_rs.GetSpacing())
     rec["voxel_mm3"] = round(voxel_mm3, 6)
-    rec["n_slices"] = int(img_out.shape[2])
+    rec["n_slices"] = int(img_arr.shape[0])
     rec["tumor_slices"] = tumor_slices
     rec["tumor_slice_ratio"] = round(float(tumor_slices / max(1, rec["n_slices"])), 6)
     rec["tiny_tumor_slices"] = tiny_slices
@@ -381,22 +386,27 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
 
 
 def build_aggregate(records: list, pre: dict) -> dict:
-    """汇总所有 case：尺寸分布、分桶情况、肿瘤切片占比、体积量级。"""
+    """汇总所有 case：面内尺寸分布、分桶情况、肿瘤切片占比、体积量级。
+
+    尺寸一律用「面内 (ny, nx)」口径：数组是 (nz, ny, nx)，切片数 nz 各例不同、
+    面内尺寸才是决定分桶与显存的量。
+    """
     ok = [r for r in records if r["status"] == "OK"]
     failed = [r for r in records if r["status"] != "OK"]
-    shapes = Counter(tuple(r["new_shape"]) for r in ok)
+    inplane = Counter((int(r["new_shape_zyx"][1]), int(r["new_shape_zyx"][2])) for r in ok)
+    n_slices_values = Counter(int(r["n_slices"]) for r in ok)
     spacings = Counter(tuple(r["new_spacing"]) for r in ok)
     orig_spacings = Counter(tuple(r["original_spacing"]) for r in ok)
     orig_orientations = Counter(r["original_orientation"] for r in ok)
 
     max_hw = [0, 0]
-    for shape in shapes:
+    for shape in inplane:
         max_hw[0] = max(max_hw[0], int(shape[0]))
         max_hw[1] = max(max_hw[1], int(shape[1]))
 
     mult = int(16)
     buckets = Counter((int(np.ceil(shape[0] / mult) * mult), int(np.ceil(shape[1] / mult) * mult))
-                      for shape in shapes for _ in range(shapes[shape]))
+                      for shape in inplane for _ in range(inplane[shape]))
 
     tumor_slices = sum(int(r["tumor_slices"]) for r in ok)
     total_slices = sum(int(r["n_slices"]) for r in ok)
@@ -406,6 +416,7 @@ def build_aggregate(records: list, pre: dict) -> dict:
     floor_values = Counter(r["floor_value"] for r in ok)
 
     return {
+        "axis_convention": "cache 数组形状为 (nz, ny, nx)；a[k] 是一层 (ny, nx) 切片，k 为切片索引",
         "n_cases_ok": len(ok),
         "n_cases_failed": len(failed),
         "failed_cases": [r["case"] for r in failed],
@@ -414,8 +425,11 @@ def build_aggregate(records: list, pre: dict) -> dict:
         "cases_liver_only": liver_only,
         "n_cases_with_tumor": len(with_tumor),
         "n_cases_liver_only": len(liver_only),
-        "image_shapes": {"x".join(str(v) for v in k): v for k, v in sorted(shapes.items())},
-        "unique_image_shapes": len(shapes),
+        "inplane_shapes": {"x".join(str(v) for v in k): v for k, v in sorted(inplane.items())},
+        "unique_inplane_shapes": len(inplane),
+        "n_slices_distribution": {str(k): v for k, v in sorted(n_slices_values.items())},
+        "n_slices_min": min(n_slices_values) if n_slices_values else 0,
+        "n_slices_max": max(n_slices_values) if n_slices_values else 0,
         "max_hw": max_hw,
         "pad_to_multiple": mult,
         "size_buckets": {"x".join(str(v) for v in k): v for k, v in sorted(buckets.items())},
@@ -439,9 +453,9 @@ def build_markdown(report: dict) -> str:
     """把统计报告渲染成可直接粘贴的 markdown。"""
     agg = report["aggregate"]
     columns = ["case", "original_shape", "original_spacing", "original_orientation", "floor_value",
-               "floor_fraction", "new_shape", "new_spacing", "n_slices", "tumor_slices",
-               "tumor_slice_ratio", "n_components", "min_component_voxels", "min_component_mm3",
-               "tumor_volume_mm3", "clip_low_fraction"]
+               "floor_fraction", "new_shape_zyx", "new_spacing", "n_slices", "tumor_slices",
+               "tumor_slice_ratio", "label2_voxel_ratio", "n_components", "min_component_voxels",
+               "min_component_mm3", "tumor_volume_mm3", "clip_low_fraction"]
     lines: list = []
     lines.append("# 预处理统计报告（scripts/preprocess.py）")
     lines.append("")
@@ -453,11 +467,15 @@ def build_markdown(report: dict) -> str:
     lines.append(f"- 目标 spacing：{agg['target_spacing']}；实际达到：{agg['new_spacing']}")
     lines.append(f"- 全局窗 hu_clip：{agg['hu_clip']}（地板值分布：{agg['floor_values']}）")
     lines.append("")
-    lines.append("## 1. 切片尺寸分布（决定 batch 与分桶）")
+    lines.append(f"- 轴序约定：{agg['axis_convention']}")
     lines.append("")
-    lines.append(f"- 唯一尺寸数：{agg['unique_image_shapes']}；尺寸 -> case 数：{agg['image_shapes']}")
-    lines.append(f"- 最大 H×W：{agg['max_hw']}；按 pad_to_multiple={agg['pad_to_multiple']} 分桶："
+    lines.append("## 1. 面内尺寸分布（决定 batch、分桶与显存）")
+    lines.append("")
+    lines.append(f"- 唯一面内尺寸数：{agg['unique_inplane_shapes']}；面内 (ny,nx) -> case 数：{agg['inplane_shapes']}")
+    lines.append(f"- 最大面内 (ny,nx)：{agg['max_hw']}；按 pad_to_multiple={agg['pad_to_multiple']} 分桶："
                  f"{agg['size_buckets']}（共 {agg['n_size_buckets']} 个桶）")
+    lines.append(f"- 切片数 nz：min={agg['n_slices_min']} max={agg['n_slices_max']}；"
+                 f"分布 -> case 数：{agg['n_slices_distribution']}")
     lines.append("")
     lines.append("## 2. 切片级前景占比（采样器依据）")
     lines.append("")
@@ -472,11 +490,13 @@ def build_markdown(report: dict) -> str:
     lines.append("")
     lines.append("## 4. 判读提示")
     lines.append("")
-    lines.append("- `new_shape` 不唯一是正常的：面内 spacing 0.666-0.9766 重采样到 1mm 后会得到不同面内尺寸；"
+    lines.append("- 面内尺寸不唯一是正常的：面内 spacing 0.666-0.9766 重采样到 1mm 后会得到不同面内尺寸；"
                  "下游不做任何 resize，只按桶 padding 到 16 的整数倍。")
     lines.append("- `n_components` > 1 或 `min_component_voxels` 很小，说明存在孤立小病灶，"
                  "评估阶段的 3D 后处理阈值（eval.min_lesion_mm3）要据此判断。")
     lines.append("- `tumor_slices` 为 0 的 case 就是仅肝脏病例，只进训练集、不进验证集。")
+    lines.append("- `label2_voxel_ratio` = 重采样前后 label 2 体素数之比，正常应在 0.2-5.0 之间；"
+                 "越界说明该例 spacing 异常，已在运行日志里告警。")
     return "\n".join(lines) + "\n"
 
 
@@ -537,8 +557,9 @@ def main(argv=None) -> int:
             rec = {"case": case_id, "status": "FAILED", "error": f"{type(exc).__name__}: {exc}"}
         records.append(rec)
         if rec["status"] == "OK":
-            LOGGER.info("    shape %s -> %s，含肿瘤切片 %d/%d，肿瘤体积 %.1f mm3",
-                        tuple(rec["original_shape"]), tuple(rec["new_shape"]),
+            shape = tuple(int(s) for s in rec["new_shape_zyx"])
+            LOGGER.info("    shape(z,y,x) %s -> %s，含肿瘤切片 %d/%d，肿瘤体积 %.1f mm3",
+                        tuple(rec["original_shape"]), shape,
                         rec["tumor_slices"], rec["n_slices"], rec["tumor_volume_mm3"])
 
     import SimpleITK as sitk  # 版本号写进报告供复现
@@ -565,10 +586,11 @@ def main(argv=None) -> int:
         "cfg_hash": cfg_hash,
         "cache_dir": rel_to_root(cache_dir),
         "preprocess": {k: pre[k] for k in DEFAULTS},
+        "axis_convention": aggregate["axis_convention"],
         "cases": [
             {
                 "case": int(r["case"]),
-                "shape": list(r["new_shape"]),
+                "shape_zyx": [int(s) for s in r["new_shape_zyx"]],
                 "spacing": list(r["new_spacing"]),
                 "n_slices": int(r["n_slices"]),
                 "tumor_slices": int(r["tumor_slices"]),
@@ -581,8 +603,9 @@ def main(argv=None) -> int:
         ],
         "aggregate": {k: aggregate[k] for k in
                       ("n_cases_ok", "n_cases_with_tumor", "n_cases_liver_only", "cases_with_tumor",
-                       "cases_liver_only", "image_shapes", "max_hw", "size_buckets", "n_size_buckets",
-                       "total_slices", "tumor_slices", "tumor_slice_ratio_overall", "new_spacing")},
+                       "cases_liver_only", "inplane_shapes", "max_hw", "size_buckets", "n_size_buckets",
+                       "n_slices_min", "n_slices_max", "total_slices", "tumor_slices",
+                       "tumor_slice_ratio_overall", "new_spacing")},
     }
     manifest_path = save_json(manifest, paths.get("cache_manifest", "cache/cache_manifest.json"))
 

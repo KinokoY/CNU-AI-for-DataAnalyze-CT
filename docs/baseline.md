@@ -27,6 +27,10 @@ python scripts/preprocess.py
 做什么：剔除 48-52 → 地板值 padding 夹到 -1000 → 统一 RAS → 重采样到 1×1×1mm（影像线性 / 掩膜最近邻）
 → `clip(-1000,1000)` → `cache/image/<case>.nii.gz`（float16 HU）+ `cache/label/<case>.nii.gz`（uint8，仅 label 2）。
 
+**缓存轴序约定（下游 dataset.py 依赖，不要改动）**：cache 文件沿用 SimpleITK 的 native `(z, y, x)` 布局，
+即 `np.asanyarray(nib.load(p).dataobj)` 得到的数组形状是 `(nz, ny, nx)`，`a[k]` 就是一层 `(ny, nx)` 切片，
+"面内尺寸" = `(ny, nx)`、"切片数" = `nz`。下游只按「数组索引 + spacing」使用缓存，不解释 affine。
+
 产出：
 
 | 文件 | 说明 |
@@ -45,11 +49,34 @@ cache 中 image=25，label=25
 自检要点：
 - 出现 `可用 case 数为 N，与 docs/data.md 的 25 例预期不一致` → 把该行与失败明细贴回。
 - 出现 `仅肝脏病例实测 [...]，与 docs 预期 [32,34,38,41,47] 不一致` → 贴回，这不中断流程但会影响划分。
+- 出现 `label 2 体素数在重采样前后变化异常` → 贴回，说明该例 spacing 异常。
 - 想先验证脚本能跑通（只处理 1 例、秒级返回）：
 
 ```bash
 python scripts/preprocess.py --debug
 ```
+
+### 1.1 缓存体检（强烈建议，秒级）
+
+```bash
+python scripts/check_cache.py
+```
+
+逐例核对：image/label 是否成对、shape 是否一致、spacing 是否为约定的 1mm、
+label 是否只含 {0,1}、有无肿瘤、影像值是否落在全局窗内，并把实测与 `cache_manifest.json`
+逐例比对；有任何不一致会打印 `发现 N 个问题` 并以退出码 1 结束。
+
+期望输出：
+
+```
+case 数：25；含肿瘤 20 例；仅肝脏 5 例
+含肿瘤的 case：[...20 个...]
+仅肝脏的 case：[32, 34, 38, 41, 47]
+体检报告：reports/cache_check.json
+体检通过：几何、标签、值域与清单全部一致。
+```
+
+判读：**含肿瘤必须是 20 例**（若为 0 说明标签口径又错了），**spacing 必须全为 (1,1,1)**。
 
 ---
 
