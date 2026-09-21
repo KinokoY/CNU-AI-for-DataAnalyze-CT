@@ -159,13 +159,18 @@ def apply_floor_clamp(img, floor_value: float, margin: float, clamp_to: float):
 
 
 def resample_ras_1mm(img, target_spacing, interpolator: int):
-    """先统一到 RAS 方位，再重采样到目标 spacing（影像用线性、掩膜用最近邻）。"""
+    """先统一到 RAS 方位，再重采样到目标 spacing（影像用线性、掩膜用最近邻）。
+
+    输出网格按「输入物理范围 / target_spacing」计算；因为已经在 RAS 上，direction 是轴对齐的置换矩阵，
+    该窗口就是紧致的，不会出现倾斜包围盒导致的尺寸爆炸（这也是原先把 origin 设成输入端原点后
+    覆盖范围偏移的修法：这里显式给定 size 与 origin，SITK 不再自行推导）。
+    """
     import SimpleITK as sitk
 
     oriented = sitk.DICOMOrient(img, "RAS")
     original_spacing = oriented.GetSpacing()
     original_size = oriented.GetSize()
-    new_size = [int(round(original_size[i] * (original_spacing[i] / float(target_spacing[i]))))
+    new_size = [int(np.ceil(original_size[i] * abs(original_spacing[i]) / abs(float(target_spacing[i]))))
                 for i in range(3)]
     new_size = [max(1, n) for n in new_size]
 
@@ -206,9 +211,18 @@ def crop_origin_to_nonzero(img, arr: np.ndarray):
 # 主流程
 # --------------------------------------------------------------------------------------
 
-def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, pre: dict) -> dict:
-    """处理一个 case：地板夹取 → RAS → 1mm 重采样 → 全局窗 → 落盘 cache，返回该 case 的统计。"""
+def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, pre: dict,
+                 verbose: bool = False) -> dict:
+    """处理一个 case：地板夹取 → RAS → 1mm 重采样 → 全局窗 → 落盘 cache，返回该 case 的统计。
+
+    verbose=True 时在每一步几何操作前打印标记：SITK 是 C++ 实现，异常会以 SIGSEGV（段错误）
+    直接杀掉进程而不抛 Python 异常，留下"最后一条标记"是定位崩溃点的唯一手段。
+    """
     import SimpleITK as sitk
+
+    def step(msg: str) -> None:
+        if verbose:
+            LOGGER.info("    [case %d] %s", case_id, msg)
 
     target_spacing = [float(s) for s in pre["target_spacing"]]
     hu_lo, hu_hi = (float(x) for x in pre["hu_clip"])
@@ -217,7 +231,9 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     out_dtype = str(pre["image_out_dtype"])
 
     rec: dict = {"case": case_id, "status": "OK", "error": ""}
+    step(f"读取影像 {vol_path.name}")
     vol_img = load_as_float(vol_path)
+    step(f"读取掩膜 {seg_path.name}，size={vol_img.GetSize()}")
     seg_img = load_mask_binary(seg_path, label=2)
 
     rec["original_shape"] = tuple(int(s) for s in vol_img.GetSize())
@@ -225,30 +241,39 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     rec["original_orientation"] = "".join(sitk.DICOMOrientImageFilter_GetOrientationFromDirectionCosines(vol_img.GetDirection()))
 
     # 1) 地板值 padding：在原始整数域上判定，避免插值把地板值摊开
+    step("统计地板值")
     raw = sitk.GetArrayViewFromImage(sitk.ReadImage(str(vol_path)))
     floor_value, n_floor = floor_stats(np.asarray(raw), margin)
     rec["floor_value"] = floor_value
     rec["floor_voxels"] = n_floor
     rec["floor_fraction"] = float(n_floor / max(1, raw.size))
     del raw
+    step("统计掩膜原始标签分布")
     rec["n_labels_in_mask_raw"] = None
     seg_arr_raw = sitk.GetArrayViewFromImage(sitk.ReadImage(str(seg_path)))
     labels, counts = np.unique(np.asarray(seg_arr_raw), return_counts=True)
     rec["mask_label_counts_raw"] = {int(v): int(c) for v, c in zip(labels.tolist(), counts.tolist())}
     del seg_arr_raw
 
+    step(f"地板夹取（floor={floor_value}，比例 {rec['floor_fraction']:.4f}）")
     img_clamped = apply_floor_clamp(vol_img, floor_value, margin, clamp_to)
 
     # 2) RAS + 3) 重采样到 target_spacing（影像线性、掩膜最近邻）
+    step(f"影像 RAS + 重采样到 {target_spacing}")
     img_rs, _, new_size = resample_ras_1mm(img_clamped, target_spacing, sitk.sitkLinear)
+    step(f"影像重采样完成，输出 size={img_rs.GetSize()}")
+    step("掩膜 RAS + 重采样（最近邻）")
     seg_rs, _, _ = resample_ras_1mm(seg_img, target_spacing, sitk.sitkNearestNeighbor)
+    step("掩膜重采样完成")
 
     # 4) 全局窗：先记录窗内饱和比例，再 clip 到 [hu_lo, hu_hi]
+    step("全局窗 clip")
     img_arr = sitk.GetArrayFromImage(img_rs).astype(np.float32, copy=False)
     rec["clip_low_fraction"] = float(np.count_nonzero(img_arr < hu_lo) / max(1, img_arr.size))
     rec["clip_high_fraction"] = float(np.count_nonzero(img_arr > hu_hi) / max(1, img_arr.size))
     np.clip(img_arr, hu_lo, hu_hi, out=img_arr)
 
+    step("掩膜取 label 2 并转 uint8")
     seg_arr = np.asarray(sitk.GetArrayFromImage(seg_rs))
     seg_arr = (seg_arr == 2).astype(np.uint8)
 
@@ -263,6 +288,7 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     image_for_origin.CopyInformation(img_rs)
     image_with_origin, _ = crop_origin_to_nonzero(image_for_origin, seg_out)
 
+    step("转置轴序 (z,y,x)->(x,y,z) 并写 cache")
     image_dir = cache_dir / "image"
     label_dir = cache_dir / "label"
     image_dir.mkdir(parents=True, exist_ok=True)
@@ -422,9 +448,17 @@ def main(argv=None) -> int:
     parser.add_argument("--data-dir", default=None, help="覆盖 data/ 位置")
     parser.add_argument("--cache-dir", default=None, help="覆盖 cache/ 位置")
     parser.add_argument("--debug", action="store_true", help="只处理第一个 case，打印详细中间量后退出")
+    parser.add_argument("--limit", type=int, default=0, help="只处理前 N 个 case（0 = 全部），用于崩溃定位")
+    parser.add_argument("--verbose", action="store_true",
+                        help="每个 case 打印逐步标记（SITK 段错误时靠最后一条标记定位）")
     parser.add_argument("--set", dest="overrides", action="append", default=None,
                         help="覆盖配置项，如 --set preprocess.target_spacing=[1,1,1]（可多次）")
     args = parser.parse_args(argv)
+
+    # SITK 崩溃（SIGSEGV）不会抛 Python 异常，开 faulthandler 至少能看到 C 层栈
+    import faulthandler
+
+    faulthandler.enable()
 
     cfg = load_config(args.config, args.overrides)
     pre = dict(DEFAULTS)
@@ -446,6 +480,9 @@ def main(argv=None) -> int:
     if args.debug:
         cases = cases[:1]
         LOGGER.info("[debug] 只处理 1 个 case：%s", cases)
+    elif args.limit > 0:
+        cases = cases[: args.limit]
+        LOGGER.info("[limit] 只处理前 %d 个 case：%s", args.limit, cases)
     if not cases:
         LOGGER.error("没有任何可处理的 case，请检查 --data-dir 与排除清单。")
         return 2
@@ -455,7 +492,8 @@ def main(argv=None) -> int:
     for i, case_id in enumerate(cases, 1):
         LOGGER.info("[%d/%d] case %d ...", i, len(cases), case_id)
         try:
-            rec = process_case(case_id, volumes[case_id], segs[case_id], cache_dir, pre)
+            rec = process_case(case_id, volumes[case_id], segs[case_id], cache_dir, pre,
+                               verbose=bool(args.verbose or args.debug))
         except Exception as exc:  # noqa: BLE001 - 单 case 失败不中断整体
             LOGGER.exception("case %d 处理失败：%s", case_id, exc)
             rec = {"case": case_id, "status": "FAILED", "error": f"{type(exc).__name__}: {exc}"}
@@ -518,7 +556,7 @@ def main(argv=None) -> int:
         LOGGER.error("cache 文件数与待处理 case 数不一致（期望 %d），请检查上方的失败记录。", len(cases))
         return 3
 
-    if not args.debug:
+    if not args.debug and args.limit == 0:
         if aggregate["n_cases_ok"] != 25:
             LOGGER.warning("可用 case 数为 %d，与 docs/data.md 的 25 例预期不一致，请核对排除清单与数据目录。",
                            aggregate["n_cases_ok"])
