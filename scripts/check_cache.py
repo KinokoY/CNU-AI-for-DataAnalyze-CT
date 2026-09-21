@@ -97,7 +97,11 @@ def main(argv=None) -> int:
         zooms = tuple(round(float(z), 4) for z in img.header.get_zooms()[:3])
         lab_zooms = tuple(round(float(z), 4) for z in lab_img.header.get_zooms()[:3])
 
-        per_slice = lab.reshape(-1, lab.shape[2]).sum(axis=0)
+        # 数组是 (nz, ny, nx)：对 (y, x) 求和得到每层前景体素数
+        per_slice = lab.sum(axis=(1, 2))
+        if int(per_slice.size) != int(lab.shape[0]):
+            problems.append(f"case {case}：per-slice 长度 {int(per_slice.size)} "
+                            f"与切片数 {int(lab.shape[0])} 不一致")
         uniq = np.unique(lab)
         img_dtype = str(img.get_data_dtype())
         if img_dtype == "uint16":
@@ -123,6 +127,9 @@ def main(argv=None) -> int:
             "nan": int(np.count_nonzero(~np.isfinite(np.asarray(arr, dtype=np.float32)))),
         }
         rows.append(row)
+
+        if row["tumor_slices"] > int(lab.shape[0]):
+            problems.append(f"case {case}：含肿瘤切片数 {row['tumor_slices']} 超过总切片数 {int(lab.shape[0])}")
 
         if tuple(arr.shape) != tuple(lab.shape):
             problems.append(f"case {case}：image shape {arr.shape} != label shape {lab.shape}")

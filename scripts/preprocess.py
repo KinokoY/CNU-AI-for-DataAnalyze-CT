@@ -352,9 +352,18 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     step("统计切片与连通域")
     voxel_mm3 = float(np.prod([float(s) for s in img_rs.GetSpacing()]))
     n_tumor_voxels = int(np.count_nonzero(seg_arr))
-    per_slice = seg_arr.reshape(-1, seg_arr.shape[2]).sum(axis=0)  # 每个 z 层的前景体素数
+    # 每层前景体素数：数组是 (nz, ny, nx)，必须对 (y, x) 两个轴求和，得到的长度才是 nz。
+    # （原先写成 reshape(-1, shape[2]).sum(axis=0)，等于只对 z 求和、得到长度 nx=512 的数组，
+    #   于是"含肿瘤切片数"能超过总切片数 —— 那个数字是错的。）
+    per_slice = seg_arr.sum(axis=(1, 2))
     tumor_slices = int(np.count_nonzero(per_slice >= 1))
     tiny_slices = int(np.count_nonzero((per_slice >= 1) & (per_slice < 10)))
+    if tumor_slices > int(img_arr.shape[0]):
+        raise RuntimeError(f"case {case_id} 的含肿瘤切片数 {tumor_slices} 超过总切片数 "
+                           f"{int(img_arr.shape[0])}，per-slice 统计的轴用错了")
+    if int(per_slice.size) != int(img_arr.shape[0]):
+        raise RuntimeError(f"case {case_id} 的 per-slice 数组长度 {int(per_slice.size)} "
+                           f"与切片数 {int(img_arr.shape[0])} 不一致")
 
     rec["new_shape_zyx"] = tuple(int(s) for s in img_arr.shape)
     rec["new_spacing"] = tuple(round(float(s), 4) for s in img_rs.GetSpacing())
@@ -431,6 +440,11 @@ def build_aggregate(records: list, pre: dict) -> dict:
 
     tumor_slices = sum(int(r["tumor_slices"]) for r in ok)
     total_slices = sum(int(r["n_slices"]) for r in ok)
+    inconsistent = [r["case"] for r in ok if int(r["tumor_slices"]) > int(r["n_slices"])]
+    if inconsistent:
+        # 兜底：per-slice 统计若用错轴，含肿瘤切片数会超过总切片数，必须显式暴露而不是写进报告
+        raise RuntimeError(f"以下 case 的含肿瘤切片数超过总切片数：{inconsistent}，"
+                           f"说明 per-slice 统计的轴用错了")
     with_tumor = [r["case"] for r in ok if r["has_tumor"]]
     liver_only = [r["case"] for r in ok if not r["has_tumor"]]
     volumes = [float(r["tumor_volume_mm3"]) for r in ok if r["has_tumor"]]
