@@ -35,17 +35,40 @@ model:
   encoder_pretrained: null        # 基础版 null；进阶版可填 "resnet18" / "resnet34"
   pretrained_weights_path: null   # 本地权重文件绝对路径（离线加载，不走网络）
 
+# ---------- 数据 / DataLoader（src/dataset.py） ----------
+data:
+  pad_multiple: 16                # 面内尺寸分桶对齐；缺省时回退到 model.pad_to_multiple（必须一致！）
+  index_cache_size: 8             # 每个 worker 缓存的 nibabel 句柄数（num_workers × 该值 = 并发句柄上限）
+  num_workers: 8                  # 远程 52 核，8 worker × lru_cache(8) 句柄可控
+  pin_memory: true
+  persistent_workers: false       # 折内 epoch 之间不重建 worker（调试时可保持不变）
+  val_batch_size: null            # null = 用 train.batch_size；验证是顺序读，只影响速度
+  bucket_balance: true            # 每轮 batch 配额按桶内样本数加权（否则小桶被过度重复）
+  min_pos_per_batch: 1            # 每个 batch 至少 1 个肿瘤切片（小桶兜底；正常桶由 pos_ratio_target 决定）
+  pos_ratio_tolerance: 0.10       # 自检脚本判定「实测阳性比例偏离目标」的阈值
+  augment:                        # 仅训练；验证侧不做任何几何变换
+    flip_prob: 0.5                # RandFlip(axis=0) 与 RandFlip(axis=1) 各自独立
+    rotate90_prob: 0.5            # RandRotate90(max_k=1, spatial_axes=(0,1))
+    affine_prob: 0.5              # 自定义 2D 仿射（不用 RandAffine，避免各版本 API 差异）
+    rotation_deg: 15.0            # 旋转 ±15°
+    scale_range: [0.9, 1.1]       # 缩放 0.9–1.1（采样坐标口径，>1 = 内容放大）
+    shift_frac: 0.1               # 平移 ±10% 面内边长（内部换算成像素位移）
+    histogram_shift_prob: 0.2     # RandHistogramShift
+    histogram_num_bins: 10
+    histogram_shift_range: 0.1
+    noise_prob: 0.2               # RandGaussianNoise
+    noise_std: 0.01
+
 # ---------- 训练 ----------
 train:
   batch_size: 8                   # 第 1 轮实测尺寸后再定稿；--debug 会打印显存占用供标定
-  num_workers: 8                  # 远程 52 核，8 worker × lru_cache(8) 句柄可控
   lr: 0.001
   weight_decay: 0.0001
   scheduler: cosine               # CosineAnnealingLR
   epochs: 200
   early_stop_patience: 20         # 按验证集「整卷肿瘤 Dice」早停
   amp: bf16                       # A100 支持 bf16
-  pos_ratio_target: 0.30          # batch 内含肿瘤切片的目标占比（原始约 6%）
+  pos_ratio_target: 0.30          # batch 内含肿瘤切片的目标占比（原始约 12.81%）
   val_every: 1
   grad_clip_norm: 0.0             # >0 时对梯度做裁剪
   seed: 42

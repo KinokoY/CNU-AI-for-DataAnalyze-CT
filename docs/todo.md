@@ -19,8 +19,8 @@ CT 肝脏肿瘤分割 · 基础版（2D 闭环）后续编码计划
 剩余 5 轮，每轮都能独立运行 + 独立验证
 --------------------------------------------------------
 
-■ 第 2 轮：Dataset + 分桶采样器 + 增强
-  交付：src/selfcheck_data.py、src/dataset.py
+■ 第 2 轮：Dataset + 分桶采样器 + 增强 —— 已完成
+  交付：src/selfcheck_data.py、src/dataset.py（另在 configs/default.yaml 补了 data 节）
   【先交付自检脚本】src/selfcheck_data.py（不依赖 torch 网络，只读缓存）
     - 跑 3 个 batch，打印：每个 batch 的 image/label shape、分桶键、
       /65535 后的值域、batch 内含肿瘤切片比例实测值、单 batch 耗时；

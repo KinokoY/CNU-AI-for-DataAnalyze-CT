@@ -128,7 +128,57 @@ python scripts/make_splits.py
 
 ---
 
-## 3. 后续步骤（代码分轮交付，命令占位）
+## 3. 数据自检（第 2 轮交付，秒级到十几秒）
+
+```bash
+python -m src.selfcheck_data
+```
+
+做什么（只读 cache，不建模型、不训练）：核对 splits / 清单 / 预处理指纹 → 构建 train 与 val
+两侧的 `CTSliceDataset` → 实测 3 个 batch 的形态 → 打印一个病例的逐层肿瘤体素数曲线 →
+自检增强与采样器 → 把结果写到 `reports/selfcheck_data.json`。
+
+期望输出（关键几行）：
+
+```
+划分：data/splits.json，5 折，每折 train=[21,...] / val=[4,...]
+清单：25 例，预处理指纹 xxxxxxxx（当前配置 xxxxxxxx）一致
+分桶与清单一致：{'512x512': 17, '448x448': 1, ...}
+整体阳性率：train 侧 0.12xx（.../...），val 侧 0.12xx
+batch 1：image (8, 1, 512, 512) / label (8, 512, 512)；桶 512x512；病例 [...]
+        值域 [0.0000, 1.0000]；label 取值 [0, 1]；**含肿瘤切片 2/8 = 0.250**（目标 0.30）
+  桶    512x512：切片  1957（含肿瘤   518 = 26.47%）  病例  6 例 [...]
+bucket_seed 一致：True    # 采样器可复现
+自检步骤：... 全部通过
+下一步：第 3 轮 python -m src.train --fold 0 --debug
+```
+
+判读要点：
+
+- **`含肿瘤切片 2/8 = 0.250`（而不是 0.30）是对的**：`pos_ratio_target=0.30` 经
+  `round(8×0.30)=2` 取整后，每个 batch 恒为 2 个肿瘤切片，批次平均比例就是 0.25 =
+  原始 12.81% 的约 1.95 倍过采样。想更接近 0.30 就把 `train.batch_size` 提到 10/20，或把
+  `train.pos_ratio_target` 改成 0.25（两者等价，改一个即可）。
+- **每个 batch 内只有一种面内尺寸**：输出里 batch 的 `桶` 字段只有一个值；分桶保证不同
+  尺寸不会同 batch。
+- **逐层曲线应集中在中段**：若阳性层全挤在 `z≈0` 或 `z≈nz-1`，说明切片轴搞反了，把该曲线贴回。
+- `值域` 必须落在 `[0,1]`、`label 取值` 必须只含 `{0,1}`、`image dtype` 必须是 float32。
+
+常见报错与贴回内容：
+
+| 输出 | 含义 / 该贴回什么 |
+| --- | --- |
+| `case 31 缺 image/label` | cache 不完整 → 先跑 `python scripts/preprocess.py` |
+| `cfg_hash=... 与当前配置算出的 ... 不一致` | 缓存来自别的预处理参数 → 重跑 `preprocess.py` |
+| `含肿瘤切片数 ... 与清单 ... 不符` | 清单过期 → `python scripts/fetch_manifest.py` 刷新 |
+| `桶 ...：本轮 N 个 batch 只分到 M 个阳性层/批` | 该桶病灶层太少（正常数据不会出现） |
+| 退出码 1 + `自检发现 N 个问题` | **把带 `-` 的行整段贴回**，先不要进入第 3 轮 |
+
+只想快速过一遍、不跑完整轮采样：`python -m src.selfcheck_data --batches 1 --skip-sampler`。
+
+---
+
+## 4. 后续步骤（代码分轮交付，命令占位）
 
 ```bash
 # 第 3 轮交付 src/unet.py + src/train.py 后：
@@ -148,7 +198,7 @@ python -m src.train --fold 0 --debug --set train.batch_size=4 --set train.epochs
 
 ---
 
-## 4. 运行产物与 git 边界
+## 5. 运行产物与 git 边界
 
 - **不入库且只存在于远程**：`cache/`（含 `cache_manifest.json`）、`reports/`、`runs/`，以及所有 `*.pt` / `*.nii.gz`。
   数据受保密协议约束不能下载，所以本地仓库看不到这些文件；后续编码所需的关键数字都记在

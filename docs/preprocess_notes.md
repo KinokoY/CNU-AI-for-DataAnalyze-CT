@@ -38,6 +38,26 @@
 
 ## 五、本地缺少、必须由远程 push 回来的文件
 
-- **`data/splits.json`**：由远程 `python scripts/make_splits.py` 生成，本地仓库当前**没有**这个文件。
-  写 `src/dataset.py` / `src/train.py` 之前必须确认它已在本地（远程 `git add data/splits.json && git push`），
-  否则只能在本地按上面的 fold 归属硬编码兜底——不推荐。
+- ~~**`data/splits.json`**~~：**已入库**（远程跑 `make_splits.py` 后 push 回来了），本地已具备，
+  可以直接写/查 `src/dataset.py`、`src/train.py`。
+
+## 六、第 2 轮（Dataset + 分桶采样器 + 增强）已确认的事实
+
+- 样本单位：`index[i] = (case, z)`，`__getitem__` 返回
+  `{"image": (1,H,W) float32∈[0,1], "label": (H,W) int64∈{0,1}, "case", "z", "orig_hw"}`。
+- 分桶键 = `(ceil(H/16)*16, ceil(W/16)*16)`，与 `preprocess.py` 的 `size_buckets` 同口径；
+  **同一 batch 内面内尺寸必然一致**。`data.pad_multiple` 缺省从 `model.pad_to_multiple` 取。
+- **batch 内阳性比例的真实口径**：`n_pos = min(batch_size, max(1, round(batch_size × pos_ratio_target)))`。
+  `batch_size=8, pos_ratio_target=0.30` → `n_pos=2` → 实际比例 **0.25**（≈ 原始 12.81% 的 1.95 倍）。
+  这是取整的必然结果，不是 bug；想贴近 0.30 就把 batch_size 提到 10/20。
+- 采样器保证：一轮 epoch 内每层切片至少出现一次、**阳性层恰好各一次**；每批阳性数恒为 `n_pos`；
+  采样顺序只由 `(train.seed, epoch, 病例集合)` 决定（用 sha256 派生，不用内置 `hash()`），
+  与 `num_workers` 无关，可复现。
+- `num_workers` 等 DataLoader 参数从 `train` 节挪到了 `data` 节（`configs/default.yaml` 已补 `data` 节）。
+- 增强 8 步（image/label 同步，仅训练）：`RandFlip(axis=0)`、`RandFlip(axis=1)`、
+  `RandRotate90(spatial_axes=(0,1))`、自定义 `RandAffineSlice2D`（旋转 ±15°/缩放 0.9–1.1/平移 ±10%，
+  image 双线性、label 最近邻）、`RandHistogramShift`、`RandGaussianNoise`、夹回 [0,1]、label 二值化。
+  **刻意不用 `monai.transforms.RandAffine`**：它的 `spatial_size`/`padding_mode`/`mode` 契约跨版本有差异，
+  而自实现（`GridAffine2D` = `grid_sample`）行为确定，且本地可以离线验证几何。
+  不做弹性形变：MONAI 只有 `Rand3DElastic`，逐层施加会破坏 z 一致性。
+- 自检脚本：`python -m src.selfcheck_data`（只读 cache，不需要 GPU）。
