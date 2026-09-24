@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import random
 import sys
 import time
@@ -187,17 +188,36 @@ def check_prerequisites(cfg: dict) -> tuple:
 
 
 def check_bucket_consistency(ds: CTSliceDataset, manifest: dict, problems: list) -> None:
-    """把数据集的桶与清单里的 ``size_buckets`` 对齐（尺寸不一致说明轴序或 pad_multiple 变了）。"""
-    agg = (manifest or {}).get("aggregate") or {}
-    recorded = agg.get("size_buckets") or {}
-    if not recorded:
+    """核对分桶口径：桶键 = **精确面内尺寸**，并由清单的逐例尺寸独立复算一遍。
+
+    为什么不用清单里的 ``aggregate.size_buckets`` 直接比：那是「对齐 ``pad_to_multiple`` 之后」
+    的汇总（例如把 342×342 与 351×351 都算进 ``352x352``），而**能同 batch 的充要条件是精确尺寸相同**
+    （``torch.stack`` 要求形状逐元素一致）。所以这里用清单的逐例 ``inplane_hw`` 复算出
+    「精确尺寸 → 例数」来交叉验证，同时把对齐后的桶也打印出来供参考。
+    """
+    cases = (manifest or {}).get("cases") or []
+    if not cases:
         return
-    mine = {format_bucket(k): len(v) for k, v in ds.buckets.items()}
-    if dict(mine) != dict(recorded):
-        LOGGER.warning("本脚本按 (H,W)+pad_multiple=%d 分桶得到 %s，清单记录 %s",
-                       ds.pad_multiple, mine, recorded)
+    by_case = {int(r["case"]): r for r in cases if "case" in r}
+    expected: dict = {}
+    padded: dict = {}
+    mult = max(1, int(ds.pad_multiple))
+    for case in ds.case_ids:
+        rec = by_case.get(int(case))
+        if not rec:
+            continue
+        height, width = (int(x) for x in rec["inplane_hw"])
+        expected[(height, width)] = expected.get((height, width), 0) + 1
+        pkey = (int(math.ceil(height / mult) * mult), int(math.ceil(width / mult) * mult))
+        padded[pkey] = padded.get(pkey, 0) + 1
+    mine = {tuple(k): len({ds.index[i][0] for i in v}) for k, v in ds.buckets.items()}
+    if dict(mine) != {k: v for k, v in expected.items() if v}:
+        problems.append(f"分桶与清单逐例尺寸不一致：本数据集 {dict(sorted(mine.items()))} "
+                        f"vs 清单复算 {dict(sorted(expected.items()))}")
     else:
-        LOGGER.info("分桶与清单一致：%s", mine)
+        LOGGER.info("分桶（精确尺寸）与清单逐例尺寸一致：%s", dict(sorted(mine.items())))
+    LOGGER.info("对齐 pad_multiple=%d 后的桶（仅用于模型内部 padding，**不参与分桶**）：%s",
+                mult, dict(sorted(padded.items())))
 
 
 # --------------------------------------------------------------------------------------

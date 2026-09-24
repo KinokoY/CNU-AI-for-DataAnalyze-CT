@@ -166,8 +166,10 @@ batch 1：image (8, 1, 512, 512) / label (8, 512, 512)；桶 512x512；病例 [.
   **全阴性 batch**（自检会报 `预算内全阴性 batch=N`，fold 0 上约 16 个）——这是「一轮覆盖每一层」
   的必然代价，比反复只训同几层更可接受。想改善就调低 `train.batch_size`，
   或用 `data.bucket_balance` 之外的手段把这类病例并入更大的桶。
-- **每个 batch 内只有一种面内尺寸**：`collate_samples` 会强制校验，混了会直接报错。
-- **batch 的键含义**（`src.dataset.collate_samples` 定义的契约，第 3 轮训练直接照此取值）：
+- **每个 batch 内面内尺寸逐像素一致**：分桶键就是**精确的 `(H, W)`**，`collate_samples` 会强制校验
+  （混了直接报错）。注意 `342×342` 与 `351×351` 虽然对齐 16 后都是 `352`，却是**两个桶**、
+  **不能同 batch**——`pad_multiple=16` 只决定模型内部 pad 到多少。
+- **bucket 的键含义**（`src.dataset.collate_samples` 定义的契约，第 3 轮训练直接照此取值）：
   `image (B,1,H,W) float32` / `label (B,H,W) int64` / `case list[str]` / `z list[int]` /
   `orig_hw list[tuple[int,int]]`。**不要用 DataLoader 默认 collate**：它会把每样本一个 tuple 的
   `orig_hw` 转置成 `[(h1,h2,...),(w1,w2,...)]`，看上去像 `(H,W)` 但解包就会炸。

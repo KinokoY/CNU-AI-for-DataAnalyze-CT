@@ -690,8 +690,9 @@ class CTSliceDataset(Dataset):
 
         self.index: list = []            # [(case:int, z:int), ...]
         self.pos_flags = np.zeros(0, dtype=bool)   # 与 index 一一对应：该切片是否含肿瘤
-        self.buckets: dict = {}          # 桶键 -> [index 位置, ...]
-        self.case_hw: dict = {}          # case -> (H, W)
+        self.buckets: dict = {}          # 桶键(精确 H,W) -> [index 位置, ...]
+        self.case_hw: dict = {}          # case -> (H, W)（精确面内尺寸）
+        self.case_bucket: dict = {}      # case -> 桶键（= case_hw，保留字段方便阅读）
         self.case_n_slices: dict = {}    # case -> nz
         self.case_pos_slices: dict = {}  # case -> 含肿瘤切片数
         self.image_dtype: str | None = None
@@ -758,13 +759,18 @@ class CTSliceDataset(Dataset):
                 problems.append(f"case {case}：影像 dtype={img_dtype} 与其它病例的 {self.image_dtype} "
                                 f"不一致（cache 口径不统一，请重跑 preprocess.py）")
 
-            key = bucket_key(height, width, self.pad_multiple)
+            # 分桶键 = **精确面内尺寸** (H, W)。理由：`torch.stack` 要求同 batch 内形状完全一致，
+            # 所以能同 batch 的充要条件就是「尺寸逐像素相同」。pad_multiple 只决定模型内部要 pad 到
+            # 多少（U-Net 下采样 2^k），不参与分桶——早期用「对齐 16 后的尺寸」当桶键，
+            # 把 342×342 与 351×351 这两个病例放进了同一个 `352x352` 桶，collate 时就炸了。
+            key = (height, width)
             start = len(self.index)
             self.index.extend((int(case), int(z)) for z in range(nz))
             self.pos_flags = np.concatenate(
                 [self.pos_flags, pos_flags.astype(bool)]) if self.pos_flags.size else pos_flags.astype(bool)
             self.buckets.setdefault(key, []).extend(range(start, start + nz))
             self.case_hw[int(case)] = (height, width)
+            self.case_bucket[int(case)] = key
             self.case_n_slices[int(case)] = nz
             self.case_pos_slices[int(case)] = n_pos
 
@@ -805,15 +811,23 @@ class CTSliceDataset(Dataset):
         return float(self.n_positive / max(1, len(self.index)))
 
     def bucket_stats(self) -> dict:
-        """逐桶统计：切片数、含肿瘤切片数、涉及病例数（自检与报告用）。"""
+        """逐桶统计：切片数、含肿瘤切片数、涉及病例数、以及该桶需要 pad 到多少。
+
+        ``padded_hw`` 是模型内部要 pad 到的尺寸（``ceil(H/align)*align``），与分桶无关，
+        只用于展示与显存估算。
+        """
         stats: dict = {}
         for key, positions in sorted(self.buckets.items()):
             flags = self.pos_flags[positions]
+            height, width = int(key[0]), int(key[1])
+            mult = max(1, int(self.pad_multiple))
             stats[key] = {
                 "n_slices": len(positions),
                 "n_pos": int(flags.sum()),
                 "n_neg": int(len(positions) - int(flags.sum())),
                 "n_cases": len({self.index[i][0] for i in positions}),
+                "cases": self.cases_of_bucket(key),
+                "padded_hw": (int(math.ceil(height / mult) * mult), int(math.ceil(width / mult) * mult)),
             }
         return stats
 
@@ -822,13 +836,13 @@ class CTSliceDataset(Dataset):
         return sorted({self.index[i][0] for i in self.buckets[key]})
 
     def bucket_of_case(self, case: int) -> tuple:
-        """某个病例所属的**桶键**（避免调用方误用 ``case_hw`` 里的原始面内尺寸）。
+        """某个病例所属的**桶键**，也就是它的精确面内尺寸 ``(H, W)``。
 
-        ``case_hw[case]`` 是原始面内尺寸（如 ``(436, 436)``），而分桶键是它向上对齐 16 之后的值
-        （``(448, 448)``）——两者不同，混用会在 ``bucket_budget()`` 里报 KeyError（已踩过）。
+        桶键就是 ``case_hw[case]`` 本身；这里提供成方法的目的是让调用方不必关心
+        「桶键到底是对齐后的还是精确的」——早期版本两者不同（桶键是对齐 16 之后的值），
+        调用方混用会在 ``bucket_budget()`` 里报 KeyError，也会让「同 batch 同尺寸」的判断出错。
         """
-        height, width = self.case_hw[int(case)]
-        return bucket_key(height, width, self.pad_multiple)
+        return tuple(self.case_hw[int(case)])
 
     def describe(self) -> str:
         """返回多行描述：split、病例、切片数、阳性比例、逐桶明细。"""

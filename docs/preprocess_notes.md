@@ -50,8 +50,11 @@
   `orig_hw list[tuple[int,int]]`。默认 collate 会把每样本一个 tuple 的 `orig_hw` 转置成两行列表，
   形似 `(H,W)` 但 `for h, w in ...` 解包即炸（远程已炸过一次）；`collate_samples(verify=True)`
   顺带校验形状一致、`label⊂{0,1}`、`image⊂[0,1]`、无 NaN。
-- 分桶键 = `(ceil(H/16)*16, ceil(W/16)*16)`，与 `preprocess.py` 的 `size_buckets` 同口径；
-  **同一 batch 内面内尺寸必然一致**。`data.pad_multiple` 缺省从 `model.pad_to_multiple` 取。
+- 分桶键 = **精确面内尺寸 `(H, W)`**（如 `(342,342)` 与 `(351,351)` 是**两个桶**）。
+  理由：`torch.stack` 要求同 batch 内形状逐元素一致，所以能同 batch 的充要条件就是精确尺寸相同。
+  `pad_multiple=16` **只决定模型内部 pad 到多少**（`ceil(H/16)*16`），不参与分桶——早期版本拿
+  「对齐 16 之后的值」当桶键，把 342 与 351 放进了同一个 `352x352` 桶，collate 时直接炸。
+  `ds.bucket_of_case(case)` 返回桶键；`ds.bucket_stats()[key]["padded_hw"]` 给出该桶要 pad 到的尺寸。
 - **batch 内阳性比例的真实口径**：`n_pos = min(batch_size, max(1, round(batch_size × pos_ratio_target)))`。
   `batch_size=8, pos_ratio_target=0.30` → `n_pos=2` → 实际比例 **0.25**（≈ 原始 12.81% 的 1.95 倍）。
   这是取整的必然结果，不是 bug；想贴近 0.30 就把 batch_size 提到 10/20。
