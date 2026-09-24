@@ -1,7 +1,8 @@
 """数据自检：在写训练代码之前，先把「数据进模型的形态」用真实 cache 验一遍。
 
 整体功能（全部只读 cache，不依赖网络、不依赖模型）：
-    1. 环境与前置：打印 torch / MONAI / nibabel / CUDA 版本；核对 ``data/splits.json``、
+    1. 环境与前置：打印 torch / nibabel / numpy / CUDA 版本（MONAI 只是**顺带**报告——增强已全部
+       自实现，本脚本与 src/dataset.py 都不依赖它）；核对 ``data/splits.json``、
        ``cache/cache_manifest.json`` 是否存在，清单里的预处理指纹是否与当前配置一致；
     2. 数据集形态：``CTSliceDataset``（train / val 两侧）的病例数、切片数、含肿瘤切片比例、
        面内尺寸分桶明细，以及每例的 ``nz`` / 含肿瘤层数 / 桶键；
@@ -37,8 +38,12 @@ try:
         BucketBatchSampler,
         CTSliceDataset,
         ClampImageToUnit,
+        FlipSlice2D,
+        GammaSlice2D,
+        GaussianNoiseSlice2D,
         GridAffine2D,
         RandAffineSlice2D,
+        Rotate90Slice2D,
         bucket_key,
         build_transforms,
         data_config,
@@ -66,8 +71,12 @@ except ModuleNotFoundError:  # pragma: no cover - 兜底：把仓库根塞进 sy
         BucketBatchSampler,
         CTSliceDataset,
         ClampImageToUnit,
+        FlipSlice2D,
+        GammaSlice2D,
+        GaussianNoiseSlice2D,
         GridAffine2D,
         RandAffineSlice2D,
+        Rotate90Slice2D,
         bucket_key,
         build_transforms,
         data_config,
@@ -111,13 +120,13 @@ def check_environment() -> dict:
         "cuda_available": bool(torch.cuda.is_available()),
         "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
     }
-    try:
+    try:   # MONAI 只用于报告版本（增强已自实现，装卸都不影响本链路）
         import monai
 
         env["monai"] = monai.__version__
     except Exception:  # noqa: BLE001
         env["monai"] = None
-    LOGGER.info("环境：python %s / torch %s / monai %s / nibabel %s / numpy %s",
+    LOGGER.info("环境：python %s / torch %s / monai %s（仅报告）/ nibabel %s / numpy %s",
                 env["python"], env["torch"], env["monai"], env["nibabel"], env["numpy"])
     LOGGER.info("CUDA：%s%s", env["cuda_available"],
                 f"（{env['device']}）" if env["device"] else "（本脚本不需要 GPU，仅报告）")
@@ -388,9 +397,9 @@ def check_augment(cfg: dict, ds: CTSliceDataset, n_samples: int, problems: list)
     """对若干样本比较「无增强 / 有增强」的输出：形状、值域、标签取值、被改动的比例。
 
     传入的 ``ds`` 必须是**无增强**的数据集（``augment=False``），这样取到的是原始切片；
-    增强流水线单独用 ``build_transforms`` 构造，随机性由 MONAI 自己控制在合理范围。
+    增强流水线单独用 ``build_transforms`` 构造（自实现，随机源由 seed 固定）。
     """
-    transforms = build_transforms(cfg, train=True)
+    transforms = build_transforms(cfg, train=True, seed=int(((cfg or {}).get("train") or {}).get("seed", 42)))
     if transforms is None:
         problems.append("build_transforms(cfg, train=True) 返回了 None，训练增强没生效")
         return {}
@@ -503,13 +512,18 @@ def check_affine_geometry(problems: list) -> dict:
 
 
 def check_custom_transforms(problems: list) -> dict:
-    """单独验证自定义的三个 transform 步骤（不依赖 MONAI，逻辑可在本地静态推演）。
+    """逐个验证自实现的增强步骤（不依赖 MONAI，逻辑可在本地离线推演）。
 
-    造一张带角标记的 64×64 图案，检查：
-      * ``RandAffineSlice2D``（prob=1，几何固定）后形状不变、image 落在 [0,1]、label 仍是 {0,1}；
-      * ``ClampImageToUnit`` 把 [-0.5, 0.5, 1.5] 夹成 [0, 0.5, 1]；
-      * ``BinarizeLabel`` 把 [0, 1, 2, 3] 变成 [0, 1, 1, 1]。
+    检查项：
+      * `RandAffineSlice2D`（prob=1）后形状不变、image 落在 [0,1]、label 仍是 {0,1}；prob=0 恒等；
+      * `FlipSlice2D` 沿 axis 翻转且 image/label 同步；
+      * `Rotate90Slice2D` 旋转后形状与内容总量不变；
+      * `GammaSlice2D` 单调保序、gamma<1 提亮；
+      * `GaussianNoiseSlice2D` 的 sigma 不超过配置上界、输出夹在 [0,1]；
+      * `ClampImageToUnit` / `BinarizeLabel` 的边界行为。
     """
+    import random as _random
+
     size = 64
     canvas = np.zeros((size, size), dtype=np.float32)
     canvas[20:44, 20:44] = 1.0
@@ -517,11 +531,36 @@ def check_custom_transforms(problems: list) -> dict:
     label = (canvas > 0).astype(np.uint8)
 
     step = RandAffineSlice2D(prob=1.0, aug={"rotation_deg": 15.0, "scale_range": [0.9, 1.1],
-                                            "shift_frac": 0.1})
-    step.randomize(random.Random(0))
+                                            "shift_frac": 0.1}, rng=_random.Random(0))
     out = step({"image": canvas, "label": label})
     aug_image = np.asarray(out["image"], dtype=np.float32)
     aug_label = np.asarray(out["label"])
+
+    # 翻转方向：只在上边一行有内容的图案，翻行后内容应落到最后一行
+    marked = np.zeros((8, 8), dtype=np.float32)
+    marked[0, :] = 1.0
+    flip0 = FlipSlice2D(prob=1.0, axis=0, rng=_random.Random(0))({"image": marked, "label": marked})
+    flip1 = FlipSlice2D(prob=1.0, axis=1, rng=_random.Random(0))({"image": marked, "label": marked})
+    flip0_ok = bool(float(np.asarray(flip0["image"])[-1, :].sum()) == 8.0
+                    and float(np.asarray(flip0["image"])[0, :].sum()) == 0.0)
+    flip1_ok = bool(np.array_equal(np.asarray(flip1["image"]), marked))
+    flip_sync = bool(np.array_equal(np.asarray(flip0["image"]).astype(np.uint8),
+                                    np.asarray(flip0["label"])))
+
+    rot = Rotate90Slice2D(prob=1.0, max_k=1, rng=_random.Random(1))({"image": canvas, "label": label})
+    rot_ok = bool(np.asarray(rot["image"]).shape == canvas.shape
+                  and abs(float(np.asarray(rot["image"]).sum()) - float(canvas.sum())) < 1e-3)
+
+    ramp = np.linspace(0.0, 1.0, 64, dtype=np.float32).reshape(8, 8)
+    gam = GammaSlice2D(prob=1.0, gamma_range=(0.5, 0.5), rng=_random.Random(2))({"image": ramp})
+    gam_img = np.asarray(gam["image"], dtype=np.float32)
+    gamma_monotonic = bool(np.all(np.diff(gam_img.ravel()) >= -1e-7))
+    gamma_brighter = bool(gam_img[0, 4] > ramp[0, 4])
+
+    noise_step = GaussianNoiseSlice2D(prob=1.0, std=0.02, rng=_random.Random(3))
+    noisy = noise_step({"image": canvas})
+    noise_in_range = bool(float(np.asarray(noisy["image"]).min()) >= -1e-6
+                          and float(np.asarray(noisy["image"]).max()) <= 1.0 + 1e-6)
 
     clamp_out = ClampImageToUnit()({"image": np.asarray([-0.5, 0.5, 1.5], dtype=np.float32)})
     bin_out = BinarizeLabel()({"label": np.asarray([0, 1, 2, 3], dtype=np.uint8)})
@@ -534,47 +573,79 @@ def check_custom_transforms(problems: list) -> dict:
         "affine_prob1_image_in_range": bool(aug_image.min() >= -1e-6 and aug_image.max() <= 1.0 + 1e-6),
         "affine_prob1_label_values": sorted(int(v) for v in np.unique(aug_label).tolist()),
         "affine_prob0_identity": bool(np.array_equal(
-            RandAffineSlice2D(prob=0.0)({"image": canvas, "label": label})["image"], canvas)),
+            RandAffineSlice2D(prob=0.0, rng=_random.Random(0))(
+                {"image": canvas, "label": label})["image"], canvas)),
+        "flip_axis0_moves_top_row_to_bottom": flip0_ok,
+        "flip_axis1_identity_on_constant_columns": flip1_ok,
+        "flip_image_label_synced": flip_sync,
+        "rotate90_shape_and_sum_kept": rot_ok,
+        "gamma_monotonic": gamma_monotonic,
+        "gamma_half_brightens": gamma_brighter,
+        "noise_sigma": round(float(noise_step.last_sigma or 0.0), 6),
+        "noise_in_range": noise_in_range,
         "clamp_values": [round(float(v), 4) for v in np.asarray(clamp_out["image"]).tolist()],
         "clamp_ok": bool(np.allclose(np.asarray(clamp_out["image"]), [0.0, 0.5, 1.0], atol=1e-6)),
         "binarize_values": [int(v) for v in np.asarray(bin_out["label"]).tolist()],
         "binarize_ok": bool(np.array_equal(np.asarray(bin_out["label"]), np.asarray([0, 1, 1, 1]))),
     }
 
-    if not info["affine_prob1_shape_preserved"]:
-        problems.append("RandAffineSlice2D(prob=1) 改变了形状")
-    if not info["affine_prob1_changed_image"]:
-        problems.append("RandAffineSlice2D(prob=1) 没有改动 image（prob 语义可能反了）")
-    if not info["affine_prob1_image_in_range"]:
-        problems.append(f"RandAffineSlice2D 后 image 值域 {info['affine_prob1_image_range']} 超出 [0,1]")
+    for flag, msg in [
+        (info["affine_prob1_shape_preserved"], "RandAffineSlice2D(prob=1) 改变了形状"),
+        (info["affine_prob1_changed_image"], "RandAffineSlice2D(prob=1) 没有改动 image（prob 语义可能反了）"),
+        (info["affine_prob1_image_in_range"],
+         f"RandAffineSlice2D 后 image 值域 {info['affine_prob1_image_range']} 超出 [0,1]"),
+        (info["affine_prob0_identity"], "RandAffineSlice2D(prob=0) 不应该改动数据"),
+        (flip0_ok, "FlipSlice2D(axis=0) 没有把第一行翻到最后一行"),
+        (flip1_ok, "FlipSlice2D(axis=1) 在列方向常数的图上应保持不变"),
+        (flip_sync, "FlipSlice2D 没有让 image/label 同步"),
+        (rot_ok, "Rotate90Slice2D 改变了形状或内容总量"),
+        (gamma_monotonic, "GammaSlice2D 不是单调映射（会破坏亮暗关系）"),
+        (gamma_brighter, "GammaSlice2D(gamma=0.5) 应该提亮"),
+        (noise_in_range, "GaussianNoiseSlice2D 输出超出 [0,1]"),
+        (info["clamp_ok"], f"ClampImageToUnit 结果 {info['clamp_values']}，期望 [0, 0.5, 1]"),
+        (info["binarize_ok"], f"BinarizeLabel 结果 {info['binarize_values']}，期望 [0, 1, 1, 1]"),
+    ]:
+        if not flag:
+            problems.append(msg)
     if info["affine_prob1_label_values"] not in ([0], [0, 1], [1]):
         problems.append(f"RandAffineSlice2D 后 label 取值异常：{info['affine_prob1_label_values']}")
-    if not info["affine_prob0_identity"]:
-        problems.append("RandAffineSlice2D(prob=0) 不应该改动数据")
-    if not info["clamp_ok"]:
-        problems.append(f"ClampImageToUnit 结果 {info['clamp_values']}，期望 [0, 0.5, 1]")
-    if not info["binarize_ok"]:
-        problems.append(f"BinarizeLabel 结果 {info['binarize_values']}，期望 [0, 1, 1, 1]")
+    if info["noise_sigma"] > 0.02 + 1e-9:
+        problems.append(f"GaussianNoiseSlice2D 的 sigma {info['noise_sigma']} 超过配置上界 0.02")
 
-    LOGGER.info("自定义 transform 自检：仿射(prob=1) 形状保持 %s、确有改动 %s、值域 %s、label 取值 %s；"
-                "prob=0 恒等 %s；夹取 %s；二值化 %s",
+    LOGGER.info("自实现增强自检：仿射(prob=1) 形状保持 %s / 有改动 %s / 值域 %s / label 取值 %s；"
+                "prob=0 恒等 %s；翻转(axis0 %s, axis1 %s, 同步 %s)；旋转 90° %s；"
+                "gamma 单调 %s / 提亮 %s；噪声 sigma=%.5f 值域 %s；夹取 %s；二值化 %s",
                 info["affine_prob1_shape_preserved"], info["affine_prob1_changed_image"],
                 info["affine_prob1_image_range"], info["affine_prob1_label_values"],
-                info["affine_prob0_identity"], info["clamp_ok"], info["binarize_ok"])
+                info["affine_prob0_identity"], flip0_ok, flip1_ok, flip_sync, rot_ok,
+                gamma_monotonic, gamma_brighter, info["noise_sigma"], noise_in_range,
+                info["clamp_ok"], info["binarize_ok"])
     return info
 
 
 def check_augment_pipeline(cfg: dict, problems: list) -> dict:
-    """确认增强步骤的数量与顺序（防止有人把某一步删掉却没发现）。"""
+    """确认增强步骤的数量、顺序与作用对象（防止有人把某一步删掉却没发现）。"""
     try:
         steps = make_augment_steps(cfg)
-    except Exception as exc:  # noqa: BLE001 - MONAI 导入/构造失败要显式暴露
+    except Exception as exc:  # noqa: BLE001 - 构造失败要显式暴露
         problems.append(f"make_augment_steps 构造失败：{type(exc).__name__}: {exc}")
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     names = [type(step).__name__ for step in steps]
-    expected = ["RandFlip", "RandFlip", "RandRotate90", "RandAffineSlice2D",
-                "RandHistogramShift", "RandGaussianNoise", "ClampImageToUnit", "BinarizeLabel"]
+    expected = ["FlipSlice2D", "FlipSlice2D", "Rotate90Slice2D", "RandAffineSlice2D",
+                "GammaSlice2D", "GaussianNoiseSlice2D", "ClampImageToUnit", "BinarizeLabel"]
     ok = names == expected
+    if not ok:
+        problems.append(f"增强步骤与约定不一致：实际 {names}，期望 {expected}")
+    geo_ok = all(set(getattr(s, "keys", ())) == {"image", "label"} for s in steps[:4])
+    photo_ok = all(set(getattr(s, "keys", ())) == {"image"} for s in steps[4:6])
+    if not geo_ok:
+        problems.append(f"几何增强的 keys 不是 (image,label)：{[getattr(s, 'keys', None) for s in steps[:4]]}")
+    if not photo_ok:
+        problems.append(f"强度增强的 keys 不是 (image,)：{[getattr(s, 'keys', None) for s in steps[4:6]]}")
+    LOGGER.info("增强流水线：%d 步 %s（几何同步 image+label：%s；强度仅 image：%s）",
+                len(names), names, geo_ok, photo_ok)
+    return {"ok": bool(ok and geo_ok and photo_ok), "steps": names, "expected": expected,
+            "geo_synced": geo_ok, "photo_image_only": photo_ok}
     if not ok:
         problems.append(f"增强步骤与约定不一致：实际 {names}，期望 {expected}")
     LOGGER.info("增强流水线：%d 步 %s", len(names), names)

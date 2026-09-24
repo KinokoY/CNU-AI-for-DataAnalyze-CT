@@ -1,4 +1,4 @@
-"""数据集与采样：按病例切片读 cache、按面内尺寸分桶、定向过采样肿瘤切片，并施加 MONAI 2D 增强。
+"""数据集与采样：按病例切片读 cache、按面内尺寸分桶、定向过采样肿瘤切片，并施加自实现的 2D 增强。
 
 整体功能：
     1. ``CTSliceDataset`` —— 一个样本 = 一个病人的一层切片。``__init__`` 只读 **label 体素**
@@ -9,8 +9,10 @@
        个含肿瘤切片、其余抽不含肿瘤切片，使 batch 内肿瘤切片比例恒为 ``pos_ratio_target``。
        不用裸 ``WeightedRandomSampler``：它的比例不可控，且不同面内尺寸无法同 batch。
     3. ``make_train_loader`` / ``make_val_loader`` —— 训练侧分桶+增强+定向采样；验证侧顺序、无增强。
-    4. ``build_transforms`` —— 仅训练用的 MONAI 2D 增强（翻转 / 旋转 90 / 仿射 / 直方图偏移 / 高斯噪声）。
+    4. ``build_transforms`` —— 仅训练用的 2D 增强：翻转 / 旋转 90° / 仿射 / 随机 gamma / 高斯噪声，
+       **全部自己实现，不依赖 MONAI**（原因见 ``make_augment_steps`` 的说明）。
 
+依赖：numpy / torch / nibabel（+ 可选 scipy 的连通域，不在本文件用）。
 前后接口：上游是 ``scripts/preprocess.py`` 产出的 ``cache/image/<case>.nii.gz``（uint16 归一化）
         与 ``cache/label/<case>.nii.gz``（uint8 二值）、``data/splits.json``、``cache/cache_manifest.json``；
         下游是 ``src/selfcheck_data.py``（自检，先跑）与 ``src/train.py``（训练）。
@@ -363,46 +365,172 @@ def _rand_affine(rng: random.Random, aug: dict) -> GridAffine2D:
 
 
 class RandAffineSlice2D:
-    """``Compose`` 里的一步：按概率对 image/label 施加同一个 ``GridAffine2D``。
+    """按概率对 image/label 施加**同一个** ``GridAffine2D``（旋转 + 缩放 + 平移）。
 
-    不继承 ``monai.transforms.RandomizableTransform``：那里面 ``_do_transform`` 的私有语义
-    与各版本的 ``set_random_state`` 实现耦合，而本步只需要「抽一次样 → 同一几何作用于两个 key」，
-    自行实现更稳。``randomize()`` 沿用 MONAI 的调用约定，将来若要改成继承也无需动调用方。
+    同一套几何必须同时作用到 image 与 label，否则掩膜会与影像错位——这是本步自己实现而不是
+    拼两个 transform 的原因：随机参数只抽一次，然后逐 key 复用。
+    image 用双线性、label 用最近邻（后者避免插值出 0/1 之外的值）。
     """
 
-    def __init__(self, prob: float = 0.5, aug: dict | None = None) -> None:
+    def __init__(self, prob: float = 0.5, aug: dict | None = None,
+                 keys: Sequence[str] = ("image", "label"),
+                 rng: random.Random | None = None) -> None:
         self.prob = float(prob)
         self.aug = dict(aug or {})
-        self._do_transform = False
-        self._affine: GridAffine2D | None = None
+        self.keys = tuple(keys)
+        self.rng = rng or random
+        self.last_params: dict | None = None   # 便于自检断言
 
     def randomize(self, rng: random.Random | None = None) -> None:
-        rng = rng or random
-        self._do_transform = rng.random() < self.prob
-        self._affine = _rand_affine(rng, self.aug) if self._do_transform else None
+        """抽一组参数；返回是否施加变换（``super().randomize()`` 的等价物，便于自检单独调用）。"""
+        rng = rng or self.rng
+        if rng.random() >= self.prob:
+            self.affine = None
+            return
+        self.affine = _rand_affine(rng, self.aug)
+        self.last_params = {"rotate_deg": self.affine.rotate_deg,
+                            "scale": self.affine.scale,
+                            "shift_frac": self.affine.shift_frac}
 
     def __call__(self, data: dict) -> dict:
         self.randomize()
-        if not self._do_transform or self._affine is None:
+        if getattr(self, "affine", None) is None:
             return data
         out = dict(data)
-        for key, mode, post in (("image", "bilinear", None),
-                                ("label", "nearest", lambda a: np.rint(a).astype(np.uint8))):
+        for key in self.keys:
             if key not in out:
                 continue
             arr = np.asarray(out[key])
+            mode = "nearest" if key == "label" else "bilinear"
             height, width = int(arr.shape[0]), int(arr.shape[1])
             # 比例 → 像素（×边长）；image 与 label 尺寸相同，因此两者拿到同一套几何
-            frac_x, frac_y = self._affine.shift_frac
-            affine = GridAffine2D(self._affine.rotate_deg, self._affine.scale,
-                                  (frac_x * width, frac_y * height))
-            warped = affine.warp(arr, mode=mode)
-            out[key] = post(warped) if post else warped
+            frac_x, frac_y = self.affine.shift_frac
+            warped = GridAffine2D(self.affine.rotate_deg, self.affine.scale,
+                                  (frac_x * width, frac_y * height)).warp(arr, mode=mode)
+            if key == "label":
+                warped = np.rint(warped).astype(np.uint8)
+            out[key] = warped
+        return out
+
+
+class FlipSlice2D:
+    """按概率沿面内某个轴翻转（``axis=0`` 翻行、``axis=1`` 翻列）；image 与 label 同步。"""
+
+    def __init__(self, prob: float = 0.5, axis: int = 0, keys: Sequence[str] = ("image", "label"),
+                 rng: random.Random | None = None) -> None:
+        if int(axis) not in (0, 1):
+            raise ValueError(f"FlipSlice2D 只支持 axis=0/1（面内两轴），收到 {axis}")
+        self.prob = float(prob)
+        self.axis = int(axis)
+        self.keys = tuple(keys)
+        self.rng = rng or random
+
+    def __call__(self, data: dict) -> dict:
+        if self.rng.random() >= self.prob:
+            return data
+        out = dict(data)
+        for key in self.keys:
+            if key in out:
+                out[key] = np.flip(np.asarray(out[key]), axis=self.axis).copy()
+        return out
+
+
+class Rotate90Slice2D:
+    """按概率把切片整 90° 旋转 ``k∈{0,1,2,3}`` 次（无插值，label 不会被糊）。
+
+    ``k = 0`` 时等价于不变，因此 0.5 的概率下实际约有一半的样本完全没有旋转——这与
+    MONAI ``RandRotate90d`` 的语义一致（它也是 ``randint(0, max_k) + 1`` 那种「抽到就转」）。
+    """
+
+    def __init__(self, prob: float = 0.5, max_k: int = 3, keys: Sequence[str] = ("image", "label"),
+                 rng: random.Random | None = None) -> None:
+        if int(max_k) < 1:
+            raise ValueError(f"max_k 必须 >= 1，收到 {max_k}")
+        self.prob = float(prob)
+        self.max_k = int(max_k)
+        self.keys = tuple(keys)
+        self.rng = rng or random
+
+    def __call__(self, data: dict) -> dict:
+        if self.rng.random() >= self.prob:
+            return data
+        k = self.rng.randint(1, self.max_k) if self.max_k > 1 else 1
+        out = dict(data)
+        for key in self.keys:
+            if key in out:
+                out[key] = np.rot90(np.asarray(out[key]), k).copy()
+        return out
+
+
+class GammaSlice2D:
+    """按概率做随机 gamma 校正：``img ** gamma``，``gamma < 1`` 提亮、``> 1`` 压暗。
+
+    这是「随机直方图/对比度扰动」的最简形式（MONAI 的 ``RandHistogramShift`` 用控制点做分段线性
+    映射，本质也是单调的强度重排）。要求输入已经是 ``[0,1]``，否则幂运算会发散——预处理后的
+    cache 正好是 ``[0,1]``，所以这里直接乘幂即可，且**保序**（不会把亮暗关系翻转）。
+    只作用于 image。
+    """
+
+    def __init__(self, prob: float = 0.2, gamma_range: Sequence[float] = (0.75, 1.33),
+                 keys: Sequence[str] = ("image",), rng: random.Random | None = None) -> None:
+        lo, hi = (float(x) for x in gamma_range)
+        if lo <= 0 or hi <= 0 or lo > hi:
+            raise ValueError(f"gamma_range 必须是正数区间且 lo<=hi，收到 {gamma_range}")
+        self.prob = float(prob)
+        self.gamma_range = (lo, hi)
+        self.keys = tuple(keys)
+        self.rng = rng or random
+        self.last_gamma: float | None = None   # 便于自检断言
+
+    def __call__(self, data: dict) -> dict:
+        if self.rng.random() >= self.prob:
+            return data
+        gamma = self.rng.uniform(*self.gamma_range)
+        self.last_gamma = gamma
+        out = dict(data)
+        for key in self.keys:
+            if key in out:
+                img = np.clip(np.asarray(out[key], dtype=np.float32), 0.0, 1.0)
+                out[key] = np.power(img, gamma, dtype=np.float32)
+        return out
+
+
+class GaussianNoiseSlice2D:
+    """按概率加零均值高斯噪声。
+
+    ``std`` 是噪声强度的**上界**：每次从 ``U(0, std)`` 抽一个 ``sigma``（与 MONAI 的
+    ``sample_std=True`` 默认行为一致），这样噪声强度本身也随机。为了可复现，用的是
+    ``random.Random`` 抽 sigma、``np.random.default_rng(seed)`` 抽噪声（种子由同一个 rng 派生）。
+    只作用于 image，最后夹回 ``[0,1]``。
+    """
+
+    def __init__(self, prob: float = 0.2, std: float = 0.01, keys: Sequence[str] = ("image",),
+                 rng: random.Random | None = None) -> None:
+        if float(std) < 0:
+            raise ValueError(f"noise std 必须 >= 0，收到 {std}")
+        self.prob = float(prob)
+        self.std = float(std)
+        self.keys = tuple(keys)
+        self.rng = rng or random
+        self.last_sigma: float | None = None   # 便于自检断言
+
+    def __call__(self, data: dict) -> dict:
+        if self.rng.random() >= self.prob:
+            return data
+        sigma = self.rng.uniform(0.0, self.std)
+        self.last_sigma = sigma
+        noise_rng = np.random.default_rng(self.rng.randrange(2 ** 31))
+        out = dict(data)
+        for key in self.keys:
+            if key in out:
+                img = np.asarray(out[key], dtype=np.float32)
+                noise = noise_rng.normal(0.0, sigma, size=img.shape).astype(np.float32)
+                out[key] = np.clip(img + noise, 0.0, 1.0)
         return out
 
 
 class ClampImageToUnit:
-    """把 image 夹回 [0,1]：直方图偏移 / 高斯噪声 / 双线性插值都可能把值推出值域。"""
+    """把 image 夹回 [0,1]：gamma / 高斯噪声 / 双线性插值都可能把值推出值域。"""
 
     def __call__(self, data: dict) -> dict:
         if "image" not in data:
@@ -423,116 +551,87 @@ class BinarizeLabel:
         return out
 
 
-def _transform_kwargs(cls, **wanted):
-    """按目标 MONAI 版本的真实签名过滤构造函数参数；缺必需参数或参数名完全对不上就报错。
-
-    为什么需要这层：MONAI 的 2D transform 参数名跨版本改过（``RandFlip`` 从 ``axis`` 改成
-    ``spatial_axis``，远程 monai 1.6.0 用后者），写错一个关键字就在远程直接 ``TypeError``——
-    而这属于「本该在本地就发现」的错误。这里用 ``inspect.signature`` 做一次守卫：
-
-      * 参数名对得上 → 原样传入；
-      * 目标版本没有这个名字但有**同义名**（``axis`` ↔ ``spatial_axis``/``spatial_axes``）→ 自动改写；
-      * 目标版本完全没有这个参数 → 抛 ``RuntimeError``（**不静默丢弃**：丢一个增强是语义变化，
-        比直接报错更难发现）；
-      * 目标版本要求的必需参数没给 → 同样抛 ``RuntimeError``，并附上真实签名。
-    """
-    import inspect
-
-    try:
-        params = {name: p for name, p in inspect.signature(cls).parameters.items() if name != "self"}
-    except (TypeError, ValueError):  # pragma: no cover - 极少数对象取不到签名
-        return dict(wanted)
-
-    # 同义参数名映射：调用方按其中一个名字写，若目标版本没有它就用同义名
-    synonyms = {
-        "axis": ("spatial_axis", "spatial_axes"),
-        "spatial_axis": ("spatial_axes", "axis"),
-        "spatial_axes": ("spatial_axis", "axis"),
-    }
-    kwargs: dict = {}
-    unknown: list = []
-    for name, value in wanted.items():
-        if value is None:
-            continue
-        if name in params:
-            kwargs[name] = value
-            continue
-        alias = next((a for a in synonyms.get(name, ()) if a in params), None)
-        if alias is not None:
-            LOGGER.warning("%s 不支持参数 %r，已按 MONAI 版本差异改写为 %r",
-                           cls.__name__, name, alias)
-            kwargs[alias] = value
-        else:
-            unknown.append(name)
-    if unknown:
-        raise RuntimeError(f"{cls.__name__} 不认识参数 {unknown}；本版本签名：{list(params)}。"
-                           f"请核对 MONAI 版本（远程为 1.6.0）后修正 make_augment_steps。")
-
-    required = [n for n, p in params.items()
-                if p.default is inspect.Parameter.empty
-                and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)]
-    missing = [n for n in required if n not in kwargs]
-    if missing:
-        raise RuntimeError(f"{cls.__name__} 缺少必需参数 {missing}；本版本签名：{list(params)}")
-    return kwargs
-
-
-def make_augment_steps(cfg: dict) -> list:
+def make_augment_steps(cfg: dict, seed: int | None = None) -> list:
     """返回训练增强的步骤列表（**唯一事实来源**：``build_transforms`` 与自检脚本共用）。
 
-    顺序即施加顺序（image/label 同步；逐层独立施加）：
-      1. ``RandFlip`` 两个轴各 0.5（``spatial_axis=0`` 翻行、``=1`` 翻列；远程 monai 1.6.0 的参数名
-         就是 ``spatial_axis``，``_transform_kwargs`` 会再按实际签名兜底适配旧版本的 ``axis``）；
-      2. ``RandRotate90``（``spatial_axes=(0,1)``、``max_k=1``，整 90 度旋转，label 无插值伪影）；
-      3. 自定义 ``RandAffineSlice2D``：旋转 ±15°、缩放 0.9–1.1、平移 ±10%
-         （image 双线性 / label 最近邻）；
-      4. ``RandHistogramShift``（仅 ``num_control_points`` 与 ``prob``；**MONAI 1.6 没有 ``shift_range``**）
-         + ``RandGaussianNoise``（只动 image；输入是 (H,W) 不带通道维）；
+    **全部自实现，不依赖 MONAI**。原因：MONAI 的增强接口在 array 版 / 字典版之间有两套签名
+    （``RandFlip`` 只吃数组、``RandFlipd`` 才吃 dict 且 ``keys`` 是必需参数），参数名还跨版本变过
+    （``axis`` → ``spatial_axis``、``shift_range`` 在 1.6 已不存在），我们在这一层连炸过两次；
+    而这四个增强本身只是十几行 numpy。自实现之后这一整类「接口/版本不匹配」故障消失，
+    且随机性由单一 ``random.Random(seed)`` 驱动，可离线逐项验证。
+
+    顺序即施加顺序：
+      1. ``FlipSlice2D`` 两个轴各一次（翻行、翻列）；
+      2. ``Rotate90Slice2D(max_k=1)``：整 90° 旋转，label 无插值伪影；
+      3. ``RandAffineSlice2D``：旋转 ±15°、缩放 0.9–1.1、平移 ±10%（image 双线性 / label 最近邻）；
+      4. ``GammaSlice2D``（随机 gamma 校正，等价于单调的强度重排）+ ``GaussianNoiseSlice2D``；
       5. 末尾把 image 夹回 [0,1]、把 label 重新二值化成 {0,1}。
 
-    不做弹性形变：MONAI 没有 2D 版 ``Rand2DElastic``（只有 ``Rand3DElastic``），逐层施加会破坏
-    z 方向一致性（同一病人在相邻层被施加不同形变，病灶边界会抖动）。
-    """
-    from monai.transforms import (
-        RandFlip,
-        RandGaussianNoise,
-        RandHistogramShift,
-        RandRotate90,
-    )
+    只做面内变换、不做弹性形变：逐层独立施加形变会破坏 z 方向一致性（同一病人的相邻层被施以
+    不同形变，病灶边界会抖），而逐层形变本身对 2D 基线没有收益。
 
+    ``seed`` 为 None 时用 ``train.seed``；同一个 seed 得到同一串增强参数（但每个样本的随机数
+    仍按抽样顺序推进，因此各样本的增强互不相同）。
+    """
     aug = dict(data_config(cfg).get("augment") or {})
+    if seed is None:
+        seed = int(((cfg or {}).get("train") or {}).get("seed", 42))
+    rng = random.Random(int(seed) + 104729)   # 与采样器的种子错开一个素数
+    keys = ("image", "label")                 # 几何增强同步作用于两者
+    img_only = ("image",)
+
     return [
-        RandFlip(**_transform_kwargs(RandFlip, prob=float(aug.get("flip_prob", 0.5)),
-                                     spatial_axis=0)),
-        RandFlip(**_transform_kwargs(RandFlip, prob=float(aug.get("flip_prob", 0.5)),
-                                     spatial_axis=1)),
-        RandRotate90(**_transform_kwargs(RandRotate90, prob=float(aug.get("rotate90_prob", 0.5)),
-                                         max_k=1, spatial_axes=(0, 1))),
-        RandAffineSlice2D(prob=float(aug.get("affine_prob", 0.5)), aug=aug),
-        RandHistogramShift(**_transform_kwargs(
-            RandHistogramShift,
-            prob=float(aug.get("histogram_shift_prob", 0.2)),
-            num_control_points=int(aug.get("histogram_num_bins", 10)))),
-        RandGaussianNoise(**_transform_kwargs(RandGaussianNoise,
-                                              prob=float(aug.get("noise_prob", 0.2)),
-                                              mean=0.0, std=float(aug.get("noise_std", 0.01)))),
+        FlipSlice2D(prob=float(aug.get("flip_prob", 0.5)), axis=0, keys=keys, rng=rng),
+        FlipSlice2D(prob=float(aug.get("flip_prob", 0.5)), axis=1, keys=keys, rng=rng),
+        Rotate90Slice2D(prob=float(aug.get("rotate90_prob", 0.5)), max_k=1, keys=keys, rng=rng),
+        RandAffineSlice2D(prob=float(aug.get("affine_prob", 0.5)), aug=aug, keys=keys, rng=rng),
+        GammaSlice2D(prob=float(aug.get("gamma_prob", 0.2)),
+                     gamma_range=aug.get("gamma_range", [0.75, 1.33]), keys=img_only, rng=rng),
+        GaussianNoiseSlice2D(prob=float(aug.get("noise_prob", 0.2)),
+                             std=float(aug.get("noise_std", 0.01)), keys=img_only, rng=rng),
         ClampImageToUnit(),
         BinarizeLabel(),
     ]
 
 
-def build_transforms(cfg: dict, train: bool):
-    """构建 MONAI 2D 增强流水线；``train=False`` 时返回 ``None``（验证侧不做任何几何变换）。
+def build_transforms(cfg: dict, train: bool, seed: int | None = None):
+    """构建训练增强流水线；``train=False`` 时返回 ``None``（验证侧不做任何几何变换）。
 
-    步骤见 ``make_augment_steps``。返回 ``monai.transforms.Compose``：收到 dict 输入时，
-    对没有对应 key 的 transform 会自动跳过，因此 image-only 的增强不必单独拆流水线。
+    返回一个可调用对象：输入 ``{"image": (H,W) float32, "label": (H,W) uint8}``，返回同结构的 dict。
+    步骤见 ``make_augment_steps``。
     """
     if not train:
         return None
+    return ComposeSteps(make_augment_steps(cfg, seed=seed))
 
-    from monai.transforms import Compose
 
-    return Compose(make_augment_steps(cfg))
+class ComposeSteps:
+    """把若干「dict → dict」的增强步骤串起来（等价于 MONAI 的 ``Compose``，但只做这一件事）。"""
+
+    def __init__(self, steps: Sequence) -> None:
+        self.transforms = list(steps)
+
+    def __call__(self, data: dict) -> dict:
+        for step in self.transforms:
+            data = step(data)
+        return data
+
+    def __len__(self) -> int:
+        return len(self.transforms)
+
+    def __repr__(self) -> str:
+        return f"ComposeSteps({[type(s).__name__ for s in self.transforms]})"
+
+
+def build_transforms(cfg: dict, train: bool, seed: int | None = None):
+    """构建训练增强流水线；``train=False`` 时返回 ``None``（验证侧不做任何几何变换）。
+
+    返回一个可调用对象：输入 ``{"image": (H,W) float32, "label": (H,W) uint8}``，返回同结构的 dict。
+    步骤见 ``make_augment_steps``。
+    """
+    if not train:
+        return None
+    return ComposeSteps(make_augment_steps(cfg, seed=seed))
 
 
 # --------------------------------------------------------------------------------------
@@ -573,10 +672,14 @@ class CTSliceDataset(Dataset):
         self.index_cache_size = int(self.data_cfg.get("index_cache_size", 8))
         self.image_dir = self.cache_dir / "image"
         self.label_dir = self.cache_dir / "label"
-        self.transforms = build_transforms(self.cfg, train=self.augment)
 
         splits = load_json((self.cfg.get("paths") or {}).get("splits", "data/splits.json"), default={}) or {}
         self.case_ids: list = parse_cases(cases, splits, self.split, fold=fold)
+
+        # 增强的随机源按 (seed, fold, split) 派生：同一折每次构建得到同一串增强参数
+        aug_seed = stable_seed(int(((self.cfg.get("train") or {}).get("seed", 42))),
+                               -1 if self.fold is None else int(self.fold), self.split)
+        self.transforms = build_transforms(self.cfg, train=self.augment, seed=aug_seed)
 
         # 清单只用于交叉核对（可选；manifest 不入库，重建靠 scripts/fetch_manifest.py）
         manifest_path = (self.cfg.get("paths") or {}).get("cache_manifest", "cache/cache_manifest.json")

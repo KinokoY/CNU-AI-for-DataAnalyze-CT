@@ -177,17 +177,20 @@ bucket_seed 一致：True    # 采样器可复现
 
 只想快速过一遍、不跑完整轮采样：`python -m src.selfcheck_data --batches 1 --skip-sampler`。
 
-**MONAI 1.6.0 参数名备忘**（这些是踩过的坑，改动增强配置前先看一眼）：
+**增强实现方式（重要变更）**：第 2 轮的增强**已改成完全自实现、不依赖 MONAI**
+（`src/dataset.py` 里的 `FlipSlice2D` / `Rotate90Slice2D` / `RandAffineSlice2D` / `GammaSlice2D` /
+`GaussianNoiseSlice2D`）。原因是 MONAI 的增强有两套签名（array 版吃数组、字典版 `*d` 才吃 dict
+且 `keys` 是必需参数），参数名还跨版本改过（`axis`→`spatial_axis`、`shift_range` 在 1.6 已不存在），
+我们在这一层连炸两次。现在这四个增强只有几十行 numpy，几何口径、随机性、值域都能在本地离线断言，
+`Compose` 也由 `ComposeSteps` 替代。**MONAI 仍可用于其它用途，但这条链路不再需要它。**
 
-| transform | 1.6.0 实际参数 |
+| 参数（configs/default.yaml 的 data.augment） | 含义 |
 | --- | --- |
-| `RandFlip` | `prob`、**`spatial_axis`**（不是 `axis`）、`lazy` |
-| `RandRotate90` | `prob`、`max_k`、`spatial_axes`（本版固定 `(0,1)`、`max_k=1`） |
-| `RandHistogramShift` | `num_control_points`（必须 ≥3）、`prob`；**没有 `shift_range`** |
-| `RandGaussianNoise` | `prob`、`mean`、`std`、`dtype`、`sample_std`（默认 True → 实际 std 在 `[0, std)` 均匀采样） |
-
-代码里 `src/dataset._transform_kwargs()` 会按真实签名再兜底校验一次：参数名对不上会**直接报错**
-而不是静默丢弃增强，所以万一将来换 MONAI 版本，请在自检里先跑一遍再训练。
+| `flip_prob` | 翻行 / 翻列各一次，各自独立（image+label 同步） |
+| `rotate90_prob` | 整 90° 旋转（k=1），label 无插值伪影 |
+| `affine_prob` / `rotation_deg` / `scale_range` / `shift_frac` | 仿射：旋转 ±15°、缩放 0.9–1.1、平移 ±10%（image 双线性 / label 最近邻） |
+| `gamma_prob` / `gamma_range` | 随机 gamma 校正 `img**gamma`（单调保序的强度重排；<1 提亮、>1 压暗） |
+| `noise_prob` / `noise_std` | 高斯噪声；sigma 每次从 `U(0, noise_std)` 抽，故 `noise_std` 是强度上界 |
 
 ---
 

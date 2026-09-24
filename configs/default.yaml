@@ -47,17 +47,19 @@ data:
   min_pos_per_batch: 1            # 每个 batch 至少 1 个肿瘤切片（小桶兜底；正常桶由 pos_ratio_target 决定）
   pos_ratio_tolerance: 0.10       # 自检脚本判定「实测阳性比例偏离目标」的阈值
   augment:                        # 仅训练；验证侧不做任何几何变换
-    flip_prob: 0.5                # RandFlip(spatial_axis=0) 与 RandFlip(spatial_axis=1) 各自独立
-                                  #   注意 MONAI 1.x 的参数名是 spatial_axis，不是 axis
-    rotate90_prob: 0.5            # RandRotate90(max_k=1, spatial_axes=(0,1))
-    affine_prob: 0.5              # 自定义 2D 仿射（不用 RandAffine，避免各版本 API 差异）
+                                  # 全部自实现（src/dataset.py），不依赖 MONAI：
+                                  #   FlipSlice2D / Rotate90Slice2D / RandAffineSlice2D /
+                                  #   GammaSlice2D / GaussianNoiseSlice2D
+    flip_prob: 0.5                # 翻行、翻列各一次，各自独立（image+label 同步）
+    rotate90_prob: 0.5            # 整 90° 旋转（k=1），label 无插值伪影（image+label 同步）
+    affine_prob: 0.5              # 仿射：旋转 + 缩放 + 平移（image 双线性 / label 最近邻）
     rotation_deg: 15.0            # 旋转 ±15°
     scale_range: [0.9, 1.1]       # 缩放 0.9–1.1（采样坐标口径，>1 = 内容放大）
     shift_frac: 0.1               # 平移 ±10% 面内边长（内部换算成像素位移）
-    histogram_shift_prob: 0.2     # RandHistogramShift；MONAI 1.6 只有 prob 与 num_control_points
-    histogram_num_bins: 10        #   没有 shift_range 参数，num_control_points 必须 >= 3
-    noise_prob: 0.2               # RandGaussianNoise(mean=0, std=0.01)
-    noise_std: 0.01               #   std 是「上界」，MONAI 会从 [0, std) 均匀采样（sample_std 默认 True）
+    gamma_prob: 0.2               # 随机 gamma 校正 img**gamma（单调的强度重排，只动 image）
+    gamma_range: [0.75, 1.33]     #   <1 提亮、>1 压暗；要求输入已在 [0,1]（cache 正好是）
+    noise_prob: 0.2               # 高斯噪声，只动 image
+    noise_std: 0.01               #   sigma 每次从 U(0, noise_std) 抽，故 0.01 是强度上界
 
 # ---------- 训练 ----------
 train:
