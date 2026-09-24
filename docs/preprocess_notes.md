@@ -54,10 +54,14 @@
   采样顺序只由 `(train.seed, epoch, 病例集合)` 决定（用 sha256 派生，不用内置 `hash()`），
   与 `num_workers` 无关，可复现。
 - `num_workers` 等 DataLoader 参数从 `train` 节挪到了 `data` 节（`configs/default.yaml` 已补 `data` 节）。
-- 增强 8 步（image/label 同步，仅训练）：`RandFlip(axis=0)`、`RandFlip(axis=1)`、
-  `RandRotate90(spatial_axes=(0,1))`、自定义 `RandAffineSlice2D`（旋转 ±15°/缩放 0.9–1.1/平移 ±10%，
+- 增强 8 步（image/label 同步，仅训练）：`RandFlip(spatial_axis=0)`、`RandFlip(spatial_axis=1)`、
+  `RandRotate90(spatial_axes=(0,1), max_k=1)`、自定义 `RandAffineSlice2D`（旋转 ±15°/缩放 0.9–1.1/平移 ±10%，
   image 双线性、label 最近邻）、`RandHistogramShift`、`RandGaussianNoise`、夹回 [0,1]、label 二值化。
   **刻意不用 `monai.transforms.RandAffine`**：它的 `spatial_size`/`padding_mode`/`mode` 契约跨版本有差异，
   而自实现（`GridAffine2D` = `grid_sample`）行为确定，且本地可以离线验证几何。
   不做弹性形变：MONAI 只有 `Rand3DElastic`，逐层施加会破坏 z 一致性。
+- **MONAI 参数名坑（远程 1.6.0 实测）**：`RandFlip` 的参数是 `spatial_axis`（写 `axis` 会直接
+  `TypeError`）；`RandHistogramShift` **没有 `shift_range`**（只有 `num_control_points`/`prob`，
+  且 `num_control_points` 必须 ≥3）。`src/dataset._transform_kwargs()` 现在会按真实签名校验并
+  在参数名对不上时直接报错，避免「改一个炸一个」。
 - 自检脚本：`python -m src.selfcheck_data`（只读 cache，不需要 GPU）。

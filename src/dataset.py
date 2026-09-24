@@ -423,16 +423,71 @@ class BinarizeLabel:
         return out
 
 
+def _transform_kwargs(cls, **wanted):
+    """按目标 MONAI 版本的真实签名过滤构造函数参数；缺必需参数或参数名完全对不上就报错。
+
+    为什么需要这层：MONAI 的 2D transform 参数名跨版本改过（``RandFlip`` 从 ``axis`` 改成
+    ``spatial_axis``，远程 monai 1.6.0 用后者），写错一个关键字就在远程直接 ``TypeError``——
+    而这属于「本该在本地就发现」的错误。这里用 ``inspect.signature`` 做一次守卫：
+
+      * 参数名对得上 → 原样传入；
+      * 目标版本没有这个名字但有**同义名**（``axis`` ↔ ``spatial_axis``/``spatial_axes``）→ 自动改写；
+      * 目标版本完全没有这个参数 → 抛 ``RuntimeError``（**不静默丢弃**：丢一个增强是语义变化，
+        比直接报错更难发现）；
+      * 目标版本要求的必需参数没给 → 同样抛 ``RuntimeError``，并附上真实签名。
+    """
+    import inspect
+
+    try:
+        params = {name: p for name, p in inspect.signature(cls).parameters.items() if name != "self"}
+    except (TypeError, ValueError):  # pragma: no cover - 极少数对象取不到签名
+        return dict(wanted)
+
+    # 同义参数名映射：调用方按其中一个名字写，若目标版本没有它就用同义名
+    synonyms = {
+        "axis": ("spatial_axis", "spatial_axes"),
+        "spatial_axis": ("spatial_axes", "axis"),
+        "spatial_axes": ("spatial_axis", "axis"),
+    }
+    kwargs: dict = {}
+    unknown: list = []
+    for name, value in wanted.items():
+        if value is None:
+            continue
+        if name in params:
+            kwargs[name] = value
+            continue
+        alias = next((a for a in synonyms.get(name, ()) if a in params), None)
+        if alias is not None:
+            LOGGER.warning("%s 不支持参数 %r，已按 MONAI 版本差异改写为 %r",
+                           cls.__name__, name, alias)
+            kwargs[alias] = value
+        else:
+            unknown.append(name)
+    if unknown:
+        raise RuntimeError(f"{cls.__name__} 不认识参数 {unknown}；本版本签名：{list(params)}。"
+                           f"请核对 MONAI 版本（远程为 1.6.0）后修正 make_augment_steps。")
+
+    required = [n for n, p in params.items()
+                if p.default is inspect.Parameter.empty
+                and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)]
+    missing = [n for n in required if n not in kwargs]
+    if missing:
+        raise RuntimeError(f"{cls.__name__} 缺少必需参数 {missing}；本版本签名：{list(params)}")
+    return kwargs
+
+
 def make_augment_steps(cfg: dict) -> list:
     """返回训练增强的步骤列表（**唯一事实来源**：``build_transforms`` 与自检脚本共用）。
 
     顺序即施加顺序（image/label 同步；逐层独立施加）：
-      1. ``RandFlip`` 两个轴各 0.5（``axis=0/1`` 在 2D 上就是行/列翻转）；
+      1. ``RandFlip`` 两个轴各 0.5（``spatial_axis=0`` 翻行、``=1`` 翻列；远程 monai 1.6.0 的参数名
+         就是 ``spatial_axis``，``_transform_kwargs`` 会再按实际签名兜底适配旧版本的 ``axis``）；
       2. ``RandRotate90``（``spatial_axes=(0,1)``、``max_k=1``，整 90 度旋转，label 无插值伪影）；
       3. 自定义 ``RandAffineSlice2D``：旋转 ±15°、缩放 0.9–1.1、平移 ±10%
          （image 双线性 / label 最近邻）；
-      4. ``RandHistogramShift`` + ``RandGaussianNoise``（只动 image；输入是 (H,W) 不带通道维，
-         因此不需要通道推断参数）；
+      4. ``RandHistogramShift``（仅 ``num_control_points`` 与 ``prob``；**MONAI 1.6 没有 ``shift_range``**）
+         + ``RandGaussianNoise``（只动 image；输入是 (H,W) 不带通道维）；
       5. 末尾把 image 夹回 [0,1]、把 label 重新二值化成 {0,1}。
 
     不做弹性形变：MONAI 没有 2D 版 ``Rand2DElastic``（只有 ``Rand3DElastic``），逐层施加会破坏
@@ -447,20 +502,20 @@ def make_augment_steps(cfg: dict) -> list:
 
     aug = dict(data_config(cfg).get("augment") or {})
     return [
-        RandFlip(prob=float(aug.get("flip_prob", 0.5)), axis=0),
-        RandFlip(prob=float(aug.get("flip_prob", 0.5)), axis=1),
-        RandRotate90(prob=float(aug.get("rotate90_prob", 0.5)), max_k=1, spatial_axes=(0, 1)),
+        RandFlip(**_transform_kwargs(RandFlip, prob=float(aug.get("flip_prob", 0.5)),
+                                     spatial_axis=0)),
+        RandFlip(**_transform_kwargs(RandFlip, prob=float(aug.get("flip_prob", 0.5)),
+                                     spatial_axis=1)),
+        RandRotate90(**_transform_kwargs(RandRotate90, prob=float(aug.get("rotate90_prob", 0.5)),
+                                         max_k=1, spatial_axes=(0, 1))),
         RandAffineSlice2D(prob=float(aug.get("affine_prob", 0.5)), aug=aug),
-        RandHistogramShift(
+        RandHistogramShift(**_transform_kwargs(
+            RandHistogramShift,
             prob=float(aug.get("histogram_shift_prob", 0.2)),
-            num_control_points=int(aug.get("histogram_num_bins", 10)),
-            shift_range=float(aug.get("histogram_shift_range", 0.1)),
-        ),
-        RandGaussianNoise(
-            prob=float(aug.get("noise_prob", 0.2)),
-            mean=0.0,
-            std=float(aug.get("noise_std", 0.01)),
-        ),
+            num_control_points=int(aug.get("histogram_num_bins", 10)))),
+        RandGaussianNoise(**_transform_kwargs(RandGaussianNoise,
+                                              prob=float(aug.get("noise_prob", 0.2)),
+                                              mean=0.0, std=float(aug.get("noise_std", 0.01)))),
         ClampImageToUnit(),
         BinarizeLabel(),
     ]

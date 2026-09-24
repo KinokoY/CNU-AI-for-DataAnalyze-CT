@@ -172,9 +172,22 @@ bucket_seed 一致：True    # 采样器可复现
 | `cfg_hash=... 与当前配置算出的 ... 不一致` | 缓存来自别的预处理参数 → 重跑 `preprocess.py` |
 | `含肿瘤切片数 ... 与清单 ... 不符` | 清单过期 → `python scripts/fetch_manifest.py` 刷新 |
 | `桶 ...：本轮 N 个 batch 只分到 M 个阳性层/批` | 该桶病灶层太少（正常数据不会出现） |
+| `TypeError: RandXxx.__init__() got an unexpected keyword argument` | 我写错了 MONAI 参数名（远程 monai 1.6.0）→ **把整段 traceback 贴回** |
 | 退出码 1 + `自检发现 N 个问题` | **把带 `-` 的行整段贴回**，先不要进入第 3 轮 |
 
 只想快速过一遍、不跑完整轮采样：`python -m src.selfcheck_data --batches 1 --skip-sampler`。
+
+**MONAI 1.6.0 参数名备忘**（这些是踩过的坑，改动增强配置前先看一眼）：
+
+| transform | 1.6.0 实际参数 |
+| --- | --- |
+| `RandFlip` | `prob`、**`spatial_axis`**（不是 `axis`）、`lazy` |
+| `RandRotate90` | `prob`、`max_k`、`spatial_axes`（本版固定 `(0,1)`、`max_k=1`） |
+| `RandHistogramShift` | `num_control_points`（必须 ≥3）、`prob`；**没有 `shift_range`** |
+| `RandGaussianNoise` | `prob`、`mean`、`std`、`dtype`、`sample_std`（默认 True → 实际 std 在 `[0, std)` 均匀采样） |
+
+代码里 `src/dataset._transform_kwargs()` 会按真实签名再兜底校验一次：参数名对不上会**直接报错**
+而不是静默丢弃增强，所以万一将来换 MONAI 版本，请在自检里先跑一遍再训练。
 
 ---
 
