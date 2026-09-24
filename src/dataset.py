@@ -890,6 +890,60 @@ class CTSliceDataset(Dataset):
 
 
 # --------------------------------------------------------------------------------------
+# 组 batch（collate）
+# --------------------------------------------------------------------------------------
+
+def collate_samples(samples: Sequence[dict], verify: bool = True) -> dict:
+    """把若干样本拼成一个 batch，并定义**明确的 batch 契约**（训练与自检都按它取值）：
+
+        image     : Tensor (B, 1, H, W) float32
+        label     : Tensor (B, H, W)    int64 ∈ {0,1}
+        case      : list[str]，长度 B（每个样本来自哪个病人）
+        z         : list[int]，长度 B（每个样本是第几层）
+        orig_hw   : list[tuple[int,int]]，长度 B（每个样本原始面内尺寸）
+
+    为什么不直接用 DataLoader 的默认 collate：PyTorch 默认会把每样本一个 tuple 的 ``orig_hw``
+    做**转置**，得到 ``[(h1,h2,...), (w1,w2,...)]``——看上去像 ``(H,W)`` 但其实是两行列表，
+    解包就会炸（远程就是这样炸的：``too many values to unpack``）。显式定义契约后，
+    ``orig_hw`` 是长度 B 的 tuple 列表，含义不再依赖默认行为。
+
+    ``verify=True``（默认）时顺带校验 batch 的不变量：所有样本形状一致、
+    ``label`` 取值 ⊂ {0,1}、``image`` 值域 ⊂ [0,1]、且 ``orig_hw`` 与张量形状自洽。
+    这些校验的开销可以忽略（只是比较几个整数），但能在训练早期抓住「buffered/memmap 复用、
+    增强把尺寸改坏、collate 拼错」这类最难查的问题。
+    """
+    if not samples:
+        raise ValueError("collate_samples 收到空 batch")
+    shapes = {tuple(int(s) for s in sample["image"].shape) for sample in samples}
+    if len(shapes) != 1:
+        raise RuntimeError(f"batch 内样本形状不一致 {sorted(shapes)}——分桶采样器本应保证同 batch 同尺寸，"
+                           f"出现这个说明采样器或数据集索引出了问题（不要靠 collate 兜底）")
+    image = torch.stack([s["image"] for s in samples])
+    label = torch.stack([s["label"] for s in samples])
+    batch = {
+        "image": image,
+        "label": label,
+        "case": [str(s["case"]) for s in samples],
+        "z": [int(s["z"]) for s in samples],
+        "orig_hw": [(int(s["orig_hw"][0]), int(s["orig_hw"][1])) for s in samples],
+    }
+    if verify:
+        height, width = int(image.shape[2]), int(image.shape[3])
+        if tuple(label.shape[1:]) != (height, width):
+            raise RuntimeError(f"batch 内 image {tuple(image.shape)} 与 label {tuple(label.shape)} 尺寸不符")
+        if any(hw != (height, width) for hw in batch["orig_hw"]):
+            raise RuntimeError(f"batch 内样本的 orig_hw 与张量形状 {(height, width)} 不一致："
+                               f"{batch['orig_hw']}（说明同 batch 混了不同面内尺寸）")
+        if int(label.numel()) and (int(label.min()) < 0 or int(label.max()) > 1):
+            raise RuntimeError(f"label 取值超出 {{0,1}}：min={int(label.min())} max={int(label.max())}")
+        if not torch.isfinite(image).all():
+            raise RuntimeError("image 里出现非有限值（NaN/Inf）")
+        if float(image.min()) < -1e-6 or float(image.max()) > 1.0 + 1e-6:
+            raise RuntimeError(f"image 值域 [{float(image.min()):.6f}, {float(image.max()):.6f}] 超出 [0,1]")
+    return batch
+
+
+# --------------------------------------------------------------------------------------
 # 分桶 + 定向过采样的 BatchSampler
 # --------------------------------------------------------------------------------------
 
@@ -1007,6 +1061,37 @@ class BucketBatchSampler(BatchSampler):
         """一轮 epoch 的 batch 数（≈ 切片总数 / batch_size，小桶按配额下限保底 1）。"""
         return int(sum(self._quota_map.values()))
 
+    def bucket_budget(self, key: tuple) -> dict:
+        """该桶一轮 epoch 的「阳性预算」：目标/期望/下限各是多少。
+
+        因为一轮内 P 个阳性层**恰好各出现一次**，实际每批阳性数是
+        ``floor(P/B)`` 或 ``ceil(P/B)``（前 ``P%B`` 个 batch 多一个），所以：
+
+          * ``ideal``：``n_pos``（配置目标，正常桶取到它）；
+          * ``expect``：``ceil(P/B)``，该桶实际能给出的**平均**阳性数/批；
+          * ``floor``：``floor(P/B)``，单个 batch 的**最小**阳性数（自检按它判下界）。
+
+        ``expect < n_pos`` 说明这个桶的病灶层太少，只能牺牲比例来保证覆盖（会打告警）。
+        """
+        if key not in self._quota_map:
+            raise KeyError(f"未知的桶 {key}；可选：{sorted(self._quota_map)}")
+        batches = max(1, int(self._quota_map[key]))
+        n_pos_slices = int(self.dataset.pos_flags[self.dataset.buckets[key]].sum())
+        ideal = self._target_pos_per_batch()
+        expect = min(ideal, int(math.ceil(n_pos_slices / batches))) if n_pos_slices else 0
+        floor = min(ideal, n_pos_slices // batches)
+        return {"batches": batches, "pos_slices": n_pos_slices,
+                "ideal": ideal, "expect": expect, "floor": floor}
+
+    def bucket_budgets(self) -> dict:
+        """所有桶的阳性预算（自检与报告用）。"""
+        return {key: self.bucket_budget(key) for key in sorted(self.dataset.buckets)}
+
+    @property
+    def min_pos_per_batch_expected(self) -> int:
+        """全数据集层面「每批阳性数」的期望下限（各桶 floor 的最小值），供自检判阈值用。"""
+        return min((b["floor"] for b in self.bucket_budgets().values()), default=0)
+
     def __iter__(self) -> Iterator[list]:
         self._epoch += 1
         rng = random.Random(self._seed_for_epoch(self._epoch))
@@ -1021,7 +1106,6 @@ class BucketBatchSampler(BatchSampler):
 
         keys = list(self.dataset.buckets)
         remaining = dict(self._quota_map)
-        caps: dict = {}
         pending: list = []
         while True:
             if not pending:
@@ -1032,17 +1116,17 @@ class BucketBatchSampler(BatchSampler):
             key = pending.pop()
             batches_left = remaining.get(key, 0)      # 含当前这一个 batch
             remaining[key] = batches_left - 1
-            batch = self._draw_batch(key, pools[key][0], pools[key][1], rng, batches_left, caps)
+            batch = self._draw_batch(key, pools[key][0], pools[key][1], rng, batches_left)
             if batch:
                 yield batch
 
-        for key, cap in sorted(caps.items()):
-            if cap < self._target_pos_per_batch():
-                LOGGER.warning("桶 %s：本轮 %d 个 batch 只分到 %d 个阳性层/批（目标 %d）——桶内病灶层太少，"
-                               "为了让一轮覆盖每一层只能降低比例；跑完这一折后如仍如此，"
-                               "可考虑调低 train.batch_size 或把该桶的病例并入更大桶。",
-                               format_bucket(key), self._quota_map.get(key, 0), cap,
-                               self._target_pos_per_batch())
+        for key, budget in self.bucket_budgets().items():
+            if budget["expect"] < budget["ideal"]:
+                LOGGER.warning("桶 %s：本轮 %d 个 batch 只有 %d 个阳性层（平均 %.2f 个/批，目标 %d）"
+                               "——桶内病灶层太少，为了让一轮覆盖每一层只能降低该桶的阳性比例；"
+                               "跑完这一折后如仍如此，可考虑调低 train.batch_size 或把该桶病例并入更大桶。",
+                               format_bucket(key), budget["batches"], budget["pos_slices"],
+                               budget["pos_slices"] / max(1, budget["batches"]), budget["ideal"])
 
     def _target_pos_per_batch(self) -> int:
         """目标阳性数/批：``min(batch_size, max(min_pos_per_batch, round(batch_size * pos_ratio_target)))``。"""
@@ -1050,7 +1134,7 @@ class BucketBatchSampler(BatchSampler):
         return min(self.batch_size, max(int(self.min_pos_per_batch), n_pos))
 
     def _draw_batch(self, key: tuple, pos_pool: _CyclicPool, neg_pool: _CyclicPool,
-                    rng: random.Random, batches_left: int, caps: dict | None = None) -> list:
+                    rng: random.Random, batches_left: int) -> list:
         """在一个桶内抽一个 batch：先抽阳性，再用阴性补足。
 
         阳性数按「累计配额」算，而不是每个 batch 各自 round：
@@ -1088,8 +1172,6 @@ class BucketBatchSampler(BatchSampler):
             want_neg += take_neg
             deficit -= take_neg
             want_pos += min(deficit, max(0, len(pos_pool) - want_pos))
-        if caps is not None:
-            caps[key] = want_pos if key not in caps else min(caps[key], want_pos)
 
         batch = [pos_pool.pop() for _ in range(want_pos)]
         batch += [neg_pool.pop() for _ in range(want_neg)]
@@ -1114,17 +1196,21 @@ class BucketBatchSampler(BatchSampler):
 
     def describe(self) -> str:
         """返回采样器配置与逐桶配额的多行描述。"""
-        quota = self._quota()
         lines = [
             f"BucketBatchSampler：batch_size={self.batch_size} "
             f"pos_ratio_target={self.pos_ratio_target} "
-            f"n_pos={int(round(self.batch_size * self.pos_ratio_target))} seed={self.seed} "
+            f"n_pos={self._target_pos_per_batch()} seed={self.seed} "
             f"每轮 batch 数={len(self)}（数据集共 {len(self.dataset)} 层切片）",
         ]
         for key in sorted(self.dataset.buckets):
             n_pos, n_neg = self.bucket_counts[key]
+            b = self.bucket_budget(key)
+            extra = ""
+            if b["expect"] < b["ideal"]:
+                extra = f"  ← 病灶层不足，实际约 {b['pos_slices'] / max(1, b['batches']):.2f} 正/批"
             lines.append(f"  桶 {format_bucket(key):>9}：切片 {len(self.dataset.buckets[key]):5d}"
-                         f"（正 {n_pos:4d} / 负 {n_neg:5d}）  每轮配额 {quota[key]:4d} 个 batch")
+                         f"（正 {n_pos:4d} / 负 {n_neg:5d}）  每轮配额 {b['batches']:4d} 个 batch"
+                         f"，阳性 {b['pos_slices']:4d} 层 → {b['expect']} 正/批（目标 {b['ideal']}）{extra}")
         return "\n".join(lines)
 
 
@@ -1221,7 +1307,10 @@ def make_train_loader(splits: dict | None, fold: int, cfg: dict) -> DataLoader:
                         augment=True, fold=int(fold))
     generator = make_generator(seed + int(fold))
     batch_sampler = make_batch_sampler(ds, cfg, generator=generator)
-    return DataLoader(ds, batch_sampler=batch_sampler, generator=generator, **_loader_kwargs(cfg))
+    verify = bool(data_config(cfg).get("verify_batch", True))
+    return DataLoader(ds, batch_sampler=batch_sampler, generator=generator,
+                      collate_fn=lambda samples: collate_samples(samples, verify=verify),
+                      **_loader_kwargs(cfg))
 
 
 def make_val_loader(splits: dict | None, fold: int, cfg: dict) -> DataLoader:
@@ -1240,8 +1329,11 @@ def make_val_loader(splits: dict | None, fold: int, cfg: dict) -> DataLoader:
                         augment=False, fold=int(fold))
     batch_size = data_cfg.get("val_batch_size") or int(train_cfg.get("batch_size", 8))
     generator = make_generator(int(train_cfg.get("seed", 42)) + int(fold))
+    # 验证侧逐层顺序读，batch 内同样只会出现一种面内尺寸（每例一个桶），照用同一个 collate
+    verify = bool(data_cfg.get("verify_batch", True))
     return DataLoader(ds, batch_size=int(batch_size), shuffle=False, drop_last=False,
-                      generator=generator, **_loader_kwargs(cfg))
+                      generator=generator, collate_fn=lambda samples: collate_samples(samples, verify=verify),
+                      **_loader_kwargs(cfg))
 
 
 if __name__ == "__main__":  # pragma: no cover - 直接运行本文件时给出正确入口

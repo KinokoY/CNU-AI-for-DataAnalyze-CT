@@ -45,14 +45,22 @@
 
 - 样本单位：`index[i] = (case, z)`，`__getitem__` 返回
   `{"image": (1,H,W) float32∈[0,1], "label": (H,W) int64∈{0,1}, "case", "z", "orig_hw"}`。
+- **batch 契约**（`collate_samples`，第 3 轮训练直接照此取值；**不要用 DataLoader 默认 collate**）：
+  `image (B,1,H,W) float32`、`label (B,H,W) int64`、`case list[str]`、`z list[int]`、
+  `orig_hw list[tuple[int,int]]`。默认 collate 会把每样本一个 tuple 的 `orig_hw` 转置成两行列表，
+  形似 `(H,W)` 但 `for h, w in ...` 解包即炸（远程已炸过一次）；`collate_samples(verify=True)`
+  顺带校验形状一致、`label⊂{0,1}`、`image⊂[0,1]`、无 NaN。
 - 分桶键 = `(ceil(H/16)*16, ceil(W/16)*16)`，与 `preprocess.py` 的 `size_buckets` 同口径；
   **同一 batch 内面内尺寸必然一致**。`data.pad_multiple` 缺省从 `model.pad_to_multiple` 取。
 - **batch 内阳性比例的真实口径**：`n_pos = min(batch_size, max(1, round(batch_size × pos_ratio_target)))`。
   `batch_size=8, pos_ratio_target=0.30` → `n_pos=2` → 实际比例 **0.25**（≈ 原始 12.81% 的 1.95 倍）。
   这是取整的必然结果，不是 bug；想贴近 0.30 就把 batch_size 提到 10/20。
-- 采样器保证：一轮 epoch 内每层切片至少出现一次、**阳性层恰好各一次**；每批阳性数恒为 `n_pos`；
-  采样顺序只由 `(train.seed, epoch, 病例集合)` 决定（用 sha256 派生，不用内置 `hash()`），
-  与 `num_workers` 无关，可复现。
+- **小桶会被摊薄**：`352/432/448` 三个桶各只有 1–2 例病人、20–49 个阳性层，而一轮要出几十上百个
+  batch → 只能做到约 1 个阳性层/批。`BucketBatchSampler.bucket_budget()` 会算出每桶的
+  `ideal/expect/floor`（自检按它判阈值，不会误报成"比例不达标"）。
+- 采样器保证：一轮 epoch 内每层切片至少出现一次、**阳性层恰好各一次**；阳性充足的桶里每批阳性数
+  恒为 `n_pos`；采样顺序只由 `(train.seed, epoch, 病例集合)` 决定（用 sha256 派生，不用内置
+  `hash()`），与 `num_workers` 无关，可复现。
 - `num_workers` 等 DataLoader 参数从 `train` 节挪到了 `data` 节（`configs/default.yaml` 已补 `data` 节）。
 - 增强 8 步（image/label 同步，仅训练；**全部自实现，不依赖 MONAI**）：
   `FlipSlice2D`（翻行、翻列各一次）、`Rotate90Slice2D`（整 90°）、`RandAffineSlice2D`

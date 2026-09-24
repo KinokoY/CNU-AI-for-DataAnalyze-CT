@@ -46,6 +46,7 @@ data:
   bucket_balance: true            # 每轮 batch 配额按桶内样本数加权（否则小桶被过度重复）
   min_pos_per_batch: 1            # 每个 batch 至少 1 个肿瘤切片（小桶兜底；正常桶由 pos_ratio_target 决定）
   pos_ratio_tolerance: 0.10       # 自检脚本判定「实测阳性比例偏离目标」的阈值
+  verify_batch: true              # collate 时校验 batch 不变量（尺寸/值域/label 取值），开销可忽略
   augment:                        # 仅训练；验证侧不做任何几何变换
                                   # 全部自实现（src/dataset.py），不依赖 MONAI：
                                   #   FlipSlice2D / Rotate90Slice2D / RandAffineSlice2D /

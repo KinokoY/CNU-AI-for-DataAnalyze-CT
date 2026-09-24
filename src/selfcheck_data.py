@@ -204,8 +204,24 @@ def check_bucket_consistency(ds: CTSliceDataset, manifest: dict, problems: list)
 # batch 实测
 # --------------------------------------------------------------------------------------
 
+def sampler_budgets(ds: CTSliceDataset, cfg: dict) -> dict:
+    """构造一个采样器（不读任何切片）并取逐桶阳性预算，供 batch 自检判阈值用。"""
+    train_cfg = (cfg or {}).get("train") or {}
+    sampler = BucketBatchSampler(ds,
+                                 batch_size=int(train_cfg.get("batch_size", 8)),
+                                 pos_ratio_target=float(train_cfg.get("pos_ratio_target", 0.30)),
+                                 seed=int(train_cfg.get("seed", 42)),
+                                 min_pos_per_batch=int(data_config(cfg).get("min_pos_per_batch", 1)))
+    return sampler.bucket_budgets()
+
+
 def describe_batch(batch: dict) -> dict:
-    """汇总一个 batch 的形态信息（不落盘，供打印与报告使用）。"""
+    """汇总一个 batch 的形态信息（不落盘，供打印与报告使用）。
+
+    取值依据 ``src.dataset.collate_samples`` 定义的 batch 契约：
+    ``image``/``label`` 是张量，``case``/``z``/``orig_hw`` 是长度 B 的 list
+    （``orig_hw`` 是 tuple 列表，**不是**被转置的两行列表——默认 collate 会踩这个坑）。
+    """
     image, label = batch["image"], batch["label"]
     cases = sorted(set(batch["case"]))
     per_sample_ratio = [float((label[i] > 0).float().mean()) for i in range(label.shape[0])]
@@ -220,7 +236,7 @@ def describe_batch(batch: dict) -> dict:
         "label_values": sorted(int(v) for v in np.unique(label.numpy()).tolist()),
         "cases": cases,
         "z": [int(z) for z in batch["z"]],
-        "orig_hw": [[int(h), int(w)] for h, w in batch["orig_hw"]],
+        "orig_hw": [[int(hw[0]), int(hw[1])] for hw in batch["orig_hw"]],
         "pos_slices_in_batch": int(sum(1 for i in range(label.shape[0]) if bool((label[i] > 0).any()))),
         "pos_ratio_measured": round(
             float(sum(1 for i in range(label.shape[0]) if bool((label[i] > 0).any())) / max(1, image.shape[0])), 4),
@@ -229,8 +245,12 @@ def describe_batch(batch: dict) -> dict:
     }
 
 
-def check_batch(idx: int, batch: dict, problems: list, tolerance: float) -> dict:
-    """校验一个 batch：尺寸一致、值域、label 取值、阳性比例，返回汇总 dict。"""
+def check_batch(idx: int, batch: dict, problems: list, tolerance: dict) -> dict:
+    """校验一个 batch：尺寸一致、值域、label 取值、阳性比例，返回汇总 dict。
+
+    阳性比例的判据是**该桶的可达目标**（``tolerance['per_bucket'][桶]['expect']``）而不是配置里的
+    0.30：病灶层稀少的桶为了「一轮覆盖每一层」只能降低比例，这是设计上的取舍而非缺陷。
+    """
     info = describe_batch(batch)
     image, label = batch["image"], batch["label"]
     n = int(image.shape[0])
@@ -243,6 +263,9 @@ def check_batch(idx: int, batch: dict, problems: list, tolerance: float) -> dict
         problems.append(f"batch {idx}：image {tuple(image.shape)} 与 label {tuple(label.shape)} 不匹配")
     if info["bucket"] != format_bucket(bucket_key(int(image.shape[2]), int(image.shape[3]))):
         problems.append(f"batch {idx}：桶键与 shape 不符")
+    if any(tuple(hw) != (int(image.shape[2]), int(image.shape[3])) for hw in info["orig_hw"]):
+        problems.append(f"batch {idx}：orig_hw {info['orig_hw']} 与张量形状 "
+                        f"{(int(image.shape[2]), int(image.shape[3]))} 不一致")
 
     # 2) 值域与标签取值
     if info["image_min"] < -1e-6 or info["image_max"] > 1.0 + 1e-6:
@@ -255,19 +278,27 @@ def check_batch(idx: int, batch: dict, problems: list, tolerance: float) -> dict
     if info["label_dtype"] not in ("torch.int64", "torch.int32"):
         problems.append(f"batch {idx}：label dtype={info['label_dtype']}，期望整型")
 
-    # 3) 阳性比例
-    if abs(info["pos_ratio_measured"] - tolerance["target"]) > tolerance["limit"]:
-        problems.append(f"batch {idx}：batch 内含肿瘤切片比例 {info['pos_ratio_measured']:.3f} "
-                        f"偏离目标 {tolerance['target']:.2f} 超过 {tolerance['limit']:.2f}")
+    # 3) 每批阳性数：应落在该桶的 [floor, ideal] 区间内（见 BucketBatchSampler.bucket_budget）
+    key = bucket_key(int(image.shape[2]), int(image.shape[3]))
+    budget = tolerance.get("per_bucket", {}).get(key)
+    got = int(info["pos_slices_in_batch"])
+    if budget is not None:
+        lo, hi = int(budget["floor"]), int(budget["ideal"])
+        if not (lo <= got <= hi):
+            problems.append(f"batch {idx}（桶 {info['bucket']}）：阳性切片 {got} 超出该桶预算 "
+                            f"[{lo}, {hi}]（该桶 {budget['pos_slices']} 个阳性层 / {budget['batches']} 个 batch）")
+        elif got < hi:
+            LOGGER.info("        注：桶 %s 本轮只能给出 %d 正/批（目标 %d），本批 %d 属预期",
+                        info["bucket"], budget["expect"], hi, got)
 
     LOGGER.info("batch %d：image %s / label %s；桶 %s；病例 %s；z=%s",
                 idx, tuple(info["image_shape"]), tuple(info["label_shape"]),
                 info["bucket"], info["cases"], info["z"])
-    LOGGER.info("        值域 [%.4f, %.4f]；label 取值 %s；**含肿瘤切片 %d/%d = %.3f**（目标 %.2f）；"
-                "本 batch 消耗 %s",
+    LOGGER.info("        值域 [%.4f, %.4f]；label 取值 %s；**含肿瘤切片 %d/%d = %.3f**（配置目标 %.2f）；"
+                "orig_hw %s；取该 batch 耗时见下一行",
                 info["image_min"], info["image_max"], info["label_values"],
                 info["pos_slices_in_batch"], info["batch_size"], info["pos_ratio_measured"],
-                tolerance["target"], tolerance.get("_note", ""))
+                tolerance["target"], info["orig_hw"][:3] + (["..."] if len(info["orig_hw"]) > 3 else []))
     return info
 
 
@@ -758,6 +789,12 @@ def main(argv=None) -> int:
     # ---- 3 个 batch 实测 ----
     LOGGER.info("-" * 78)
     LOGGER.info("2) 实测 batch（第 1 个 batch 含冷读，耗时单独看）")
+    # 阳性比例的判据用「该桶可达目标」而不是全局 0.30：病灶层稀少的桶只能摊薄（见 bucket_budget）
+    tolerance["per_bucket"] = sampler_budgets(train_ds, cfg)
+    LOGGER.info("各桶可达阳性数/批：%s", {
+        format_bucket(k): f"理想 {v['ideal']} / 可达 {v['expect']}（floor {v['floor']}，"
+                          f"{v['pos_slices']} 个阳性层摊到 {v['batches']} 个 batch）"
+        for k, v in tolerance["per_bucket"].items()})
     train_loader = make_train_loader(splits, int(args.fold), cfg)
     batch_infos = run_batches(train_loader, int(args.batches), tolerance, problems, tag="train")
 

@@ -141,15 +141,16 @@ python -m src.selfcheck_data
 期望输出（关键几行）：
 
 ```
-划分：data/splits.json，5 折，每折 train=[21,...] / val=[4,...]
+划分：data/splits.json，5 折，每折 train=[21, 21, 21, 21, 21] / val=[4, 4, 4, 4, 4]
 清单：25 例，预处理指纹 xxxxxxxx（当前配置 xxxxxxxx）一致
 分桶与清单一致：{'512x512': 17, '448x448': 1, ...}
-整体阳性率：train 侧 0.12xx（.../...），val 侧 0.12xx
+整体阳性率：train 侧 0.1381（617/4469），val 侧 0.0985（149/1513）
+各桶可达阳性数/批：{'352x352': '理想 2 / 可达 1（floor 1，49 个阳性层摊到 115 个 batch）', ...}
 batch 1：image (8, 1, 512, 512) / label (8, 512, 512)；桶 512x512；病例 [...]
-        值域 [0.0000, 1.0000]；label 取值 [0, 1]；**含肿瘤切片 2/8 = 0.250**（目标 0.30）
-  桶    512x512：切片  1957（含肿瘤   518 = 26.47%）  病例  6 例 [...]
-bucket_seed 一致：True    # 采样器可复现
-自检步骤：... 全部通过
+        值域 [0.0000, 1.0000]；label 取值 [0, 1]；**含肿瘤切片 2/8 = 0.250**（配置目标 0.30）
+        取该 batch 耗时 0.9 s（含首次冷读）
+[OK] 每个 batch 内面内尺寸一致；label ⊂ {0,1}；值域 ⊂ [0,1]
+自检通过：21 例 / 4469 层切片的形态、值域、标签、分桶、增强与采样比例均符合约定。
 下一步：第 3 轮 python -m src.train --fold 0 --debug
 ```
 
@@ -159,8 +160,15 @@ bucket_seed 一致：True    # 采样器可复现
   `round(8×0.30)=2` 取整后，每个 batch 恒为 2 个肿瘤切片，批次平均比例就是 0.25 =
   原始 12.81% 的约 1.95 倍过采样。想更接近 0.30 就把 `train.batch_size` 提到 10/20，或把
   `train.pos_ratio_target` 改成 0.25（两者等价，改一个即可）。
-- **每个 batch 内只有一种面内尺寸**：输出里 batch 的 `桶` 字段只有一个值；分桶保证不同
-  尺寸不会同 batch。
+- **小的中间桶会被「摊薄」**：`352x352` / `432x432` / `448x448` 这三个桶各只有 1–2 例病人、
+  20–49 个肿瘤层，而一轮要出几十~上百个 batch，为了「一轮覆盖每一层」只能做到
+  **约 1 个肿瘤层/批**（自检会打印 `可达 N`，并按该值判阈值，不会误报）。
+  这是设计取舍，不是缺陷；想改善就调低 `train.batch_size`，或把这类病例在采样时归入相邻桶。
+- **每个 batch 内只有一种面内尺寸**：`collate_samples` 会强制校验，混了会直接报错。
+- **batch 的键含义**（`src.dataset.collate_samples` 定义的契约，第 3 轮训练直接照此取值）：
+  `image (B,1,H,W) float32` / `label (B,H,W) int64` / `case list[str]` / `z list[int]` /
+  `orig_hw list[tuple[int,int]]`。**不要用 DataLoader 默认 collate**：它会把每样本一个 tuple 的
+  `orig_hw` 转置成 `[(h1,h2,...),(w1,w2,...)]`，看上去像 `(H,W)` 但解包就会炸。
 - **逐层曲线应集中在中段**：若阳性层全挤在 `z≈0` 或 `z≈nz-1`，说明切片轴搞反了，把该曲线贴回。
 - `值域` 必须落在 `[0,1]`、`label 取值` 必须只含 `{0,1}`、`image dtype` 必须是 float32。
 
@@ -171,8 +179,9 @@ bucket_seed 一致：True    # 采样器可复现
 | `case 31 缺 image/label` | cache 不完整 → 先跑 `python scripts/preprocess.py` |
 | `cfg_hash=... 与当前配置算出的 ... 不一致` | 缓存来自别的预处理参数 → 重跑 `preprocess.py` |
 | `含肿瘤切片数 ... 与清单 ... 不符` | 清单过期 → `python scripts/fetch_manifest.py` 刷新 |
-| `桶 ...：本轮 N 个 batch 只分到 M 个阳性层/批` | 该桶病灶层太少（正常数据不会出现） |
-| `TypeError: RandXxx.__init__() got an unexpected keyword argument` | 我写错了 MONAI 参数名（远程 monai 1.6.0）→ **把整段 traceback 贴回** |
+| `batch 内 image 阳性切片 ... 超出该桶预算` | 采样器比例不符预期 → 把该行与上面的「各桶可达阳性数」一起贴回 |
+| `batch 内样本形状不一致` | 分桶失效（同 batch 混了不同面内尺寸）→ 贴回 |
+| `TypeError: ... got an unexpected keyword argument` | 多半是库里参数名/版本不匹配 → **贴整段 traceback** |
 | 退出码 1 + `自检发现 N 个问题` | **把带 `-` 的行整段贴回**，先不要进入第 3 轮 |
 
 只想快速过一遍、不跑完整轮采样：`python -m src.selfcheck_data --batches 1 --skip-sampler`。
