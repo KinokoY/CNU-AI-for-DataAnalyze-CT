@@ -12,8 +12,9 @@
 
 ## 二、关键数字（写 dataset / train 直接用）
 
-- 面内尺寸：`512×512` 17 例，其余 342–436 一族 8 例；按 16 对齐分 **6 个桶**（512/448/432/416×2/368/352×3）。
-  **不同面内尺寸不能同 batch，必须分桶**；最大面内 512。
+- 面内尺寸：`512×512` 17 例，其余 342–436 一族 8 例；**最大面内 512**。
+  现在**不再按面内尺寸分桶**（已废弃），而是把每个样本统一补边到 512×512 再用，
+  详见第六节。
 - 切片数 `nz`：74–488（各例不同，勿假设固定）。
 - **含肿瘤切片 766 / 5982 = 12.81%** → 采样器把正样本提到 batch 内 25–35% 的基线。
 - 划分：`data/splits.json`，5 折各 4 例验证 / 21 例训练，验证体积 CV=0.317。
@@ -41,43 +42,73 @@
 - ~~**`data/splits.json`**~~：**已入库**（远程跑 `make_splits.py` 后 push 回来了），本地已具备，
   可以直接写/查 `src/dataset.py`、`src/train.py`。
 
-## 六、第 2 轮（Dataset + 分桶采样器 + 增强）已确认的事实
+## 六、第 2 轮（Dataset + 补边 + 采样器 + 增强）已确认的事实
+
+### 6.1 统一补边（**取代了按面内尺寸分桶**）
 
 - 样本单位：`index[i] = (case, z)`，`__getitem__` 返回
-  `{"image": (1,H,W) float32∈[0,1], "label": (H,W) int64∈{0,1}, "case", "z", "orig_hw"}`。
-- **batch 契约**（`collate_samples`，第 3 轮训练直接照此取值；**不要用 DataLoader 默认 collate**）：
-  `image (B,1,H,W) float32`、`label (B,H,W) int64`、`case list[str]`、`z list[int]`、
-  `orig_hw list[tuple[int,int]]`。默认 collate 会把每样本一个 tuple 的 `orig_hw` 转置成两行列表，
-  形似 `(H,W)` 但 `for h, w in ...` 解包即炸（远程已炸过一次）；`collate_samples(verify=True)`
-  顺带校验形状一致、`label⊂{0,1}`、`image⊂[0,1]`、无 NaN。
-- 分桶键 = **精确面内尺寸 `(H, W)`**（如 `(342,342)` 与 `(351,351)` 是**两个桶**）。
-  理由：`torch.stack` 要求同 batch 内形状逐元素一致，所以能同 batch 的充要条件就是精确尺寸相同。
-  `pad_multiple=16` **只决定模型内部 pad 到多少**（`ceil(H/16)*16`），不参与分桶——早期版本拿
-  「对齐 16 之后的值」当桶键，把 342 与 351 放进了同一个 `352x352` 桶，collate 时直接炸。
-  `ds.bucket_of_case(case)` 返回桶键；`ds.bucket_stats()[key]["padded_hw"]` 给出该桶要 pad 到的尺寸。
-- **batch 内阳性比例的真实口径**：`n_pos = min(batch_size, max(1, round(batch_size × pos_ratio_target)))`。
+  `{"image": (1,512,512) float32∈[0,1], "label": (512,512) int64∈{0,1}, "case", "z", "orig_hw"}`。
+- **读取顺序**：取一层 → `/65535` 还原 [0,1]（label 取 `>0`）→ **居中补边到 512×512**（`data.target_hw`
+  + `data.pad_align=center`，image 与 label 同一偏移，补 0）→ 仅训练侧再施加增强。
+  镜像做法（早期版本）：按精确面内尺寸分桶；`torch.stack` 要求同 batch 形状逐元素一致，
+  于是采样器要先选桶再在桶内配额，小桶被摊薄、还产生大量全阴性 batch —— **已整条删除**
+  （`bucket_key` / `format_bucket` / `BucketBatchSampler` / `pad_multiple` 都不存在了）。
+- 512 是 16 的倍数 → U-Net 4 级下采样不需要内部 pad；`model.pad_to_multiple` 保留，
+  只用来给 `data.target_hw` 做对齐（见 `src/dataset.resolve_target_hw`）。
+- 补边代价（按尺寸推算，未在远程实测权重）：非 512 的 8 例浪费约 41%、全部 25 例按例加权约 13%；
+  且增强在补边之后施加，非 512 病例的补边区在 gamma/噪声/仿射后**不再严格为 0**。
+  第 3 轮 loss 可考虑用 `orig_hw` + `pad_offset` 生成 ignore mask。
+- **裁回原始尺寸必须用 `pad_offset`**：居中补边时内容不在原点（342→512 偏移 (85,85)），
+  第 4 轮写死 `[:H, :W]` 会整体错位。`src.dataset.pad_offset_of(orig_hw, target_hw)` 是唯一口径。
+
+### 6.2 batch 契约（`collate_samples`，第 3 轮训练直接照此取值）
+
+`image (B,1,512,512) float32`、`label (B,512,512) int64`、`case list[str]`、`z list[int]`、
+`orig_hw list[tuple]`（**补边前**的面内尺寸）、`pad_offset list[tuple]`（内容在画布里的左上角）。
+**不要用 DataLoader 默认 collate**：它会把每样本一个 tuple 的 `orig_hw` 转置成两行列表，
+形似 `(H,W)` 但 `for h, w in ...` 解包即炸（远程已炸过一次）。
+比较 image 与 label 的空间维要**错开一个通道维**（`image (B,1,H,W)` vs `label (B,H,W)`）——
+这条历史的坑在 `check_batch` 里改坏过一次。
+
+### 6.3 采样器（`ProportionalBatchSampler`，单一池）
+
+- 目标阳性数/批：`n_pos = min(batch_size, max(1, round(batch_size × pos_ratio_target)))`。
   `batch_size=8, pos_ratio_target=0.30` → `n_pos=2` → 实际比例 **0.25**（≈ 原始 12.81% 的 1.95 倍）。
-  这是取整的必然结果，不是 bug；想贴近 0.30 就把 batch_size 提到 10/20。
-- **小桶会被摊薄**：`352/432/448` 三个桶各只有 1–2 例病人、20–49 个阳性层，而一轮要出几十上百个
-  batch → 每批阳性数只能是 `floor(P/B)`~`ceil(P/B)`（0 或 1），且必然有少量**全阴性 batch**。
-  分配用「均摊」公式 ``第 q 批 = ceil(P*q/B) - ceil(P*(q-1)/B)``（**不要**用
-  ``max(q, ceil(P*q/B))``：那会把阳性前置到前 P 批、后面整段全 0，远程实测 566 个 batch 里
-  有 117 个全阴性，均摊后降到 16 个）。`BucketBatchSampler.bucket_budget()` 给出每桶的
-  `ideal/expect/floor/empty_batches`，自检按它判阈值。
-- 采样器保证：一轮 epoch 内每层切片至少出现一次、**阳性层恰好各一次**；阳性充足的桶里每批阳性数
-  恒为 `n_pos`；采样顺序只由 `(train.seed, epoch, 病例集合)` 决定（用 sha256 派生，不用内置
-  `hash()`），与 `num_workers` 无关，可复现。**可复现性的正确口径**：同 epoch+同 seed 两次采样
-  必须完全一致；**相邻 epoch 必须不同**（不同 epoch 种子不同是有意设计，别误判成"不可复现"）。
-- `num_workers` 等 DataLoader 参数从 `train` 节挪到了 `data` 节（`configs/default.yaml` 已补 `data` 节）。
-- 增强 8 步（image/label 同步，仅训练；**全部自实现，不依赖 MONAI**）：
-  `FlipSlice2D`（翻行、翻列各一次）、`Rotate90Slice2D`（整 90°）、`RandAffineSlice2D`
-  （旋转 ±15°/缩放 0.9–1.1/平移 ±10%，image 双线性、label 最近邻）、`GammaSlice2D`（随机 gamma
-  校正，单调保序的强度重排）、`GaussianNoiseSlice2D`（sigma 从 `U(0, noise_std)` 抽）、
-  夹回 [0,1]、label 二值化。串接用 `ComposeSteps` 替代 MONAI 的 `Compose`。
-  **为什么放弃 MONAI 做增强**：它的增强有两套签名（array 版吃数组、字典版 `*d` 才吃 dict 且
-  `keys` 是必需参数），参数名还跨版本改过（`axis` → `spatial_axis`、`shift_range` 在 1.6 已不存在），
-  远程在这一层连炸两次；而这几个增强本身只是几十行 numpy，自实现后可离线逐项断言。
-  不做弹性形变：逐层形变会破坏 z 方向一致性，对 2D 基线也没有收益。
-- 增强的随机源：`random.Random(stable_seed(train.seed, fold, split) + 104729)`，与采样器种子错开；
-  同一折每次构建得到同一串增强参数（可复现），各样本之间仍互不相同。
-- 自检脚本：`python -m src.selfcheck_data`（只读 cache，不需要 GPU；**不再需要 MONAI**）。
+  取整的必然结果，不是 bug；想贴近 0.30 就把 batch_size 提到 10/20。
+- **一轮的 batch 数 = max(切片覆盖 `ceil(N/bs)`、阳性槽位 `ceil(P/n_pos)`、阴性槽位 `ceil(N_neg/(bs-n_pos))`）**，
+  **可能大于** `ceil(N/bs)`（阳性多、batch 大时阳性槽位才是上界）。自检别拿 `N/bs` 直接等号比。
+- 阳性层在整轮**均摊**：``第 q 批 = ceil(P*q/B) - ceil(P*(q-1)/B)``，每批再按 `n_pos` 封顶。
+  不要用 ``max(q, ceil(P*q/B))``：那会把阳性前置到前几批、后面整段全 0。
+  均摊后每个阳性层一轮**恰好出现一次**，且默认配置下**不再出现全阴性 batch**。
+- 阴性层用轮转池：优先吐「本轮还没抽过」的，抽完才重排重复 ⇒ 保证**一轮覆盖每一层切片**
+  （总槽位数 ≥ 切片数）。采样顺序只由 `(train.seed, epoch, 病例集合)` 用 sha256 派生，与 `num_workers` 无关。
+- **可复现性的正确口径**：同 epoch + 同 seed 两次采样必须完全一致；**相邻 epoch 必须不同**
+  （不同 epoch 种子不同是有意设计，别误判成"不可复现"）。
+- `data` 节里的 `bucket_balance` / `min_pos_per_batch` 已删除；`pos_ratio_tolerance` 保留（自检阈值）。
+
+### 6.4 自检判阈值的三条口径（旧版在这里误报过）
+
+1. 训练侧每批阳性数按**采样器自己的计划区间**（`batch_targets()` 的 `floor`~`observed_max`）判，
+   不是拿 `pos_ratio_target` 直接当阈值；
+2. **验证侧不判阳性数**：val loader 顺序读、不做过采样，某个 batch 恰好落在「病例前 8 层无肿瘤」
+   上（如 case 33）是正常的 —— 旧版把训练侧的桶预算套到 val batch 上，误报
+   「阳性切片 0 超出该桶预算 [1,2]」；
+3. 几何自检的期望值口径见 `selfcheck_data.check_affine_geometry` 的 docstring（踩过两次）。
+
+### 6.5 增强（8 步，全部自实现）
+
+`FlipSlice2D`（翻行、翻列各一次）、`Rotate90Slice2D`（整 90°）、`RandAffineSlice2D`
+（旋转 ±15°/缩放 0.9–1.1/平移 ±10%，image 双线性、label 最近邻）、`GammaSlice2D`（随机 gamma
+校正，单调保序的强度重排）、`GaussianNoiseSlice2D`（sigma 从 `U(0, noise_std)` 抽）、
+夹回 [0,1]、label 二值化。串接用 `ComposeSteps` 替代 MONAI 的 `Compose`。
+**为什么放弃 MONAI 做增强**：它的增强有两套签名（array 版吃数组、字典版 `*d` 才吃 dict 且
+`keys` 是必需参数），参数名还跨版本改过（`axis` → `spatial_axis`、`shift_range` 在 1.6 已不存在），
+远程在这一层连炸两次；而这几个增强本身只是几十行 numpy，自实现后可离线逐项断言。
+不做弹性形变：逐层形变会破坏 z 方向一致性，对 2D 基线也没有收益。
+
+增强的随机源：`random.Random(stable_seed(train.seed, fold, split) + 104729)`，与采样器种子错开；
+同一折每次构建得到同一串增强参数（可复现），各样本之间仍互不相同。
+**增强在补边之后**施加（见 6.1 的补边代价）。
+
+自检脚本：`python -m src.selfcheck_data`（只读 cache，不需要 GPU；**不再需要 MONAI**）。
+想核对某个不在当前折里的病例（如 case 56 在 fold 2 的 val）：`--probe-case 56`。

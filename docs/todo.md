@@ -7,9 +7,8 @@ CT 肝脏肿瘤分割 · 基础版（2D 闭环）后续编码计划
 - 缓存：nibabel 读回形状 (nx, ny, nz)，切片轴在最后一维（a[:, :, k] 是一层 (ny,nx) 切片）；
   SimpleITK 读回是其转置 (nz,ny,nx)，两库互为转置。影像 uint16 归一化值（/65535 得 [0,1]）；
   掩膜 uint8 只含 {0,1}；全部 1mm 各向同性。
-- 面内尺寸：512×512 共 17 例；其余 8 例为 342–436 一族。按 16 对齐分 6 个桶：
-  512×512(17)、448×448、432×432、416×416(2)、368×368、352×352(3)。
-  → 不同面内尺寸不能同 batch，必须分桶。
+- 面内尺寸：512×512 共 17 例；其余 8 例为 342–436 一族；最大 512。
+  → **不按尺寸分桶**，统一补边到 512×512（见第 2 轮改动）。
 - 切片数 nz：74–488，各例不同。
 - 含肿瘤切片 766/5982 = 12.81% → 过采样基线（目标提到 batch 内 25–35%）。
 - 划分：data/splits.json，5 折各 4 例验证 / 21 例训练（16 含肿瘤 + 5 仅肝脏），体积 CV 0.317。
@@ -19,38 +18,44 @@ CT 肝脏肿瘤分割 · 基础版（2D 闭环）后续编码计划
 剩余 5 轮，每轮都能独立运行 + 独立验证
 --------------------------------------------------------
 
-■ 第 2 轮：Dataset + 分桶采样器 + 增强 —— 已完成
+■ 第 2 轮：Dataset + 采样器 + 增强 —— 已完成（含一次口径简化）
   交付：src/selfcheck_data.py、src/dataset.py（另在 configs/default.yaml 补了 data 节）
+  【本轮改动：放弃按面内尺寸分桶，改为统一补边到 512×512】
+    - 用户拍板：读取切片后把 image/label **居中补边**到 data.target_hw（默认 512×512，补 0），
+      于是所有 batch 形状恒为 (B,1,512,512)，torch.stack 永远合法；
+      512 是 16 的倍数 → 不需要模型内部 pad；pad_multiple / bucket_key 整条链路删除。
+    - 每样本保留 orig_hw（补边前尺寸）与 pad_offset（内容在画布里的左上角）：
+      第 4 轮整卷推理按 pad_offset 裁回原始面内尺寸（居中补边时内容不在原点）。
+    - BucketBatchSampler → ProportionalBatchSampler：单一池 + 按比例定向抽正负样本，
+      保留「阳性过采样比例控制」「一轮覆盖全部切片与全部阳性层」「同 epoch 可复现且相邻 epoch 不同」，
+      删除 bucket_budget / positive_plan / 按桶配额 / 混尺寸校验。
+    - 代价（写在 docs/preprocess_notes.md 6.1）：补边像素被白算；非 512 病例的补边区在增强后
+      不再严格为 0，第 3 轮 loss 可考虑忽略补边区域。
   【先交付自检脚本】src/selfcheck_data.py（不依赖 torch 网络，只读缓存）
-    - 跑 3 个 batch，打印：每个 batch 的 image/label shape、分桶键、
-      /65535 后的值域、batch 内含肿瘤切片比例实测值、单 batch 耗时；
-    - 再对 1 个 case 打印逐层肿瘤体素数曲线，确认切片轴没搞反。
-    - 目的：让你先确认"数据进模型的形态"正确，再往上搭训练。
+    - 跑 3 个 batch，打印：每个 batch 的 image/label shape、值域、batch 内含肿瘤切片比例实测值、
+      补边样本数与补边像素占比、单 batch 耗时；
+    - 再对 1 个 case 打印逐层肿瘤体素数曲线（--probe-case 可指定任意病例，含 val 侧），确认切片轴没搞反。
   src/dataset.py 接口：
     class CTSliceDataset(torch.utils.data.Dataset)
-      __init__(cases, cache_dir, split, cfg, augment: bool, debug: bool=False)
+      __init__(cases, cache_dir, split, cfg, augment: bool, debug: bool=False, fold=None)
       __len__() -> int                 # 全部切片数
-      __getitem__(i) -> {"image": FloatTensor[1,H,W], "label": LongTensor[H,W],
+      __getitem__(i) -> {"image": FloatTensor[1,512,512], "label": LongTensor[512,512],
                          "case": str, "z": int, "orig_hw": (H,W)}
-      属性：index = [(case, z)...]；pos_flags = bool 数组（该切片是否含肿瘤）
+      属性：index = [(case, z)...]；pos_flags = bool 数组；case_hw / case_pad_offset / inplane_stats()
+    def pad_to_target(arr, target_hw, align) -> (padded, (top, left))
+    def pad_offset_of(orig_hw, target_hw, align) -> (top, left)   # 裁回原始尺寸的唯一口径
     def make_batch_sampler(ds, cfg, generator=None) -> BatchSampler
-      # 自定义 BatchSampler：先按桶（ceil(H/16), ceil(W/16)）选桶，再在桶内
-      # 按 n_pos = round(batch_size*pos_ratio_target)、n_neg = 其余 定向抽取；
-      # 保证 batch 内肿瘤切片比例恒为 pos_ratio_target（默认 0.30）、batch 内尺寸一致。
-      # 不用裸 WeightedRandomSampler：比例不可控，且不同尺寸无法同 batch。
+      # ProportionalBatchSampler：n_pos = min(bs, max(1, round(bs*pos_ratio_target)))，
+      # 阳性层在整轮均摊、阴性层轮转池补满；一轮覆盖每层切片、每个阳性层恰好一次。
     def make_train_loader(splits, fold, cfg) -> DataLoader
-    def make_val_loader(splits, fold, cfg) -> DataLoader   # 顺序、无增强
-    def build_transforms(cfg, train: bool) -> monai.transforms.Compose
+    def make_val_loader(splits, fold, cfg) -> DataLoader   # 顺序、无增强（仍补边）
+    def build_transforms(cfg, train: bool) -> ComposeSteps | None
   读取策略（避免 DataLoader 里开上千句柄）：
     __init__ 只 nib.load 读 header + label 体素（算 pos_flags/索引），不读 image 体素；
-    __getitem__ 用每 worker 一份的 lru_cache(maxsize=8) 按 (case, key) 打开 nibabel 代理对象，
+    __getitem__ 用每 worker 一份的 lru_cache(maxsize=8) 按 case 打开 nibabel 代理对象，
     memmap=True，只取 [:, :, z]。
-  增强（仅训练，MONAI 2D，image/label 同步）：
-    RandFlip(0.5, axis=0) + RandFlip(0.5, axis=1)、RandRotate90(0.5, (0,1))、
-    RandAffine(0.5, 旋转±15°、缩放0.9–1.1、平移±10%，image=bilinear/label=nearest)、
-    RandHistogramShift(0.2)、RandGaussianNoise(0.2, std=0.01)。
-    不做弹性形变（无 2D 版，逐层施加会破坏 z 一致性）。
-  校验要点（必须打印/断言）：batch 内正样本比例 ≈ 0.30；值域 ∈ [0,1]；label ⊂ {0,1}。
+  校验要点（必须打印/断言）：batch 形状恒为 (B,1,512,512)；值域 ∈ [0,1]；label ⊂ {0,1}；
+    训练侧每批阳性数落在采样器计划区间（验证侧不判阳性数——旧版在这里误报过）。
 
 ■ 第 3 轮：模型 + 损失 + 训练
   交付：src/unet.py、src/losses.py、src/train.py
@@ -79,7 +84,7 @@ CT 肝脏肿瘤分割 · 基础版（2D 闭环）后续编码计划
     - 保存 runs/fold<k>/best.pt（含 model_state/epoch/metric/cfg 指纹）与 last.pt，
       写 runs/fold<k>/metrics.csv + TensorBoard；
     - 固定种子：random/numpy/torch/cuda + DataLoader generator；
-    - --debug：batch_size=2、每折 2 例、3 个 iteration，打印每 batch shape、分桶键、
+    - --debug：batch_size=2、每折 2 例、3 个 iteration，打印每 batch shape、
       实测正样本比例、torch.cuda.max_memory_allocated()/reserved、单步耗时，然后退出不落盘。
       这是标定 batch_size（先按 8）的依据。
   逐折执行：for f in 0 1 2 3 4; do python -m src.train --fold $f; done
@@ -90,7 +95,9 @@ CT 肝脏肿瘤分割 · 基础版（2D 闭环）后续编码计划
     @torch.no_grad()
     def predict_volume(model, case, cache_dir, cfg, device, pad_to_multiple=16, batch_slices=8)
         -> (prob[H,W,Z] float32, pred[H,W,Z] uint8, meta)
-      # 逐层前向 → 新建 np.zeros((H,W,Z)) 按 z 索引赋值拼回整卷 → 还原原始面内尺寸
+      # 逐层前向（每层补边到 data.target_hw）→ 新建 np.zeros((H,W,Z)) 按 z 索引赋值拼回整卷
+      # → **按 pad_offset 裁回原始面内尺寸**（居中补边时内容不在原点，不能写死 [:H,:W]）。
+      # pad_offset 的来源：ds.pad_offset_of_case(case) 或 collate 出来的 batch["pad_offset"]。
     def seg_prob_to_label(prob, thr=0.5) -> uint8
   src/postprocess.py：
     def remove_small_lesions(binary3d, min_voxels, spacing) -> (cleaned, n_removed, removed_mm3)
@@ -125,6 +132,7 @@ CT 肝脏肿瘤分割 · 基础版（2D 闭环）后续编码计划
 --------------------------------------------------------
 1. 划分按病人，不按切片；data/splits.json 入库。
 2. 5 例仅肝脏只进训练集，用于约束假阳性。
-3. 重采样到 1mm 后不再对整图 resize；尺寸差异只靠分桶 + padding 到 16 的倍数处理。
+3. 重采样到 1mm 后不再对整图 resize；尺寸差异只靠**统一补边到 data.target_hw（512×512）**处理
+   （补边偏移 pad_offset 要一路带到推理，裁回原始尺寸时用它）。
 4. 每折划分、随机种子、指标口径写入产物，保证跨轮可复现。
 5. 代码只写、不本地执行；需要远程执行时先提交再给命令；产物路径一律相对仓库根。

@@ -48,6 +48,16 @@ temp/
 *.tmp
 *.bak
 probe_report.txt
+# 本地离线自检（_selftest.py）造的假 cache，不是真实数据，但也别入库
+_selftest_cache*/
+_selftest_out.txt
+
+# ===== 本地临时工具（不入库，本轮结束后由用户删除）=====
+# 只用来在本地（没有 torch / nibabel 真包、没有数据）离线跑逻辑断言与 AST 检查，
+# 与 src/ 的实际运行无关；远程平台不需要它们。
+_selftest.py
+_static_check.py
+_stubs/
 
 # ===== 编辑器与 IDE =====
 .vscode/

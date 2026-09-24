@@ -5,19 +5,30 @@
        自实现，本脚本与 src/dataset.py 都不依赖它）；核对 ``data/splits.json``、
        ``cache/cache_manifest.json`` 是否存在，清单里的预处理指纹是否与当前配置一致；
     2. 数据集形态：``CTSliceDataset``（train / val 两侧）的病例数、切片数、含肿瘤切片比例、
-       面内尺寸分桶明细，以及每例的 ``nz`` / 含肿瘤层数 / 桶键；
-    3. 3 个 batch 的实测：image/label 的 shape、dtype、值域、label 取值集合、
-       **batch 内实测肿瘤切片比例**、batch 的桶键与病例构成、单 batch 耗时、CUDA 显存；
+       原始面内尺寸分布与补边占比，以及每例的 ``nz`` / 含肿瘤层数 / 原始尺寸；
+    3. 3 个 batch 的实测：image/label 的 shape（应恒为 ``(B,1,512,512)`` / ``(B,512,512)``）、
+       dtype、值域、label 取值集合、**batch 内实测肿瘤切片比例**、batch 的病例构成、
+       取 batch 耗时、CUDA 显存；
     4. 切片轴校验：对指定病例打印逐层肿瘤体素数曲线（含 ASCII 直方图）与「首尾各 10% 层的
        阳性占比」，切片轴若被搞反，曲线会贴到某一端而不是集中在中间层；
-    5. 增强自检：随机抽若干样本做「同一 idx 分别用 无增强/增强」的对比，确认形状不变、
-       label 仍是 {0,1}、image 仍在 [0,1]，并给出被改动的样本比例；
-    6. 采样器自检：同一 epoch 用同一 seed 采样两次必须完全一致（可复现），并统计
-       正/负切片对 batch 的覆盖情况。
+    5. 增强自检：分「含肿瘤组 / 全背景组」抽样做「无增强 vs 有增强」对比，确认形状不变、
+       label 仍是 {0,1}、image 仍在 [0,1]，且含肿瘤组的 label 真的被改动过；
+    6. 采样器自检：同一 epoch 用同一 seed 采样两次必须完全一致（可复现）、相邻 epoch 必须不同、
+       一轮覆盖每一层切片、每个阳性层恰好出现一次。
+
+判阈值的口径（旧版在这里误报过，别改回去）：
+    * 训练侧每个 batch 的阳性数按**采样器自己的均摊计划**判区间（``batch_targets()`` 的
+      ``floor``~``observed_max``），不是拿 ``train.pos_ratio_target`` 直接当阈值——
+      阳性层稀少时每批放不满是设计取舍；
+    * **验证侧不判阳性数**：val loader 是顺序读、不做过采样，某个 batch 恰好落在「前 8 层无肿瘤」的
+      病例上（如 case 33）就是正常现象。旧版把训练侧的预算套到 val batch 上，于是误报
+      「阳性切片 0 超出该桶预算 [1,2]」。
+    * 比较 image 与 label 的空间维要**错开一个通道维**（``image (B,1,H,W)`` vs ``label (B,H,W)``）。
 
 前后接口：上游是 scripts/preprocess.py 的产物（cache/ + cache_manifest.json）与 data/splits.json；
         下游是 src/train.py（第 3 轮）——本脚本通过后再往上搭训练。
 用法：仓库根目录执行 ``python -m src.selfcheck_data``（默认 fold 0、3 个 batch）。
+     想核对某个特定病例的切片轴（它不在当前折里也行）：``--probe-case 56``。
      产物 reports/selfcheck_data.json 在远程（不入库），把终端输出贴回本地即可。
 """
 
@@ -36,23 +47,23 @@ try:
     from src.dataset import (
         UINT16_SCALE,
         BinarizeLabel,
-        BucketBatchSampler,
         CTSliceDataset,
         ClampImageToUnit,
         FlipSlice2D,
         GammaSlice2D,
         GaussianNoiseSlice2D,
         GridAffine2D,
+        ProportionalBatchSampler,
         RandAffineSlice2D,
         Rotate90Slice2D,
-        bucket_key,
         build_transforms,
         data_config,
-        format_bucket,
+        format_hw,
         make_augment_steps,
         make_train_loader,
         make_val_loader,
         open_volume,
+        pad_offset_of,
         reset_open_cache,
     )
     from src.utils import (
@@ -69,23 +80,23 @@ except ModuleNotFoundError:  # pragma: no cover - 兜底：把仓库根塞进 sy
     from src.dataset import (  # type: ignore
         UINT16_SCALE,
         BinarizeLabel,
-        BucketBatchSampler,
         CTSliceDataset,
         ClampImageToUnit,
         FlipSlice2D,
         GammaSlice2D,
         GaussianNoiseSlice2D,
         GridAffine2D,
+        ProportionalBatchSampler,
         RandAffineSlice2D,
         Rotate90Slice2D,
-        bucket_key,
         build_transforms,
         data_config,
-        format_bucket,
+        format_hw,
         make_augment_steps,
         make_train_loader,
         make_val_loader,
         open_volume,
+        pad_offset_of,
         reset_open_cache,
     )
     from src.utils import (  # type: ignore
@@ -179,117 +190,140 @@ def check_prerequisites(cfg: dict) -> tuple:
                             f"缓存可能来自不同的预处理参数，需要重跑 preprocess.py")
         agg = manifest.get("aggregate") or {}
         if agg:
-            LOGGER.info("清单汇总：面内尺寸 %s；分桶 %s；切片数 %s-%s；含肿瘤切片 %s/%s = %.4f",
-                        agg.get("inplane_shapes"), agg.get("size_buckets"),
-                        agg.get("n_slices_min"), agg.get("n_slices_max"),
+            shapes = agg.get("inplane_shapes") or {}
+            LOGGER.info("清单汇总：原始面内尺寸 %s（%d 种）；切片数 %s-%s；含肿瘤切片 %s/%s = %.4f",
+                        shapes, len(shapes), agg.get("n_slices_min"), agg.get("n_slices_max"),
                         agg.get("tumor_slices"), agg.get("total_slices"),
                         float(agg.get("tumor_slice_ratio_overall") or 0.0))
     return splits, manifest, problems
 
 
-def check_bucket_consistency(ds: CTSliceDataset, manifest: dict, problems: list) -> None:
-    """核对分桶口径：桶键 = **精确面内尺寸**，并由清单的逐例尺寸独立复算一遍。
+def check_inplane_consistency(ds: CTSliceDataset, manifest: dict, problems: list) -> None:
+    """核对**原始面内尺寸**与补边口径：逐例尺寸必须与清单一致，且不能超过 ``data.target_hw``。
 
-    为什么不用清单里的 ``aggregate.size_buckets`` 直接比：那是「对齐 ``pad_to_multiple`` 之后」
-    的汇总（例如把 342×342 与 351×351 都算进 ``352x352``），而**能同 batch 的充要条件是精确尺寸相同**
-    （``torch.stack`` 要求形状逐元素一致）。所以这里用清单的逐例 ``inplane_hw`` 复算出
-    「精确尺寸 → 例数」来交叉验证，同时把对齐后的桶也打印出来供参考。
+    已废弃的口径（别改回去）：早期版本按「对齐 ``pad_multiple`` 之后」的尺寸分桶，要求同 batch
+    精确同尺寸；现在统一补边到 ``data.target_hw``，分桶概念整条链路都不存在了。
+    这里只做两件事：用清单的逐例 ``inplane_hw`` 交叉验证数据集读到的尺寸，并把补边占比列出来
+    （补边区的像素是白算的，第 3 轮 loss 可考虑忽略）。
     """
     cases = (manifest or {}).get("cases") or []
     if not cases:
         return
     by_case = {int(r["case"]): r for r in cases if "case" in r}
-    expected: dict = {}
-    padded: dict = {}
-    mult = max(1, int(ds.pad_multiple))
+    mismatch: list = []
     for case in ds.case_ids:
         rec = by_case.get(int(case))
         if not rec:
             continue
-        height, width = (int(x) for x in rec["inplane_hw"])
-        expected[(height, width)] = expected.get((height, width), 0) + 1
-        pkey = (int(math.ceil(height / mult) * mult), int(math.ceil(width / mult) * mult))
-        padded[pkey] = padded.get(pkey, 0) + 1
-    mine = {tuple(k): len({ds.index[i][0] for i in v}) for k, v in ds.buckets.items()}
-    if dict(mine) != {k: v for k, v in expected.items() if v}:
-        problems.append(f"分桶与清单逐例尺寸不一致：本数据集 {dict(sorted(mine.items()))} "
-                        f"vs 清单复算 {dict(sorted(expected.items()))}")
+        recorded = tuple(int(x) for x in rec["inplane_hw"])
+        if recorded != tuple(ds.case_hw[int(case)]):
+            mismatch.append(f"case {case}：{tuple(ds.case_hw[int(case)])} vs 清单 {recorded}")
+    if mismatch:
+        problems.append(f"原始面内尺寸与清单逐例不一致（{len(mismatch)} 例）：{mismatch[:5]}")
     else:
-        LOGGER.info("分桶（精确尺寸）与清单逐例尺寸一致：%s", dict(sorted(mine.items())))
-    LOGGER.info("对齐 pad_multiple=%d 后的桶（仅用于模型内部 padding，**不参与分桶**）：%s",
-                mult, dict(sorted(padded.items())))
+        LOGGER.info("原始面内尺寸与清单逐例一致（%d 例）：%s", len(ds.case_ids),
+                    {format_hw(k): v["n_cases"] for k, v in sorted(ds.inplane_stats().items())})
+    over = [c for c in ds.case_ids
+            if ds.case_hw[int(c)][0] > ds.target_hw[0] or ds.case_hw[int(c)][1] > ds.target_hw[1]]
+    if over:
+        problems.append(f"这些病例的面内尺寸超过 data.target_hw {format_hw(ds.target_hw)}：{over}")
+    LOGGER.info("补边口径：统一补到 %s（%s）；逐种原始尺寸的补边像素占比 %s",
+                format_hw(ds.target_hw), ds.pad_align,
+                {format_hw(k): f"{v['pad_fraction']:.1%}" for k, v in sorted(ds.inplane_stats().items())})
 
 
 # --------------------------------------------------------------------------------------
 # batch 实测
 # --------------------------------------------------------------------------------------
 
-def sampler_budgets(ds: CTSliceDataset, cfg: dict) -> dict:
-    """构造一个采样器（不读任何切片）并取逐桶阳性预算，供 batch 自检判阈值用。"""
+def make_sampler(ds: CTSliceDataset, cfg: dict) -> ProportionalBatchSampler:
+    """按配置构造一个采样器（不读任何切片），供自检判阈值与复现采样顺序。"""
     train_cfg = (cfg or {}).get("train") or {}
-    sampler = BucketBatchSampler(ds,
-                                 batch_size=int(train_cfg.get("batch_size", 8)),
-                                 pos_ratio_target=float(train_cfg.get("pos_ratio_target", 0.30)),
-                                 seed=int(train_cfg.get("seed", 42)),
-                                 min_pos_per_batch=int(data_config(cfg).get("min_pos_per_batch", 1)))
-    return sampler.bucket_budgets()
+    return ProportionalBatchSampler(ds,
+                                    batch_size=int(train_cfg.get("batch_size", 8)),
+                                    pos_ratio_target=float(train_cfg.get("pos_ratio_target", 0.30)),
+                                    seed=int(train_cfg.get("seed", 42)))
 
 
 def describe_batch(batch: dict) -> dict:
     """汇总一个 batch 的形态信息（不落盘，供打印与报告使用）。
 
     取值依据 ``src.dataset.collate_samples`` 定义的 batch 契约：
-    ``image``/``label`` 是张量，``case``/``z``/``orig_hw`` 是长度 B 的 list
-    （``orig_hw`` 是 tuple 列表，**不是**被转置的两行列表——默认 collate 会踩这个坑）。
+    ``image``/``label`` 是张量，``case``/``z``/``orig_hw``/``pad_offset`` 是长度 B 的 list
+    （``orig_hw`` / ``pad_offset`` 是 tuple 列表，**不是**被转置的两行列表——默认 collate 会踩这个坑）。
+
+    统计一律先 ``.numpy()`` 再算：张量的逐元素比较/归约在本地 stubs 里没有实现，
+    而 numpy 侧本来就够用（形状、值域、取值集合）。
     """
     image, label = batch["image"], batch["label"]
-    cases = sorted(set(batch["case"]))
-    per_sample_ratio = [float((label[i] > 0).float().mean()) for i in range(label.shape[0])]
+    img = np.asarray(image.numpy(), dtype=np.float32)
+    lab = np.asarray(label.numpy())
+    target_h, target_w = (int(img.shape[-2]), int(img.shape[-1]))
+    per_sample_ratio = [float((lab[i] > 0).mean()) for i in range(lab.shape[0])]
+    per_sample_pos = [bool((lab[i] > 0).any()) for i in range(lab.shape[0])]
+    per_sample_pad = [
+        1.0 - (int(hw[0]) * int(hw[1])) / float(max(1, target_h * target_w)) for hw in batch["orig_hw"]
+    ]
     return {
         "batch_size": int(image.shape[0]),
         "image_shape": [int(s) for s in image.shape],
         "label_shape": [int(s) for s in label.shape],
         "image_dtype": str(image.dtype),
         "label_dtype": str(label.dtype),
-        "image_min": round(float(image.min()), 6),
-        "image_max": round(float(image.max()), 6),
-        "label_values": sorted(int(v) for v in np.unique(label.numpy()).tolist()),
-        "cases": cases,
+        "image_min": round(float(img.min()), 6),
+        "image_max": round(float(img.max()), 6),
+        "label_values": sorted(int(v) for v in np.unique(lab).tolist()),
+        "cases": sorted(set(batch["case"])),
         "z": [int(z) for z in batch["z"]],
         "orig_hw": [[int(hw[0]), int(hw[1])] for hw in batch["orig_hw"]],
-        "pos_slices_in_batch": int(sum(1 for i in range(label.shape[0]) if bool((label[i] > 0).any()))),
-        "pos_ratio_measured": round(
-            float(sum(1 for i in range(label.shape[0]) if bool((label[i] > 0).any())) / max(1, image.shape[0])), 4),
+        "pad_offset": [[int(o[0]), int(o[1])] for o in batch["pad_offset"]],
+        "pos_slices_in_batch": int(sum(1 for v in per_sample_pos if v)),
+        "pos_ratio_measured": round(float(sum(1 for v in per_sample_pos if v) / max(1, img.shape[0])), 4),
         "pos_pixels_per_slice": [round(v, 6) for v in per_sample_ratio],
-        "bucket": format_bucket(bucket_key(int(image.shape[2]), int(image.shape[3]))),
+        # 补边区在 batch 里占的像素比例（居中补边；512 病例为 0）——第 3 轮 loss 是否忽略它看这个数
+        "pad_fraction_mean": round(float(np.mean(per_sample_pad)) if per_sample_pad else 0.0, 6),
+        "n_padded_samples": int(sum(1 for v in per_sample_pad if v > 0)),
     }
 
 
-def check_batch(idx: int, batch: dict, problems: list, tolerance: dict) -> dict:
-    """校验一个 batch：尺寸一致、值域、label 取值、阳性比例，返回汇总 dict。
+def check_batch(idx: int, batch: dict, problems: list, tolerance: dict, tag: str = "train",
+                sampler: "ProportionalBatchSampler | None" = None) -> dict:
+    """校验一个 batch：形状契约、值域、label 取值，以及（**仅训练侧**）阳性数区间。
 
-    阳性比例的判据是**该桶的可达目标**（``tolerance['per_bucket'][桶]['expect']``）而不是配置里的
-    0.30：病灶层稀少的桶为了「一轮覆盖每一层」只能降低比例，这是设计上的取舍而非缺陷。
+    阳性数只在训练侧判，区间取采样器自己的均摊计划（``batch_targets()`` 的 floor~observed_max）：
+    阳性层稀少时每批放不满是「一轮覆盖每一层」的取舍，不是缺陷。
+    **验证侧不判阳性数**——val loader 顺序读、不做过采样，某个 batch 恰好落在病例前几层
+    无肿瘤（如 case 33 的前 8 层）本来就是正常的；旧版拿训练侧的桶预算去判 val batch，
+    于是误报「阳性切片 0 超出该桶预算 [1,2]」。
     """
     info = describe_batch(batch)
     image, label = batch["image"], batch["label"]
     n = int(image.shape[0])
 
-    # 1) 同 batch 内尺寸必须一致（分桶采样器的硬约束）
+    # 1) 形状契约：所有样本补边到同一个 target_hw，因此同 batch 内必然逐像素一致
     shapes = {tuple(int(s) for s in image[i].shape) for i in range(n)}
     if len(shapes) != 1:
-        problems.append(f"batch {idx}：同 batch 内 image 尺寸不一致 {sorted(shapes)}（分桶失效）")
+        problems.append(f"batch {idx}：同 batch 内 image 尺寸不一致 {sorted(shapes)}"
+                        f"（补边失效：所有样本都应补到 data.target_hw）")
     # image 是 (B,1,H,W)、label 是 (B,H,W)：比较空间维时要错开一个通道维
     if tuple(image.shape[2:]) != tuple(label.shape[1:]) or int(image.shape[0]) != int(label.shape[0]):
         problems.append(f"batch {idx}：image {tuple(image.shape)} 与 label {tuple(label.shape)} 空间维不匹配"
                         f"（期望 image (B,1,H,W) / label (B,H,W)）")
     if int(image.shape[1]) != 1:
         problems.append(f"batch {idx}：image 通道维是 {int(image.shape[1])}，期望 1")
-    if info["bucket"] != format_bucket(bucket_key(int(image.shape[2]), int(image.shape[3]))):
-        problems.append(f"batch {idx}：桶键与 shape 不符")
-    if any(tuple(hw) != (int(image.shape[2]), int(image.shape[3])) for hw in info["orig_hw"]):
-        problems.append(f"batch {idx}：orig_hw {info['orig_hw']} 与张量形状 "
-                        f"{(int(image.shape[2]), int(image.shape[3]))} 不一致")
+    expect_hw = tuple(int(v) for v in tolerance["target_hw"])
+    if tuple(image.shape[2:]) != expect_hw:
+        problems.append(f"batch {idx}：image 空间维 {tuple(image.shape[2:])} != data.target_hw "
+                        f"{format_hw(expect_hw)}（补边口径不对）")
+    bad_orig = [hw for hw in info["orig_hw"] if hw[0] > expect_hw[0] or hw[1] > expect_hw[1]]
+    if bad_orig:
+        problems.append(f"batch {idx}：orig_hw {bad_orig} 超过 target_hw {format_hw(expect_hw)}")
+    # 补边偏移必须与 orig_hw、张量形状自洽（第 4 轮裁回原始尺寸就用它）
+    for orig, offset in zip(info["orig_hw"], info["pad_offset"]):
+        if tuple(offset) != pad_offset_of(orig, expect_hw):
+            problems.append(f"batch {idx}：orig_hw {orig} 的 pad_offset {offset} 与推导值 "
+                            f"{pad_offset_of(orig, expect_hw)} 不一致")
+            break
 
     # 2) 值域与标签取值
     if info["image_min"] < -1e-6 or info["image_max"] > 1.0 + 1e-6:
@@ -302,34 +336,39 @@ def check_batch(idx: int, batch: dict, problems: list, tolerance: dict) -> dict:
     if info["label_dtype"] not in ("torch.int64", "torch.int32"):
         problems.append(f"batch {idx}：label dtype={info['label_dtype']}，期望整型")
 
-    # 3) 每批阳性数：应落在该桶的 [floor, ideal] 区间内（见 BucketBatchSampler.bucket_budget）
-    key = bucket_key(int(image.shape[2]), int(image.shape[3]))
-    budget = tolerance.get("per_bucket", {}).get(key)
-    got = int(info["pos_slices_in_batch"])
-    if budget is not None:
-        lo, hi = int(budget["floor"]), int(budget["ideal"])
-        if not (lo <= got <= hi):
-            problems.append(f"batch {idx}（桶 {info['bucket']}）：阳性切片 {got} 超出该桶预算 "
-                            f"[{lo}, {hi}]（该桶 {budget['pos_slices']} 个阳性层 / {budget['batches']} 个 batch）")
-        elif got < hi:
-            LOGGER.info("        注：桶 %s 本轮只能给出 %d 正/批（目标 %d），本批 %d 属预期",
-                        info["bucket"], budget["expect"], hi, got)
+    # 3) 阳性数：**仅训练侧**按采样器的均摊计划判区间（val 侧不判，见 docstring）
+    if sampler is not None and str(tag).startswith("train"):
+        targets = sampler.batch_targets()
+        lo, hi = int(targets["floor"]), int(targets["observed_max"])
+        got = int(info["pos_slices_in_batch"])
+        if not lo <= got <= hi:
+            problems.append(f"batch {idx}：阳性切片 {got} 超出采样器计划区间 [{lo}, {hi}]"
+                            f"（数据集阳性 {targets['pos_slices']} 层 / 一轮 {targets['batches']} 个 batch）")
+        elif got < int(targets["ideal"]):
+            LOGGER.info("        注：本轮每批阳性数在 %d~%d 之间（理想 %d），本批 %d 属预期——"
+                        "阳性层被均摊到整轮，避免把阳性堆在前几批",
+                        lo, hi, targets["ideal"], got)
 
-    LOGGER.info("batch %d：image %s / label %s；桶 %s；病例 %s；z=%s",
+    LOGGER.info("batch %d：image %s / label %s；病例 %s；z=%s",
                 idx, tuple(info["image_shape"]), tuple(info["label_shape"]),
-                info["bucket"], info["cases"], info["z"])
+                info["cases"], info["z"])
     LOGGER.info("        值域 [%.4f, %.4f]；label 取值 %s；**含肿瘤切片 %d/%d = %.3f**（配置目标 %.2f）；"
-                "orig_hw %s；取该 batch 耗时见下一行",
+                "补边样本 %d/%d（补边像素均值 %.1f%%）",
                 info["image_min"], info["image_max"], info["label_values"],
                 info["pos_slices_in_batch"], info["batch_size"], info["pos_ratio_measured"],
-                tolerance["target"], info["orig_hw"][:3] + (["..."] if len(info["orig_hw"]) > 3 else []))
+                tolerance["target"], info["n_padded_samples"], info["batch_size"],
+                100.0 * info["pad_fraction_mean"])
+    LOGGER.info("        orig_hw %s；补边偏移 %s",
+                info["orig_hw"][:3] + (["..."] if len(info["orig_hw"]) > 3 else []),
+                info["pad_offset"][:3] + (["..."] if len(info["pad_offset"]) > 3 else []))
     return info
 
 
 def run_batches(loader, n_batches: int, tolerance: dict, problems: list, tag: str,
-                max_batches: int = 0) -> list:
+                max_batches: int = 0, sampler=None) -> list:
     """从 loader 依次取 ``n_batches`` 个 batch，逐个自检并计时。
 
+    ``sampler`` 只在训练侧传：传了才判「阳性数落在采样器计划区间内」，验证侧不判（见 ``check_batch``）。
     ``max_batches>0`` 时只统计前面若干个 batch 的平均耗时（第一个 batch 含冷读，单独报）。
     """
     infos: list = []
@@ -346,7 +385,7 @@ def run_batches(loader, n_batches: int, tolerance: dict, problems: list, tag: st
             break
         dt = time.perf_counter() - t0
         times.append(dt)
-        info = check_batch(i, batch, problems, tolerance)
+        info = check_batch(i, batch, problems, tolerance, tag=tag, sampler=sampler)
         info["seconds"] = round(dt, 4)
         infos.append(info)
         LOGGER.info("        取该 batch 耗时 %.3f s%s", dt, "（含首次冷读）" if i == 1 else "")
@@ -759,85 +798,109 @@ def check_augment_pipeline(cfg: dict, problems: list) -> dict:
 
 
 def check_sampler(ds: CTSliceDataset, cfg: dict, problems: list) -> dict:
-    """采样器自检：批数与配额、正/负覆盖、可复现性。
+    """采样器自检：batch 数/大小、阳性覆盖、切片覆盖、可复现性。
 
     可复现性的正确口径（这里踩过坑）：
       * **同一个 epoch 用同一个 seed 必须完全一致** → 用两个**新建的**采样器各跑一次比较；
       * **相邻 epoch 必须不同**（否则过采样会退化成每轮固定同一顺序）→ 同一采样器连续两轮比较。
 
     早期版本直接把「同一个采样器连续迭代两次」当成可复现性检查，但那两次是 epoch 1 与 epoch 2，
-    种子本来就不同（`_seed_for_epoch(1) != _seed_for_epoch(2)`），于是把一个**正常**行为报成了
+    种子本来就不同（``_seed_for_epoch(1) != _seed_for_epoch(2)``），于是把一个**正常**行为报成了
     「采样器不可复现」。
+
+    另外两条断言按新口径（统一补边、单一池）写：
+      * 每个 batch 的形状恒为 ``batch_size``，且形状集合只有一个（=补边后的固定尺寸）；
+      * 一轮内**每个阳性层恰好出现一次**、**每层切片至少出现一次**——这是「阳性均摊 + 阴性轮转池」
+        两件事共同保证的，写错任何一处都会在这里露出来。
     """
     train_cfg = (cfg or {}).get("train") or {}
     kwargs = dict(batch_size=int(train_cfg.get("batch_size", 8)),
                   pos_ratio_target=float(train_cfg.get("pos_ratio_target", 0.30)),
                   seed=int(train_cfg.get("seed", 42)))
-    sampler = BucketBatchSampler(ds, **kwargs)
+    sampler = ProportionalBatchSampler(ds, **kwargs)
     LOGGER.info("%s", sampler.describe())
 
     # 1) 可复现性：两个新建采样器的 epoch 1 必须逐 batch 相同
-    run_a = [list(b) for b in BucketBatchSampler(ds, **kwargs)]
-    run_b = [list(b) for b in BucketBatchSampler(ds, **kwargs)]
+    run_a = [list(b) for b in ProportionalBatchSampler(ds, **kwargs)]
+    run_b = [list(b) for b in ProportionalBatchSampler(ds, **kwargs)]
     reproducible = bool(run_a == run_b)
     # 2) 相邻 epoch 应当不同（同一 sampler 连续两轮）
     run_e1 = [list(b) for b in sampler]
     run_e2 = [list(b) for b in sampler]
     epochs_differ = bool(run_e1 != run_e2)
 
+    targets = sampler.batch_targets()
     n_batches = len(run_a)
+    # 3) 覆盖与阳性数
+    drawn = [i for b in run_a for i in b]
+    pos_indices = set(np.flatnonzero(np.asarray(ds.pos_flags)).tolist())
+    drawn_pos = [i for i in drawn if i in pos_indices]
+    covered = set(drawn)
+    size_bad = sorted({len(b) for b in run_a} - {sampler.batch_size})
+    empty_batches = sum(1 for b in run_a if not any(i in pos_indices for i in b))
+    # 期望 batch 数 = 切片覆盖 / 阳性槽位 / 阴性槽位 三个下界的最大值
+    # （**不能**只按切片数算：阳性多、batch 大时阳性槽位才是上界）
+    n_pos_slices = int(ds.n_positive)
+    n_neg_slices = int(ds.n_negative)
+    n_pos_per_batch = max(1, int(targets["ideal"]))
+    expect_batches = max(
+        math.ceil(len(ds) / max(1, sampler.batch_size)),
+        math.ceil(n_pos_slices / n_pos_per_batch) if n_pos_slices else 0,
+        math.ceil(n_neg_slices / max(1, sampler.batch_size - n_pos_per_batch))
+        if (n_neg_slices and sampler.batch_size - n_pos_per_batch > 0) else 0,
+    )
     info = {
         "n_batches_per_epoch": n_batches,
-        "expected_batches": round(len(ds) / max(1, sampler.batch_size), 2),
+        "expected_batches": int(expect_batches),
+        "slices_per_batch_size": round(len(ds) / max(1, sampler.batch_size), 2),
         "reproducible_same_epoch": reproducible,
         "adjacent_epochs_differ": epochs_differ,
         "epoch1_seed": sampler.epoch_seed(1),
         "epoch2_seed": sampler.epoch_seed(2),
-        "n_pos": sampler.bucket_counts and int(sum(v[0] for v in sampler.bucket_counts.values())),
-        "n_neg": sampler.bucket_counts and int(sum(v[1] for v in sampler.bucket_counts.values())),
+        "pos_per_batch_ideal": int(targets["ideal"]),
+        "pos_per_batch_floor": int(targets["floor"]),
+        "pos_per_batch_max": int(targets["observed_max"]),
+        "n_pos": n_pos_slices,
+        "n_neg": n_neg_slices,
+        "pos_drawn_total": len(drawn_pos),
+        "pos_drawn_unique": len(set(drawn_pos)),
+        "slices_covered": len(covered),
+        "slices_total": len(ds),
+        "batch_sizes_out_of_spec": size_bad,
+        "all_negative_batches": int(empty_batches),
     }
     if not reproducible:
         detail = f"两个采样器的 batch 数不同：{len(run_a)} vs {len(run_b)}"
         if len(run_a) == len(run_b):
             for k, (x, y) in enumerate(zip(run_a, run_b), 1):
                 if x != y:
-                    detail = (f"首个不同的 batch 是第 {k} 个：run1={x}（形状 "
-                              f"{[ds.case_hw[ds.index[i][0]] for i in x]}） run2={y}（形状 "
-                              f"{[ds.case_hw[ds.index[i][0]] for i in y]}）")
+                    detail = f"首个不同的 batch 是第 {k} 个：run1={x} run2={y}"
                     break
         problems.append(f"同一 epoch 两次采样结果不同（采样器不可复现）：{detail}")
         LOGGER.error("采样器不可复现的细节：%s", detail)
     if not epochs_differ:
         problems.append("相邻两个 epoch 的采样顺序完全相同：过采样会退化成每轮固定同一批样本"
                         f"（epoch1_seed={sampler.epoch_seed(1)} epoch2_seed={sampler.epoch_seed(2)}）")
-
-    # 逐 batch 校验：尺寸一致 + 阳性数落在该桶预算区间（预算要按**桶键**取，不是原始 (H,W)）
-    bad_sizes = 0
-    bad_pos = 0
-    first_bad_size = ""
-    for k, batch in enumerate(run_a, 1):
-        sizes = {ds.case_hw[ds.index[i][0]] for i in batch}
-        if len(sizes) != 1:
-            bad_sizes += 1
-            if not first_bad_size:
-                first_bad_size = f"第 {k} 个 batch：索引 {batch} → 形状 {sorted(sizes)}"
-        key = ds.bucket_of_case(ds.index[batch[0]][0])
-        got = int(ds.pos_flags[batch].sum())
-        budget = sampler.bucket_budget(key)
-        if not (int(budget["floor"]) <= got <= int(budget["ideal"])):
-            bad_pos += 1
-    info["batches_with_mixed_sizes"] = bad_sizes
-    info["batches_out_of_budget"] = bad_pos
-    if bad_sizes:
-        problems.append(f"{bad_sizes}/{n_batches} 个 batch 混了不同面内尺寸（分桶失效）：{first_bad_size}")
-    if bad_pos:
-        problems.append(f"{bad_pos}/{n_batches} 个 batch 的阳性切片数落在该桶预算区间之外")
-    empty_total = sum(b["empty_batches"] for b in sampler.bucket_budgets().values())
-    info["empty_batches_expected"] = empty_total
-    LOGGER.info("采样器自检：每轮 %d 个 batch（期望约 %.1f）；同 epoch 可复现=%s；相邻 epoch 不同=%s；"
-                "混尺寸 batch=%d；阳性数越界 batch=%d；预算内全阴性 batch=%d",
-                n_batches, info["expected_batches"], reproducible, epochs_differ,
-                bad_sizes, bad_pos, empty_total)
+    if size_bad:
+        problems.append(f"有 batch 的大小不等于 batch_size={sampler.batch_size}：出现 {size_bad}"
+                        f"（池子够大时不该发生）")
+    if n_batches != expect_batches:
+        problems.append(f"一轮 batch 数 {n_batches} 与预期下限 {expect_batches} 不符"
+                        f"（切片覆盖 ceil({len(ds)}/{sampler.batch_size})、阳性槽位 "
+                        f"ceil({n_pos_slices}/{n_pos_per_batch})、阴性槽位三者取最大）")
+    if len(set(drawn_pos)) != len(pos_indices) or len(drawn_pos) != len(pos_indices):
+        problems.append(f"阳性层覆盖不对：本轮抽到 {len(drawn_pos)} 次 / 去重 {len(set(drawn_pos))} 个，"
+                        f"数据集共 {len(pos_indices)} 个阳性层（每个阳性层应恰好出现一次）")
+    if len(covered) != len(ds):
+        missing = sorted(set(range(len(ds))) - covered)[:5]
+        problems.append(f"一轮没有覆盖全部切片：覆盖 {len(covered)}/{len(ds)}，缺 {len(ds) - len(covered)}"
+                        f" 层（前几个缺失索引 {missing}）")
+    LOGGER.info("采样器自检：每轮 %d 个 batch（预期下限 %d；切片数/batch_size ≈ %.1f）；同 epoch 可复现=%s；"
+                "相邻 epoch 不同=%s；batch 大小越界=%d 种；阳性层抽到 %d 次/去重 %d 个（共 %d）；"
+                "覆盖切片 %d/%d；全阴性 batch=%d",
+                n_batches, expect_batches, info["slices_per_batch_size"], reproducible, epochs_differ,
+                len(size_bad), len(drawn_pos), len(set(drawn_pos)), len(pos_indices),
+                len(covered), len(ds), empty_batches)
     return info
 
 
@@ -869,7 +932,8 @@ def main(argv=None) -> int:
     problems: list = []
 
     LOGGER.info("=" * 78)
-    LOGGER.info("第 2 轮数据自检：Dataset + 分桶采样器 + 增强（fold=%d）", int(args.fold))
+    LOGGER.info("第 2 轮数据自检：Dataset（统一补边到 %s）+ 采样器 + 增强（fold=%d）",
+                format_hw(data_cfg["target_hw"]), int(args.fold))
     LOGGER.info("=" * 78)
 
     env = check_environment()
@@ -878,17 +942,19 @@ def main(argv=None) -> int:
 
     # ---- 数据集 ----
     LOGGER.info("-" * 78)
-    LOGGER.info("1) 构建数据集（train 侧带增强、val 侧无增强）")
+    LOGGER.info("1) 构建数据集（train 侧带增强、val 侧无增强；两侧都补边到 %s）",
+                format_hw(data_cfg["target_hw"]))
     train_ds = CTSliceDataset("train", cache_dir, "train", cfg, augment=True,
                               debug=True, fold=int(args.fold))
     val_ds = CTSliceDataset("val", cache_dir, "val", cfg, augment=False, fold=int(args.fold))
     LOGGER.info("\n%s", train_ds.describe())
     LOGGER.info("\n%s", val_ds.describe())
-    check_bucket_consistency(train_ds, manifest, problems)
+    check_inplane_consistency(train_ds, manifest, problems)
 
     tolerance = {
         "target": float(train_cfg.get("pos_ratio_target", 0.30)),
-        "limit": float(data_cfg.get("pos_ratio_tolerance", 0.10)),
+        "limit": float(data_cfg.get("pos_ratio_tolerance", 0.20)),
+        "target_hw": tuple(int(v) for v in train_ds.target_hw),
     }
     LOGGER.info("整体阳性率：train 侧 %.4f（%d/%d），val 侧 %.4f（%d/%d）；"
                 "目标 batch 内比例 %.2f（≈ %.1f 倍过采样）",
@@ -899,24 +965,27 @@ def main(argv=None) -> int:
     # ---- 3 个 batch 实测 ----
     LOGGER.info("-" * 78)
     LOGGER.info("2) 实测 batch（第 1 个 batch 含冷读，耗时单独看）")
-    # 阳性比例的判据用「该桶可达目标」而不是全局 0.30：病灶层稀少的桶只能摊薄（见 bucket_budget）
-    tolerance["per_bucket"] = sampler_budgets(train_ds, cfg)
-    LOGGER.info("各桶可达阳性数/批：%s", {
-        format_bucket(k): f"理想 {v['ideal']} / 可达 {v['expect']}（floor {v['floor']}，"
-                          f"{v['pos_slices']} 个阳性层摊到 {v['batches']} 个 batch）"
-        for k, v in tolerance["per_bucket"].items()})
+    # 阳性数的判据是**采样器自己的均摊计划**，不是配置里的 0.30：见 ProportionalBatchSampler
+    train_sampler = make_sampler(train_ds, cfg)
+    targets = train_sampler.batch_targets()
+    LOGGER.info("训练侧可达阳性数/批：理想 %d / 本轮计划 %d~%d（%d 个阳性层摊到 %d 个 batch）；"
+                "计划前 12 批 = %s",
+                targets["ideal"], targets["floor"], targets["observed_max"],
+                targets["pos_slices"], targets["batches"], targets["plan_head"])
     train_loader = make_train_loader(splits, int(args.fold), cfg)
-    batch_infos = run_batches(train_loader, int(args.batches), tolerance, problems, tag="train")
+    batch_infos = run_batches(train_loader, int(args.batches), tolerance, problems, tag="train",
+                              sampler=train_sampler)
 
+    # 验证侧顺序读、不做过采样：**不判阳性数**（某个 batch 落在病例前几层无肿瘤是正常的）
     val_loader = make_val_loader(splits, int(args.fold), cfg)
     val_infos = run_batches(val_loader, min(2, int(args.batches)), tolerance, problems, tag="val")
-    if val_infos and any(info["pos_ratio_measured"] > 0 for info in val_infos):
+    if val_infos:
         LOGGER.info("提示：val 侧顺序读取，batch 内阳性比例天然接近整体比例（%.4f），"
-                    "不做过采样是正确行为。", val_ds.pos_ratio)
+                    "不做过采样也不判阳性数——出现全阴性 batch 是正常的。", val_ds.pos_ratio)
 
     if batch_infos:
         sizes = {tuple(info["image_shape"][2:]) for info in batch_infos}
-        LOGGER.info("%d 个 train batch 涉及 %d 种面内尺寸：%s（每个 batch 内部只有 1 种）",
+        LOGGER.info("%d 个 train batch 的空间维只有 %d 种：%s（统一补边后应恒为 1 种）",
                     len(batch_infos), len(sizes), sorted(sizes))
     if env.get("cuda_available"):
         import torch
@@ -928,8 +997,15 @@ def main(argv=None) -> int:
     # ---- 切片轴 ----
     LOGGER.info("-" * 78)
     LOGGER.info("3) 切片轴校验（逐层肿瘤体素数曲线）")
-    probe_case = pick_probe_case(train_ds, args.probe_case)
-    axis_info = check_slice_axis(train_ds, probe_case, manifest, problems)
+    # 用「全部 25 例」建一个数据集：这样 --probe-case 可以指定任意病例（它不一定在当前折里，
+    # 例如 case 56 在 fold 2 的 val 里）。曲线只看单例逐层体素数，与折划分无关。
+    probe_ds = CTSliceDataset("all", cache_dir, "all", cfg, augment=False)
+    probe_case = pick_probe_case(probe_ds, args.probe_case)
+    LOGGER.info("（曲线用病例 %d；它在 fold %d 的 %s 侧）", probe_case,
+                int(args.fold),
+                "train" if probe_case in train_ds.case_ids else
+                ("val" if probe_case in val_ds.case_ids else "其它折"))
+    axis_info = check_slice_axis(probe_ds, probe_case, manifest, problems)
 
     # ---- 增强 ----
     LOGGER.info("-" * 78)
@@ -944,11 +1020,11 @@ def main(argv=None) -> int:
     sampler_info = {}
     if not args.skip_sampler:
         LOGGER.info("-" * 78)
-        LOGGER.info("5) 分桶采样器自检")
+        LOGGER.info("5) 采样器自检（可复现性 / 阳性层覆盖 / 切片覆盖）")
         sampler_info = check_sampler(train_ds, cfg, problems)
 
     # ---- 收尾：评估是否可进入第 3 轮 ----
-    del train_loader, val_loader
+    del train_loader, val_loader, probe_ds
     reset_open_cache()
 
     report = {
@@ -963,13 +1039,13 @@ def main(argv=None) -> int:
             "n_positive": train_ds.n_positive,
             "pos_ratio": round(train_ds.pos_ratio, 6),
             "image_dtype": train_ds.image_dtype,
-            "pad_multiple": train_ds.pad_multiple,
-            "buckets": {format_bucket(k): v for k, v in train_ds.bucket_stats().items()},
+            "target_hw": list(train_ds.target_hw),
+            "pad_align": train_ds.pad_align,
+            "inplane": {format_hw(k): v for k, v in sorted(train_ds.inplane_stats().items())},
             "per_case": {str(c): {"nz": train_ds.case_n_slices[c],
                                   "pos_slices": train_ds.case_pos_slices[c],
-                                  "hw": list(train_ds.case_hw[c]),
-                                  "bucket": format_bucket(bucket_key(*train_ds.case_hw[c],
-                                                                    train_ds.pad_multiple))}
+                                  "orig_hw": list(train_ds.case_hw[c]),
+                                  "pad_offset": list(train_ds.pad_offset_of_case(c))}
                          for c in train_ds.case_ids},
         },
         "val_dataset": {
@@ -1001,7 +1077,7 @@ def main(argv=None) -> int:
         LOGGER.error("请把上面带 - 的行贴回本地，修好后再进入第 3 轮。")
         return 1
 
-    LOGGER.info("自检通过：%d 例 / %d 层切片的形态、值域、标签、分桶、增强与采样比例均符合约定。",
+    LOGGER.info("自检通过：%d 例 / %d 层切片的形态、值域、标签、补边、增强与采样比例均符合约定。",
                 len(train_ds.case_ids), len(train_ds))
     LOGGER.info("报告：%s（远程产物，不入库，贴回终端输出即可）", rel_to_root(report_path))
     LOGGER.info("下一步：第 3 轮 python -m src.train --fold %d --debug", int(args.fold))

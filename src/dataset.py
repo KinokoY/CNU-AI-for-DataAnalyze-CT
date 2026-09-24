@@ -1,16 +1,24 @@
-"""数据集与采样：按病例切片读 cache、按面内尺寸分桶、定向过采样肿瘤切片，并施加自实现的 2D 增强。
+"""数据集与采样：按病例切片读 cache、统一补边到固定尺寸、定向过采样肿瘤切片，并施加自实现的 2D 增强。
 
 整体功能：
     1. ``CTSliceDataset`` —— 一个样本 = 一个病人的一层切片。``__init__`` 只读 **label 体素**
        （用于算 ``pos_flags`` 与索引），**不读 image 体素**；``__getitem__`` 用每 worker 一份的
-       ``lru_cache`` 持有 nibabel 代理对象（``memmap=True``），只取 ``[:, :, z]`` 这一层。
-    2. ``make_batch_sampler`` —— 自定义 ``BatchSampler``：先按桶 ``(ceil(H/mult)*mult, ceil(W/mult)*mult)``
-       选桶（**同一 batch 内面内尺寸必然一致**），再在桶内定向抽 ``n_pos = round(batch_size*pos_ratio)``
-       个含肿瘤切片、其余抽不含肿瘤切片，使 batch 内肿瘤切片比例恒为 ``pos_ratio_target``。
-       不用裸 ``WeightedRandomSampler``：它的比例不可控，且不同面内尺寸无法同 batch。
-    3. ``make_train_loader`` / ``make_val_loader`` —— 训练侧分桶+增强+定向采样；验证侧顺序、无增强。
+       ``lru_cache`` 持有 nibabel 代理对象（``memmap=True``），只取 ``[:, :, z]`` 这一层，
+       归一化后把 image/label **居中补边到 ``data.target_hw``（默认 512×512）**。
+    2. ``ProportionalBatchSampler`` —— 单一池 + 定向抽样的 ``BatchSampler``：每个 batch 抽
+       ``n_pos = round(batch_size * pos_ratio_target)`` 个含肿瘤切片、其余抽不含肿瘤切片。
+       因为所有样本补边后都是同一个形状，``torch.stack`` 恒成立，**不再需要按面内尺寸分桶**。
+    3. ``make_train_loader`` / ``make_val_loader`` —— 训练侧定向采样+增强；验证侧顺序、无增强。
     4. ``build_transforms`` —— 仅训练用的 2D 增强：翻转 / 旋转 90° / 仿射 / 随机 gamma / 高斯噪声，
        **全部自己实现，不依赖 MONAI**（原因见 ``make_augment_steps`` 的说明）。
+
+为什么改成「统一补边」而不是「按尺寸分桶」：
+    分桶要求同一 batch 内所有人的精确面内尺寸逐像素相同，于是采样器得先选桶再在桶内配额，
+    小桶会被摊薄、还会出现大量全阴性 batch。改成统一补边到 512×512（512 是 16 的倍数，
+    U-Net 4 级下采样不再需要内部 pad）之后，batch 形状恒为 ``(B,1,512,512)``，
+    ``pad_multiple`` / ``bucket_key`` 这些概念整条链路都不需要了。
+    代价是补边区域的白像素被浪费，且非 512 病例的补边区在增强后不再严格为 0；
+    第 3 轮的 loss 可以考虑忽略补边区域，见 ``pad_to_target`` 的说明。
 
 依赖：numpy / torch / nibabel（+ 可选 scipy 的连通域，不在本文件用）。
 前后接口：上游是 ``scripts/preprocess.py`` 产出的 ``cache/image/<case>.nii.gz``（uint16 归一化）
@@ -22,7 +30,6 @@
 from __future__ import annotations
 
 import hashlib
-import math
 import random
 import sys
 from contextlib import contextmanager
@@ -57,29 +64,31 @@ LOGGER = setup_logger("dataset")
 #: 因此还原 [0,1] 只需除以 65535（与 scripts/preprocess.py、scripts/check_cache.py 同一口径）。
 UINT16_SCALE = 65535.0
 
-#: 面内尺寸分桶的默认对齐（与 model.pad_to_multiple 一致：U-Net 4 级下采样 = 2^4）
-DEFAULT_PAD_MULTIPLE = 16
+#: 统一补边的目标尺寸（面内）。512 是 16 的倍数：U-Net 4 级下采样 = 2^4，前向内部无需再 pad。
+DEFAULT_TARGET_HW = (512, 512)
+
+#: 补边时原图放在目标画布里的位置：``center`` = 居中（数据侧默认），``bottom-right`` = 右下补 0。
+DEFAULT_PAD_ALIGN = "center"
 
 DEFAULT_DATA_CFG: dict = {
     "index_cache_size": 8,        # 每 worker 保留的 nibabel 句柄数（lru_cache maxsize）
-    "pad_multiple": DEFAULT_PAD_MULTIPLE,
+    "target_hw": list(DEFAULT_TARGET_HW),   # 面内统一补边到的目标尺寸（H, W）
+    "pad_align": DEFAULT_PAD_ALIGN,         # center = 居中补边；bottom-right = 右下补 0
     "num_workers": 8,
     "pin_memory": True,
     "persistent_workers": False,
-    "val_batch_size": None,       # None = 用 train.batch_size
-    "bucket_balance": True,       # 按桶内样本数分配每轮 batch 配额，避免小桶被过度重复
-    "min_pos_per_batch": 1,       # 每个 batch 至少含几个肿瘤切片（batch_size 很小时兜底）
-    "pos_ratio_tolerance": 0.10,  # 自检用：实测比例偏离目标的告警阈值
-    "augment": {
+    "val_batch_size": None,       # None = 用 train.batch_size；验证是顺序读，只影响速度
+    "pos_ratio_tolerance": 0.20,  # 自检用：实测比例偏离目标的告警阈值
+    "verify_batch": True,         # collate 时校验 batch 不变量（形状/值域/label 取值）
+    "augment": {                  # 仅训练；验证侧不做任何几何变换
         "flip_prob": 0.5,
         "rotate90_prob": 0.5,
         "affine_prob": 0.5,
         "rotation_deg": 15.0,
         "scale_range": [0.9, 1.1],
         "shift_frac": 0.1,
-        "histogram_shift_prob": 0.2,
-        "histogram_num_bins": 10,
-        "histogram_shift_range": 0.1,
+        "gamma_prob": 0.2,
+        "gamma_range": [0.75, 1.33],
         "noise_prob": 0.2,
         "noise_std": 0.01,
     },
@@ -90,19 +99,75 @@ DEFAULT_DATA_CFG: dict = {
 # 小工具
 # --------------------------------------------------------------------------------------
 
-def bucket_key(height: int, width: int, pad_multiple: int = DEFAULT_PAD_MULTIPLE) -> tuple:
-    """面内尺寸 → 分桶键 ``(ceil(H/mult)*mult, ceil(W/mult)*mult)``。
+def format_hw(hw: Sequence[int]) -> str:
+    """把面内尺寸 ``(H, W)`` 渲染成 ``512x512`` 这样的字符串，便于日志与报告阅读。"""
+    return "x".join(str(int(v)) for v in hw)
 
-    与 ``scripts/preprocess.py`` 的 ``build_aggregate`` 用同一套口径，因此清单里的 ``size_buckets``
-    可以直接和本函数的输出比对。键的取整值是「pad 之后的边长」，同键的切片才能同 batch。
+
+def resolve_target_hw(cfg: dict) -> tuple:
+    """从配置里取面内目标尺寸，并对齐到 ``model.pad_to_multiple`` 的整数倍。
+
+    配置项 ``data.target_hw`` 写的是**期望的**目标尺寸（默认 512×512）；这里再按
+    ``model.pad_to_multiple`` 向上对齐，保证补边后的边长一定能被 U-Net 的 2^k 下采样整除
+    （512 本身已是 16 的倍数，对齐是恒等操作；写小尺寸做调试时才有实际作用）。
     """
-    mult = max(1, int(pad_multiple))
-    return (int(math.ceil(int(height) / mult) * mult), int(math.ceil(int(width) / mult) * mult))
+    raw = ((cfg or {}).get("data") or {}).get("target_hw") or list(DEFAULT_TARGET_HW)
+    if isinstance(raw, (int, float)):
+        raw = [int(raw), int(raw)]
+    if len(raw) != 2:
+        raise ValueError(f"data.target_hw 必须是 (H, W) 两个整数，收到 {raw!r}")
+    mult = max(1, int(((cfg or {}).get("model") or {}).get("pad_to_multiple", 1) or 1))
+    import math
+
+    return tuple(int(math.ceil(int(v) / mult) * mult) for v in raw)
 
 
-def format_bucket(key: Sequence[int]) -> str:
-    """把桶键渲染成 ``512x512`` 这样的字符串，便于日志与报告阅读。"""
-    return "x".join(str(int(v)) for v in key)
+def pad_to_target(array: np.ndarray, target_hw: Sequence[int],
+                  align: str = DEFAULT_PAD_ALIGN) -> tuple:
+    """把 ``(H, W)`` 数组补边到 ``target_hw``，返回 ``(补边后的数组, (top, left))``。
+
+    ``align="center"``（默认）时上下、左右各分一半的填充量，奇数余数放在右下；
+    ``align="bottom-right"`` 时全部补在右侧与下侧。
+    返回的 ``(top, left)`` 就是原图内容在补边画布里的左上角位置——第 4 轮整卷推理要把预测
+    裁回原始面内尺寸，必须按它裁（居中补边时内容不在原点，写死 ``[:H, :W]`` 会错位）。
+
+    补边值固定为 0（= 预处理后 HU 窗下界的背景值），label 也同样补 0。
+    两个已知代价，写在这里供后续轮次判断：
+      * 补边像素被白算，非 512 的 8 例按尺寸推算浪费约 41%、全部 25 例按例加权约 13%；
+      * 增强在补边之后施加，所以非 512 病例的补边区在 gamma/噪声/仿射之后**不再严格为 0**。
+        第 3 轮的 loss 可以考虑用 ``orig_hw``+``pad_offset`` 生成 ignore mask；第 6 轮再决定是否要改顺序。
+    """
+    arr = np.asarray(array)
+    if arr.ndim != 2:
+        raise ValueError(f"pad_to_target 只接受 (H, W) 切片，收到 shape={arr.shape}")
+    target_h, target_w = (int(target_hw[0]), int(target_hw[1]))
+    height, width = (int(arr.shape[0]), int(arr.shape[1]))
+    if height > target_h or width > target_w:
+        raise ValueError(f"切片尺寸 {(height, width)} 超过目标尺寸 {(target_h, target_w)}："
+                         f"请调大 data.target_hw（补边只能放大，不能缩小）")
+    if (height, width) == (target_h, target_w):
+        return arr, (0, 0)
+    top, left = pad_offset_of((height, width), (target_h, target_w), align)
+    padded = np.zeros((target_h, target_w), dtype=arr.dtype)
+    padded[top:top + height, left:left + width] = arr
+    return padded, (int(top), int(left))
+
+
+def pad_offset_of(orig_hw: Sequence[int], target_hw: Sequence[int],
+                  align: str = DEFAULT_PAD_ALIGN) -> tuple:
+    """只算「内容在补边画布里的左上角 ``(top, left)``」，不真的补边。
+
+    补边与裁回必须用**同一套偏移**：``__getitem__`` 用它补边，``collate_samples`` 把它写进 batch，
+    第 4 轮整卷推理按它把预测裁回原始面内尺寸。这里做成公开函数，避免两处各算一遍写歪
+    （居中补边时内容不在原点，裁回写死 ``[:H, :W]`` 会整体错位 ``pad_h//2`` 像素）。
+    """
+    height, width = (int(orig_hw[0]), int(orig_hw[1]))
+    target_h, target_w = (int(target_hw[0]), int(target_hw[1]))
+    if height > target_h or width > target_w:
+        raise ValueError(f"原始面内尺寸 {(height, width)} 超过目标尺寸 {(target_h, target_w)}")
+    if str(align).lower() in ("bottom-right", "right-bottom", "br") or (height, width) == (target_h, target_w):
+        return (0, 0)
+    return ((target_h - height) // 2, (target_w - width) // 2)
 
 
 def parse_cases(value: Any, splits: dict, split: str, fold: int | None = None) -> list:
@@ -148,10 +213,10 @@ def parse_cases(value: Any, splits: dict, split: str, fold: int | None = None) -
 
 
 def data_config(cfg: dict) -> dict:
-    """从总配置里取出 data 节并与默认值合并。
+    """从总配置里取出 data 节并与默认值合并，顺带校验 ``pad_align`` 与归一化 ``target_hw``。
 
-    ``pad_multiple`` 缺省时回退到 ``model.pad_to_multiple``（键名不同，别写错——写错会静默用 16，
-    和 U-Net 的下采样倍数不一致时会在前向里被 pad 掩盖，很难查）。这里顺带校验它是 2 的幂。
+    历史提醒：早期版本这里还会把 ``model.pad_to_multiple`` 回退成 ``data.pad_multiple`` 供**分桶**用；
+    分桶已经删除（现在统一补边到 ``target_hw``），**不要再把对齐值当分桶键**。
     """
     merged = {k: (dict(v) if isinstance(v, dict) else v) for k, v in DEFAULT_DATA_CFG.items()}
     user = (cfg or {}).get("data") or {}
@@ -160,15 +225,12 @@ def data_config(cfg: dict) -> dict:
             merged[key].update(value)
         else:
             merged[key] = value
-    if "pad_multiple" not in user:
-        merged["pad_multiple"] = int(((cfg or {}).get("model") or {}).get(
-            "pad_to_multiple", DEFAULT_PAD_MULTIPLE))
-    mult = int(merged["pad_multiple"])
-    if mult < 1:
-        raise ValueError(f"pad_multiple 必须 >= 1，收到 {mult}")
-    if mult & (mult - 1):
-        raise ValueError(f"pad_multiple 必须是 2 的幂（U-Net 每级下采样 2 倍），收到 {mult}")
-    merged["pad_multiple"] = mult
+    align = str(merged.get("pad_align", DEFAULT_PAD_ALIGN)).lower()
+    if align not in ("center", "bottom-right", "right-bottom", "br"):
+        raise ValueError(f"data.pad_align 只支持 'center' / 'bottom-right'，收到 {merged.get('pad_align')!r}")
+    merged["pad_align"] = "bottom-right" if align in ("bottom-right", "right-bottom", "br") else "center"
+    merged["target_hw"] = list(resolve_target_hw({"data": {"target_hw": merged.get("target_hw")},
+                                                  "model": (cfg or {}).get("model") or {}}))
     return merged
 
 
@@ -303,6 +365,8 @@ class GridAffine2D:
         """
         height, width = int(height), int(width)
         if self._theta is None or self._theta_hw != (height, width):
+            import math
+
             rad = math.radians(self.rotate_deg)
             cos, sin = math.cos(rad), math.sin(rad)
             sx = sy = self.scale
@@ -379,6 +443,7 @@ class RandAffineSlice2D:
         self.aug = dict(aug or {})
         self.keys = tuple(keys)
         self.rng = rng or random
+        self.affine: GridAffine2D | None = None
         self.last_params: dict | None = None   # 便于自检断言
 
     def randomize(self, rng: random.Random | None = None) -> None:
@@ -394,7 +459,7 @@ class RandAffineSlice2D:
 
     def __call__(self, data: dict) -> dict:
         self.randomize()
-        if getattr(self, "affine", None) is None:
+        if self.affine is None:
             return data
         out = dict(data)
         for key in self.keys:
@@ -438,8 +503,8 @@ class FlipSlice2D:
 class Rotate90Slice2D:
     """按概率把切片整 90° 旋转 ``k∈{0,1,2,3}`` 次（无插值，label 不会被糊）。
 
-    ``k = 0`` 时等价于不变，因此 0.5 的概率下实际约有一半的样本完全没有旋转——这与
-    MONAI ``RandRotate90d`` 的语义一致（它也是 ``randint(0, max_k) + 1`` 那种「抽到就转」）。
+    ``max_k=1`` 时固定转 90°；``k = 0`` 那种「抽到但等于不变」的情况在 ``max_k>1`` 时才会出现，
+    与 MONAI ``RandRotate90d`` 的语义一致。
     """
 
     def __init__(self, prob: float = 0.5, max_k: int = 3, keys: Sequence[str] = ("image", "label"),
@@ -557,7 +622,7 @@ def make_augment_steps(cfg: dict, seed: int | None = None) -> list:
     **全部自实现，不依赖 MONAI**。原因：MONAI 的增强接口在 array 版 / 字典版之间有两套签名
     （``RandFlip`` 只吃数组、``RandFlipd`` 才吃 dict 且 ``keys`` 是必需参数），参数名还跨版本变过
     （``axis`` → ``spatial_axis``、``shift_range`` 在 1.6 已不存在），我们在这一层连炸过两次；
-    而这四个增强本身只是十几行 numpy。自实现之后这一整类「接口/版本不匹配」故障消失，
+    而这几步增强本身只是十几行 numpy。自实现之后这一整类「接口/版本不匹配」故障消失，
     且随机性由单一 ``random.Random(seed)`` 驱动，可离线逐项验证。
 
     顺序即施加顺序：
@@ -592,17 +657,6 @@ def make_augment_steps(cfg: dict, seed: int | None = None) -> list:
         ClampImageToUnit(),
         BinarizeLabel(),
     ]
-
-
-def build_transforms(cfg: dict, train: bool, seed: int | None = None):
-    """构建训练增强流水线；``train=False`` 时返回 ``None``（验证侧不做任何几何变换）。
-
-    返回一个可调用对象：输入 ``{"image": (H,W) float32, "label": (H,W) uint8}``，返回同结构的 dict。
-    步骤见 ``make_augment_steps``。
-    """
-    if not train:
-        return None
-    return ComposeSteps(make_augment_steps(cfg, seed=seed))
 
 
 class ComposeSteps:
@@ -643,17 +697,18 @@ class CTSliceDataset(Dataset):
 
     读取策略（避免 DataLoader 里开出上千个文件句柄）：
       * ``__init__``：只 ``nib.load`` 读 header + **label 体素**（算 ``pos_flags`` 与索引），
-        **不读 image 体素**；25 例 label 合计几十 MB，读完这一例即可释放；
+        **不读 image 体素**；25 例 label 合计几十 MB，读完一例即可释放；
       * ``__getitem__``：走每 worker 一份的 ``lru_cache`` 拿 nibabel 代理对象（``mmap=True``），
-        只取 ``[:, :, z]`` 一层；image 除以 65535 还原 [0,1]，label 取 >0 得 {0,1}。
+        只取 ``[:, :, z]`` 一层；image 除以 65535 还原 [0,1]，label 取 >0 得 {0,1}，
+        然后**居中补边到 ``data.target_hw``**，最后（仅训练）施加增强。
 
     参数：
         cases：``"train"`` / ``"val"`` / ``"all"``、逗号串或整数序列（见 ``parse_cases``）。
         cache_dir：``cache/`` 根目录（其下 image/ 与 label/）。
         split：写进样本字典的分组名（``"train"`` / ``"val"`` / ``"all"``），仅用于追踪与日志。
         cfg：总配置字典（``load_config`` 的返回值）。
-        augment：是否施加训练增强；``False`` 时不做任何几何变换。
-        debug：True 时打印逐 case 的索引统计（切片数、含肿瘤切片数、桶键）。
+        augment：是否施加训练增强；``False`` 时不做任何几何变换（仍然补边）。
+        debug：True 时打印逐 case 的索引统计（切片数、含肿瘤切片数、原始/补边后尺寸）。
 
     ``cases="train"`` 时使用 ``splits`` 里该 fold 的训练集；未给 ``fold`` 则取各折 train 的并集
     （等价于全部 25 例，仅用于自检与冒烟测试）。
@@ -668,7 +723,8 @@ class CTSliceDataset(Dataset):
         self.augment = bool(augment)
         self.debug = bool(debug)
         self.fold = fold
-        self.pad_multiple = int(self.data_cfg.get("pad_multiple", DEFAULT_PAD_MULTIPLE))
+        self.target_hw = tuple(int(v) for v in self.data_cfg.get("target_hw", DEFAULT_TARGET_HW))
+        self.pad_align = str(self.data_cfg.get("pad_align", DEFAULT_PAD_ALIGN))
         self.index_cache_size = int(self.data_cfg.get("index_cache_size", 8))
         self.image_dir = self.cache_dir / "image"
         self.label_dir = self.cache_dir / "label"
@@ -690,9 +746,8 @@ class CTSliceDataset(Dataset):
 
         self.index: list = []            # [(case:int, z:int), ...]
         self.pos_flags = np.zeros(0, dtype=bool)   # 与 index 一一对应：该切片是否含肿瘤
-        self.buckets: dict = {}          # 桶键(精确 H,W) -> [index 位置, ...]
-        self.case_hw: dict = {}          # case -> (H, W)（精确面内尺寸）
-        self.case_bucket: dict = {}      # case -> 桶键（= case_hw，保留字段方便阅读）
+        self.case_hw: dict = {}          # case -> (H, W) 原始面内尺寸（**补边前**）
+        self.case_pad_offset: dict = {}  # case -> (top, left) 内容在补边画布里的左上角
         self.case_n_slices: dict = {}    # case -> nz
         self.case_pos_slices: dict = {}  # case -> 含肿瘤切片数
         self.image_dtype: str | None = None
@@ -701,7 +756,7 @@ class CTSliceDataset(Dataset):
     # ---------------- 索引构建 ----------------
 
     def _build_index(self) -> None:
-        """逐 case 读 label 体素，建 ``index`` / ``pos_flags`` / ``buckets``，并做一致性自检。
+        """逐 case 读 label 体素，建 ``index`` / ``pos_flags``，并做一致性自检。
 
         读的是 label（几 MB/例）而不是 image（几十 MB/例）：索引只需要「哪些层有肿瘤」。
         """
@@ -732,6 +787,11 @@ class CTSliceDataset(Dataset):
                                 f"{(nx, ny, nz)}（缓存不成对或被写坏）")
             if tuple(round(float(s), 3) for s in spacing) != (1.0, 1.0, 1.0):
                 problems.append(f"case {case}：spacing {spacing} 不是 1mm（cache 口径被破坏）")
+            if height > self.target_hw[0] or width > self.target_hw[1]:
+                problems.append(f"case {case}：面内尺寸 {(height, width)} 超过 data.target_hw "
+                                f"{self.target_hw}（补边只能放大，不能缩小；请调大 target_hw）")
+                release_mmap(lab_img)
+                continue
 
             # 掩膜二值口径：cache 里只含 {0,1}，这里用 >0 取前景（不要写成 ==2）
             binary = (lab_arr > 0).astype(np.uint8)
@@ -759,18 +819,14 @@ class CTSliceDataset(Dataset):
                 problems.append(f"case {case}：影像 dtype={img_dtype} 与其它病例的 {self.image_dtype} "
                                 f"不一致（cache 口径不统一，请重跑 preprocess.py）")
 
-            # 分桶键 = **精确面内尺寸** (H, W)。理由：`torch.stack` 要求同 batch 内形状完全一致，
-            # 所以能同 batch 的充要条件就是「尺寸逐像素相同」。pad_multiple 只决定模型内部要 pad 到
-            # 多少（U-Net 下采样 2^k），不参与分桶——早期用「对齐 16 后的尺寸」当桶键，
-            # 把 342×342 与 351×351 这两个病例放进了同一个 `352x352` 桶，collate 时就炸了。
-            key = (height, width)
-            start = len(self.index)
+            # 内容在补边画布里的左上角（居中补边时不是 (0,0)）：第 4 轮裁回原始尺寸必须用它
+            offset = pad_offset_of((height, width), self.target_hw, self.pad_align)
+
             self.index.extend((int(case), int(z)) for z in range(nz))
             self.pos_flags = np.concatenate(
                 [self.pos_flags, pos_flags.astype(bool)]) if self.pos_flags.size else pos_flags.astype(bool)
-            self.buckets.setdefault(key, []).extend(range(start, start + nz))
             self.case_hw[int(case)] = (height, width)
-            self.case_bucket[int(case)] = key
+            self.case_pad_offset[int(case)] = offset
             self.case_n_slices[int(case)] = nz
             self.case_pos_slices[int(case)] = n_pos
 
@@ -781,8 +837,9 @@ class CTSliceDataset(Dataset):
             _open_nii.cache_clear()
 
             if self.debug:
-                LOGGER.info("  case %d：nz=%d 含肿瘤层=%d 面内=%dx%d 桶=%s",
-                            int(case), nz, n_pos, height, width, format_bucket(key))
+                LOGGER.info("  case %d：nz=%d 含肿瘤层=%d 原始面内=%s → 补边到 %s（偏移 %s）",
+                            int(case), nz, n_pos, format_hw((height, width)),
+                            format_hw(self.target_hw), offset)
 
         if problems:
             for item in problems:
@@ -810,57 +867,53 @@ class CTSliceDataset(Dataset):
         """全部切片里含肿瘤的比例（第 1 轮实测整体约 12.8%）。"""
         return float(self.n_positive / max(1, len(self.index)))
 
-    def bucket_stats(self) -> dict:
-        """逐桶统计：切片数、含肿瘤切片数、涉及病例数、以及该桶需要 pad 到多少。
+    def inplane_stats(self) -> dict:
+        """逐种原始面内尺寸的统计：切片数、含肿瘤切片数、病例数、补边填充占比。
 
-        ``padded_hw`` 是模型内部要 pad 到的尺寸（``ceil(H/align)*align``），与分桶无关，
-        只用于展示与显存估算。
+        ``pad_fraction`` = 该尺寸补到 ``target_hw`` 后被浪费的像素占比
+        （``1 - H*W/(target_h*target_w)``），用于估算补边代价与后续是否需要忽略补边区域。
         """
         stats: dict = {}
-        for key, positions in sorted(self.buckets.items()):
-            flags = self.pos_flags[positions]
-            height, width = int(key[0]), int(key[1])
-            mult = max(1, int(self.pad_multiple))
-            stats[key] = {
-                "n_slices": len(positions),
-                "n_pos": int(flags.sum()),
-                "n_neg": int(len(positions) - int(flags.sum())),
-                "n_cases": len({self.index[i][0] for i in positions}),
-                "cases": self.cases_of_bucket(key),
-                "padded_hw": (int(math.ceil(height / mult) * mult), int(math.ceil(width / mult) * mult)),
-            }
+        target_h, target_w = (int(self.target_hw[0]), int(self.target_hw[1]))
+        for case in self.case_ids:
+            height, width = self.case_hw[int(case)]
+            rec = stats.setdefault((height, width), {"n_slices": 0, "n_pos": 0, "cases": []})
+            rec["n_slices"] += int(self.case_n_slices[int(case)])
+            rec["n_pos"] += int(self.case_pos_slices[int(case)])
+            rec["cases"].append(int(case))
+        for (height, width), rec in stats.items():
+            rec["n_cases"] = len(rec["cases"])
+            rec["n_neg"] = int(rec["n_slices"] - rec["n_pos"])
+            rec["pad_fraction"] = round(1.0 - (height * width) / float(target_h * target_w), 4)
+            rec["cases"] = sorted(rec["cases"])
         return stats
 
-    def cases_of_bucket(self, key: tuple) -> list:
-        """该桶里出现的病例列表（升序）。"""
-        return sorted({self.index[i][0] for i in self.buckets[key]})
-
-    def bucket_of_case(self, case: int) -> tuple:
-        """某个病例所属的**桶键**，也就是它的精确面内尺寸 ``(H, W)``。
-
-        桶键就是 ``case_hw[case]`` 本身；这里提供成方法的目的是让调用方不必关心
-        「桶键到底是对齐后的还是精确的」——早期版本两者不同（桶键是对齐 16 之后的值），
-        调用方混用会在 ``bucket_budget()`` 里报 KeyError，也会让「同 batch 同尺寸」的判断出错。
-        """
-        return tuple(self.case_hw[int(case)])
-
     def describe(self) -> str:
-        """返回多行描述：split、病例、切片数、阳性比例、逐桶明细。"""
+        """返回多行描述：split、病例、切片数、阳性比例、逐种原始面内尺寸的明细。"""
         lines = [
             f"split={self.split}"
             + (f" fold={self.fold}" if self.fold is not None else "")
             + f"：{len(self.case_ids)} 例、{len(self.index)} 层切片、含肿瘤 {self.n_positive} 层"
-              f"（{self.pos_ratio:.4f}）、{len(self.buckets)} 个尺寸桶、影像 dtype={self.image_dtype}",
+              f"（{self.pos_ratio:.4f}）、原始面内尺寸 {len(self.inplane_stats())} 种 →"
+              f" 统一补边到 {format_hw(self.target_hw)}（{self.pad_align}）、影像 dtype={self.image_dtype}",
         ]
-        for key, stat in self.bucket_stats().items():
+        for (height, width), stat in sorted(self.inplane_stats().items()):
             ratio = stat["n_pos"] / max(1, stat["n_slices"])
-            lines.append(f"  桶 {format_bucket(key):>9}：切片 {stat['n_slices']:5d}"
+            lines.append(f"  原始 {format_hw((height, width)):>9}：切片 {stat['n_slices']:5d}"
                          f"（含肿瘤 {stat['n_pos']:4d} = {ratio:6.2%}）"
-                         f"  病例 {stat['n_cases']:2d} 例 {self.cases_of_bucket(key)}")
+                         f"  病例 {stat['n_cases']:2d} 例 {stat['cases']}"
+                         f"  补边占比 {stat['pad_fraction']:.2%}")
         return "\n".join(lines)
 
     def __len__(self) -> int:
         return len(self.index)
+
+    def pad_offset_of_case(self, case: int) -> tuple:
+        """该病例的内容在补边画布里的左上角 ``(top, left)``（居中补边时不是 (0,0)）。
+
+        第 4 轮整卷推理把预测裁回原始面内尺寸时用它：``pred[top:top+H, left:left+W]``。
+        """
+        return self.case_pad_offset[int(case)]
 
     # ---------------- 取样本 ----------------
 
@@ -885,8 +938,16 @@ class CTSliceDataset(Dataset):
         image = np.asanyarray(_open_nii(str(self.image_dir / f"{case}.nii.gz")).dataobj)[:, :, z]
         label = np.asanyarray(_open_nii(str(self.label_dir / f"{case}.nii.gz")).dataobj)[:, :, z]
 
+        # 先归一化，再补边（uint16 的 0 就是窗下界，补边补 0 与「背景」同值）
         image = np.ascontiguousarray(self._to_unit_range(image))
         label = np.ascontiguousarray((np.asarray(label) > 0).astype(np.uint8))
+
+        # 统一补边：所有样本出来都是 target_hw，torch.stack 永远合法（不再需要分桶）
+        image, offset = pad_to_target(image, self.target_hw, self.pad_align)
+        label, label_offset = pad_to_target(label, self.target_hw, self.pad_align)
+        if offset != label_offset:
+            raise RuntimeError(f"case {case} z={z}：image 与 label 的补边偏移不一致 "
+                               f"{offset} vs {label_offset}")
 
         if self.transforms is not None:
             out = self.transforms({"image": image, "label": label})
@@ -900,15 +961,15 @@ class CTSliceDataset(Dataset):
                 raise RuntimeError(f"增强后 image/label 形状不一致：{image.shape} vs {label.shape}")
 
         height, width = (int(s) for s in image.shape)
-        if (height, width) != self.case_hw[case]:
-            raise RuntimeError(f"case {case} z={z}：取出切片形状 {(height, width)} 与初始化记录的 "
-                               f"{self.case_hw[case]} 不一致（轴序或增强出了错）")
+        if (height, width) != tuple(self.target_hw):
+            raise RuntimeError(f"case {case} z={z}：补边/增强后切片形状 {(height, width)} 不是 "
+                               f"data.target_hw {tuple(self.target_hw)}（补边或增强出了错）")
         return {
-            "image": torch.from_numpy(image).unsqueeze(0),        # (1, H, W) float32 ∈ [0,1]
-            "label": torch.from_numpy(label.astype(np.int64)),    # (H, W) int64 ∈ {0,1}
+            "image": torch.from_numpy(image).unsqueeze(0),        # (1, target_h, target_w) float32 ∈ [0,1]
+            "label": torch.from_numpy(label.astype(np.int64)),    # (target_h, target_w) int64 ∈ {0,1}
             "case": str(case),
             "z": int(z),
-            "orig_hw": (height, width),
+            "orig_hw": (int(self.case_hw[case][0]), int(self.case_hw[case][1])),
         }
 
 
@@ -919,44 +980,55 @@ class CTSliceDataset(Dataset):
 def collate_samples(samples: Sequence[dict], verify: bool = True) -> dict:
     """把若干样本拼成一个 batch，并定义**明确的 batch 契约**（训练与自检都按它取值）：
 
-        image     : Tensor (B, 1, H, W) float32
-        label     : Tensor (B, H, W)    int64 ∈ {0,1}
-        case      : list[str]，长度 B（每个样本来自哪个病人）
-        z         : list[int]，长度 B（每个样本是第几层）
-        orig_hw   : list[tuple[int,int]]，长度 B（每个样本原始面内尺寸）
+        image      : Tensor (B, 1, 512, 512) float32
+        label      : Tensor (B, 512, 512)    int64 ∈ {0,1}
+        case       : list[str]，长度 B（每个样本来自哪个病人）
+        z          : list[int]，长度 B（每个样本是第几层）
+        orig_hw    : list[tuple[int,int]]，长度 B（每个样本**补边前**的面内尺寸）
+        pad_offset : list[tuple[int,int]]，长度 B（内容在补边画布里的左上角 (top, left)）
+
+    用 ``data.target_hw`` 之外的尺寸时上面两处的 512 相应替换；契约的结构不变。
 
     为什么不直接用 DataLoader 的默认 collate：PyTorch 默认会把每样本一个 tuple 的 ``orig_hw``
     做**转置**，得到 ``[(h1,h2,...), (w1,w2,...)]``——看上去像 ``(H,W)`` 但其实是两行列表，
     解包就会炸（远程就是这样炸的：``too many values to unpack``）。显式定义契约后，
-    ``orig_hw`` 是长度 B 的 tuple 列表，含义不再依赖默认行为。
+    ``orig_hw`` / ``pad_offset`` 都是长度 B 的 tuple 列表，含义不再依赖默认行为。
 
     ``verify=True``（默认）时顺带校验 batch 的不变量：所有样本形状一致、
-    ``label`` 取值 ⊂ {0,1}、``image`` 值域 ⊂ [0,1]、且 ``orig_hw`` 与张量形状自洽。
+    ``label`` 取值 ⊂ {0,1}、``image`` 值域 ⊂ [0,1]、张量形状与 ``orig_hw`` 自洽。
     这些校验的开销可以忽略（只是比较几个整数），但能在训练早期抓住「buffered/memmap 复用、
     增强把尺寸改坏、collate 拼错」这类最难查的问题。
+
+    注意（历史教训）：``image`` 是 ``(B,1,H,W)``、``label`` 是 ``(B,H,W)``，
+    **比较空间维时要错开一个通道维**（``image.shape[2:]`` vs ``label.shape[1:]``），
+    写成 ``label.shape[2:]`` 会得到空 tuple 而恒真/恒假。
     """
     if not samples:
         raise ValueError("collate_samples 收到空 batch")
     shapes = {tuple(int(s) for s in sample["image"].shape) for sample in samples}
     if len(shapes) != 1:
-        raise RuntimeError(f"batch 内样本形状不一致 {sorted(shapes)}——分桶采样器本应保证同 batch 同尺寸，"
-                           f"出现这个说明采样器或数据集索引出了问题（不要靠 collate 兜底）")
+        raise RuntimeError(f"batch 内样本形状不一致 {sorted(shapes)}——数据集本应把每个样本都补边到"
+                           f"同一个 data.target_hw，出现这个说明补边或增强改变了尺寸")
     image = torch.stack([s["image"] for s in samples])
     label = torch.stack([s["label"] for s in samples])
+    height, width = int(image.shape[2]), int(image.shape[3])
     batch = {
         "image": image,
         "label": label,
         "case": [str(s["case"]) for s in samples],
         "z": [int(s["z"]) for s in samples],
         "orig_hw": [(int(s["orig_hw"][0]), int(s["orig_hw"][1])) for s in samples],
+        # 补边偏移不在样本里携带，而是由 orig_hw + 张量形状**当场推导**：
+        # 这样它一定与 batch 的形状自洽（样本里再存一份就有写歪的可能）。
+        "pad_offset": [pad_offset_of(s["orig_hw"], (height, width)) for s in samples],
     }
     if verify:
-        height, width = int(image.shape[2]), int(image.shape[3])
         if tuple(label.shape[1:]) != (height, width):
-            raise RuntimeError(f"batch 内 image {tuple(image.shape)} 与 label {tuple(label.shape)} 尺寸不符")
-        if any(hw != (height, width) for hw in batch["orig_hw"]):
-            raise RuntimeError(f"batch 内样本的 orig_hw 与张量形状 {(height, width)} 不一致："
-                               f"{batch['orig_hw']}（说明同 batch 混了不同面内尺寸）")
+            raise RuntimeError(f"batch 内 image {tuple(image.shape)} 与 label {tuple(label.shape)} 尺寸不符"
+                               f"（注意 image 是 (B,1,H,W)、label 是 (B,H,W)，比较时要错开通道维）")
+        if any(hw[0] > height or hw[1] > width for hw in batch["orig_hw"]):
+            raise RuntimeError(f"batch 内样本的 orig_hw 超过张量形状 {(height, width)}："
+                               f"{batch['orig_hw']}（补边只能放大，不能缩小）")
         if int(label.numel()) and (int(label.min()) < 0 or int(label.max()) > 1):
             raise RuntimeError(f"label 取值超出 {{0,1}}：min={int(label.min())} max={int(label.max())}")
         if not torch.isfinite(image).all():
@@ -967,263 +1039,211 @@ def collate_samples(samples: Sequence[dict], verify: bool = True) -> dict:
 
 
 # --------------------------------------------------------------------------------------
-# 分桶 + 定向过采样的 BatchSampler
+# 单一池 + 定向过采样的 BatchSampler
 # --------------------------------------------------------------------------------------
 
 class _CyclicPool:
-    """无放回轮转池：洗牌后依次吐出元素，吐完再洗牌。
+    """无放回轮转池：优先吐出**本轮还没抽过**的元素，抽完了就重排再抽。
 
-    用途：在一个桶内「尽量不重复地」抽样本。同一个 batch 内不会重复（池内元素远多于 batch_size）；
-    一轮 epoch 内是否重复由调用方控制——``BucketBatchSampler`` 会用 ``drawn`` 记录本轮已抽次数，
-    在池子快被抽空时主动降低该桶的正样本配额，从而保证**一轮 epoch 覆盖到池内每个样本**，
-    而不是反复抓同样的几层（小桶尤其明显）。
-
+    用途：在一个池（阳性层 / 阴性层）内「尽量不重复地」抽样本。只要``总抽取次数 >= 池大小``，
+    就保证**池内每个元素至少出现一次**（未抽过的先出，抽完才开始重复），这是「一轮覆盖全部切片」
+    这条保证的实现方式。
     池内的洗牌只用传入的 ``rng``（由 seed+epoch 派生），**不碰全局 random**，
     这样采样顺序与全局随机状态、worker 数都无关，同一配置下逐轮可复现。
     """
 
     def __init__(self, items: Sequence[int], rng: random.Random) -> None:
-        self._items = list(items)
+        self._items = [int(v) for v in items]
         self._rng = rng
-        self._order: list = []
+        # 未被抽过的（初始为全部，顺序随机）；抽走即从 pool 里移除
+        self._pool: list = list(self._items)
+        self._rng.shuffle(self._pool)
         self._cursor = 0
+        # 抽过的元素：供「重复抽取」阶段使用（保证重复也均匀、且不集中在少数几层）
+        self._seen: list = []
         self.drawn = 0
 
     def __len__(self) -> int:
         return len(self._items)
 
-    def pop(self) -> int:
-        if self._cursor >= len(self._order):
-            self._order = list(self._items)
-            self._rng.shuffle(self._order)
+    def _pop_unseen(self) -> int:
+        if self._cursor >= len(self._pool):
+            self._seen = list(self._items)
+            self._rng.shuffle(self._seen)
+            self._pool = self._seen
             self._cursor = 0
-        value = self._order[self._cursor]
+        value = self._pool[self._cursor]
         self._cursor += 1
         self.drawn += 1
         return value
 
+    def take(self, k: int) -> list:
+        """连续取 ``k`` 个样本；池子不够大时按需重复（重复的元素也均匀分布）。"""
+        k = int(k)
+        if k <= 0 or not self._items:
+            return []
+        if k > len(self._items):
+            LOGGER.error("池内样本不足：需要 %d 个，池里只有 %d 个（本轮会有重复；"
+                         "请检查 batch_size/pos_ratio_target 与数据集规模是否匹配）", k, len(self._items))
+        return [self._pop_unseen() for _ in range(k)]
 
-class BucketBatchSampler(BatchSampler):
-    """按「尺寸桶 + batch 内阳性比例」迭代 batch 的采样器（不是 torch 自带的任何一种）。
+
+class ProportionalBatchSampler(BatchSampler):
+    """「单一池 + batch 内阳性比例」的采样器（不是 torch 自带的任何一种）。
 
     每个 batch 的构造：
-      1. 轮流从尚未用过的桶里挑一个桶（桶顺序用固定 seed 洗牌，一轮内每个桶至少出现一次）；
-      2. 在该桶内定向抽取：``n_pos = round(batch_size * pos_ratio_target)`` 个含肿瘤切片，
-         ``n_neg = batch_size - n_pos`` 个不含肿瘤切片；
-      3. 返回这 ``batch_size`` 个全局索引。
+      1. 先把 ``P`` 个含肿瘤层在 ``B`` 个 batch 上**尽量均摊**，得到每批的阳性数
+         ``第 q 批 = ceil(P*q/B) - ceil(P*(q-1)/B)``，每批再按 ``n_pos`` 封顶；
+      2. 阴性层把每个 batch 补满到 ``batch_size``。
 
-    这样保证：**同一 batch 内面内尺寸完全一致**（同桶才有相同 H/W），且**阳性比例恒为
-    ``pos_ratio_target``**；而 ``WeightedRandomSampler`` 只能控制期望、每批实际比例会抖动，
-    也无法满足「同 batch 同尺寸」的硬约束。
+    为什么均摊而不是「每个 batch 恒取 ``pos_ratio_target``」：那样每批要 2 个阳性，
+    而整个训练集只有 12–14% 的阳性层，硬凑就要把 batch 数放大到「阴性层一个都别重复」的程度，
+    反而制造出上百个**全阴性** batch（旧的分桶实现在远程跑出过 566 个 batch / 117 个全阴性，
+    基线口径见 docs/baseline.md）。改成「阳性总数在整轮均摊 + 阴性补满」之后，
+    每个阳性层在一轮里**恰好出现一次**，也不会为了凑比例而丢弃阴性层。
 
-    一轮 epoch 的 batch 配额按桶内样本数加权分配（``bucket_balance=True``），否则 512×512 那个桶
-    会吃掉绝大多数 step，而样本很少的小桶被重复采样几十次。某一边样本不足时 batch 会变小并把
-    比例拉偏，此时打印一次告警（不中断）。
+    保证（自检脚本逐条验证）：
+      * batch 大小恒为 ``batch_size``（池子够大时），形状恒为 ``(B,1,512,512)``；
+      * 一轮 epoch 内**每一层切片至少出现一次**（阳性层恰好一次、无重复）；
+      * 采样顺序只由 ``(train.seed, epoch, 病例集合)`` 决定（sha256 派生，不用内置 ``hash()``），
+        与 ``num_workers`` 无关；**同一个 epoch 可复现、相邻 epoch 不同**。
+
+    一轮的 batch 数取三个下界的最大值（``自身 __len__`` 即此值）：
+      * ``ceil(切片数 / batch_size)``：把整个数据集过一遍；
+      * ``ceil(阳性层数 / n_pos)``：给阳性层留够槽位（阳性多、batch 大时这条会成为上界）；
+      * ``ceil(阴性层数 / (batch_size - n_pos))``：让阴性层尽量不要重复抽。
+    所以 batch 数**可能大于** ``ceil(切片数 / batch_size)``（当 ``P`` 相对 ``n_pos`` 很大时），
+    自检里不能拿「切片数/batch_size」直接等号比对。
     """
 
-    #: 「桶内样本不足」告警的打印上限，避免刷屏
+    #: 告警的打印上限，避免刷屏
     MAX_WARNINGS = 5
 
     def __init__(self, dataset: CTSliceDataset, batch_size: int = 8,
                  pos_ratio_target: float = 0.30, seed: int = 42,
-                 min_pos_per_batch: int = 1, bucket_balance: bool = True,
                  verbose: bool = False) -> None:
         if int(batch_size) < 1:
             raise ValueError(f"batch_size 必须 >= 1，收到 {batch_size}")
         if not 0.0 <= float(pos_ratio_target) <= 1.0:
             raise ValueError(f"pos_ratio_target 必须落在 [0,1]，收到 {pos_ratio_target}")
-        if not dataset.buckets:
-            raise ValueError("数据集里没有任何尺寸桶（index 为空？）")
+        if len(dataset) == 0:
+            raise ValueError("数据集里没有任何切片（index 为空？）")
         self.dataset = dataset
         self.batch_size = int(batch_size)
         self.pos_ratio_target = float(pos_ratio_target)
         self.seed = int(seed)
-        self.min_pos_per_batch = int(min_pos_per_batch)
-        self.bucket_balance = bool(bucket_balance)
         self.verbose = bool(verbose)
         self._epoch = 0
         self._warnings = 0
-        self._quota_map = self._quota()   # 一轮 epoch 内每个桶的 batch 数（预算一次即可）
+        # 一轮 epoch 的 batch 数：先把阳性槽位留够（ceil(P / n_pos)），再用阴性层把每批补满
+        self._n_pos = self._target_pos_per_batch()
+        self._n_neg = self.batch_size - self._n_pos
+        n_pos_slices = int(dataset.pos_flags.sum())
+        by_positive = int(-(-n_pos_slices // self._n_pos)) if n_pos_slices > 0 else 0
+        by_samples = int(-(-len(dataset) // self.batch_size))
+        if self._n_neg > 0:
+            # 覆盖全部阴性层所需的最少 batch 数（不足时会在 _CyclicPool 里重复抽取）
+            by_negative = int(-(-(len(dataset) - n_pos_slices) // self._n_neg))
+            self._n_batches = max(1, by_samples, by_positive, by_negative)
+        else:
+            self._n_batches = max(1, by_positive)
+        self._plan = self._build_plan()
+        self.n_positive = n_pos_slices
+        self.n_negative = int(len(dataset) - n_pos_slices)
+        if sum(self._plan) < min(n_pos_slices, self._n_batches * self._n_pos):
+            LOGGER.error("阳性层 %d 个、一轮却只有 %d 个阳性槽位（%d batch × %d 正/批）："
+                         "本轮无法覆盖全部阳性层，请调大 train.batch_size 或 pos_ratio_target",
+                         n_pos_slices, self._n_batches * self._n_pos, self._n_batches, self._n_pos)
 
-        # 仅用于 describe() 展示「桶内正/负样本量」；真正的抽样池每轮 epoch 重建（见 __iter__）
-        self.bucket_counts: dict = {}
-        for key, positions in dataset.buckets.items():
-            flags = dataset.pos_flags[positions]
-            self.bucket_counts[key] = (int(flags.sum()), int(len(positions) - int(flags.sum())))
+    # ---------------- 计划与长度 ----------------
 
-    # ---------------- 配额与长度 ----------------
+    def _target_pos_per_batch(self) -> int:
+        """目标阳性数/批：``min(batch_size, max(1, round(batch_size * pos_ratio_target)))``。
 
-    def _quota(self) -> dict:
-        """一轮 epoch 内每个桶的 batch 数配额：**按样本数加权**，并保证「装得下该桶的阳性层」。
-
-        每个桶取三者的最大值：
-
-          1. ``bucket_balance=True`` 时按桶内切片数占比分配（否则各桶等分总 batch 数）；
-          2. ``ceil(桶内切片数 / batch_size)``：至少能把这桶的切片过一遍；
-          3. ``ceil(桶内阳性层数 / n_pos)``：至少能按目标比例装下桶里的阳性层。
-
-        第 3 条很关键：只按样本数加权时，阳性特别密的桶会出现
-        「配额 × n_pos < 阳性层数」，于是无论如何都覆盖不全（本文件第一版就是这样，
-        实测阳性比例掉到 0.25、还有 10 层一次没见到）。加上第 3 条后，正常尺寸的桶里
-        「每 batch 阳性数」恒等于 ``n_pos``、且一轮覆盖每一层。
+        ``batch_size=8, pos_ratio_target=0.30`` → ``round(2.4) = 2`` → 实际比例 **0.25**
+        （≈ 原始 12.81% 的 1.95 倍）。这是取整的必然结果，不是 bug；想更贴近 0.30
+        就把 ``batch_size`` 提到 10/20，或直接改 ``pos_ratio_target``。
         """
-        sizes = {key: len(positions) for key, positions in self.dataset.buckets.items()}
-        total = max(1, sum(sizes.values()))
-        n_pos = max(1, self._target_pos_per_batch())
-        quota: dict = {}
-        for key, size in sizes.items():
-            share = size / total if self.bucket_balance else 1.0 / max(1, len(sizes))
-            by_samples = int(round(share * total / self.batch_size))
-            by_size = int(math.ceil(size / self.batch_size))
-            n_pos_slices = int(self.dataset.pos_flags[self.dataset.buckets[key]].sum())
-            by_positive = int(math.ceil(n_pos_slices / n_pos)) if n_pos_slices > 0 else 0
-            quota[key] = max(1, by_samples, by_size, by_positive)
-        return quota
+        return min(self.batch_size, max(1, int(round(self.batch_size * self.pos_ratio_target))))
 
-    def __len__(self) -> int:
-        """一轮 epoch 的 batch 数（≈ 切片总数 / batch_size，小桶按配额下限保底 1）。"""
-        return int(sum(self._quota_map.values()))
+    def _build_plan(self) -> list:
+        """一轮 epoch 内每批的阳性数清单（长度 = batch 数，合计 = 阳性层总数）。
 
-    def positive_plan(self, key: tuple) -> list:
-        """该桶一轮 epoch 内**每批的阳性数**清单（长度 = 该桶 batch 配额）。
+        ``第 q 批 = ceil(P*q/B) - ceil(P*(q-1)/B)``，再按 ``n_pos`` 封顶：
+        每批是 ``floor(P/B)`` 或 ``ceil(P/B)``，且合计恰好 P（覆盖每个阳性层一次）。
 
-        规则：把 P 个阳性层在 B 个 batch 上**尽量均摊**——
-        ``第 q 批 = ceil(P*q/B) - ceil(P*(q-1)/B)``，因此每批是 ``floor(P/B)`` 或 ``ceil(P/B)``，
-        且合计恰好 P（每个阳性层在整轮里出现一次）。
-
-        为什么不用「保证前几批达标」的 ``max(q, ceil(P*q/B))``：在 P < B 的桶里它会退化成
-        「前 P 批每批 1 个、后面全 0」，一轮里出现大段**完全没有正样本**的 batch
-        （远程真实数据上 566 个 batch 里就有 117 个），这些 step 的监督信号为零。
-        均摊后阳性仍然一个不浪费，但铺满整轮、分布更平稳。
+        不要用 ``max(q, ceil(P*q/B))`` 那种「保证前几批达标」的写法：它会把阳性前置到前 P 批、
+        后面整段全 0。
         """
-        if key not in self._quota_map:
-            raise KeyError(f"未知的桶 {key}；可选：{sorted(self._quota_map)}")
-        batches = max(1, int(self._quota_map[key]))
-        n_pos_slices = int(self.dataset.pos_flags[self.dataset.buckets[key]].sum())
-        ideal = self._target_pos_per_batch()
+        import math
+
+        batches = max(1, int(self._n_batches))
+        total = int(self.dataset.pos_flags.sum())
 
         def cum(q: int) -> int:
-            return min(n_pos_slices, int(math.ceil(n_pos_slices * q / batches)))
+            return min(total, int(math.ceil(total * q / batches)))
 
-        return [min(ideal, cum(q) - cum(q - 1)) for q in range(1, batches + 1)]
+        return [min(self._n_pos, cum(q) - cum(q - 1)) for q in range(1, batches + 1)]
 
-    def bucket_budget(self, key: tuple) -> dict:
-        """该桶一轮 epoch 的「阳性预算」：目标 / 可达均值 / 单批下限 / 空批个数。
+    def __len__(self) -> int:
+        """一轮 epoch 的 batch 数 = 「切片覆盖 / 阳性槽位 / 阴性槽位」三个下界的最大值。
 
-        ``key`` 必须是**桶键**（即 ``bucket_key(H, W, pad_multiple)`` 的结果，如 ``(448, 448)``），
-        不是原始面内尺寸（``(436, 436)`` 这种会被拒绝——早期自检就传错成后者而报 KeyError）；
-        ``ds.bucket_of_case(case)`` 可以直接拿到某个病例所属的桶键。
-
-          * ``ideal``：``n_pos``（配置目标，阳性充足的桶取到它）；
-          * ``expect``：``min(ideal, ceil(P/B))``，该桶实际能给出的**平均**阳性数/批；
-          * ``floor``：``min(ideal, floor(P/B))``，单个 batch 的**最小**阳性数（自检判下界用）；
-          * ``empty_batches``：按 ``positive_plan`` 预测有多少个 batch 完全没有阳性
-            （P 远小于 B 时无法避免）。
-
-        ``expect < ideal`` 说明这个桶的病灶层太少，只能牺牲比例来保证覆盖（会打告警）。
+        注意它**可能大于** ``ceil(切片数 / batch_size)``：阳性层相对 ``n_pos`` 很多时，
+        要给每个阳性层留够槽位就得加 batch（多出来的槽位由阴性层填）。
         """
-        plan = self.positive_plan(key)
-        batches = max(1, int(self._quota_map[key]))
-        n_pos_slices = int(self.dataset.pos_flags[self.dataset.buckets[key]].sum())
-        ideal = self._target_pos_per_batch()
-        expect = min(ideal, int(math.ceil(n_pos_slices / batches))) if n_pos_slices else 0
-        floor = min(ideal, n_pos_slices // batches)
-        return {"batches": batches, "pos_slices": n_pos_slices,
-                "ideal": ideal, "expect": expect, "floor": floor,
-                "empty_batches": int(sum(1 for v in plan if v == 0)),
-                "plan_head": plan[:12]}
+        return int(self._n_batches)
 
-    def bucket_budgets(self) -> dict:
-        """所有桶的阳性预算（自检与报告用）。"""
-        return {key: self.bucket_budget(key) for key in sorted(self.dataset.buckets)}
+    def batch_targets(self) -> dict:
+        """本采样器的「可达阳性数/批」区间，供自检脚本判阈值与打印。
 
-    @property
-    def min_pos_per_batch_expected(self) -> int:
-        """全数据集层面「每批阳性数」的期望下限（各桶 floor 的最小值），供自检判阈值用。"""
-        return min((b["floor"] for b in self.bucket_budgets().values()), default=0)
+        ``ideal`` = 每批最多放几个阳性（配置目标）；``observed_max`` / ``floor`` = 均摊计划里
+        实际出现的最大/最小值。阳性层稀少时两者会低于 ``ideal``，这是覆盖与比例之间的取舍，
+        **自检必须按这个区间判，不能拿全局 0.30 直接当阈值**（旧版就是这样在 val 侧误报的）。
+        """
+        plan = list(self._plan)
+        return {
+            "batch_size": int(self.batch_size),
+            "batches": int(self._n_batches),
+            "ideal": int(self._n_pos),
+            "floor": int(min(plan)) if plan else 0,
+            "observed_max": int(max(plan)) if plan else 0,
+            "pos_slices": int(self.n_positive),
+            "neg_slices": int(self.n_negative),
+            "plan_head": plan[:12],
+        }
+
+    # ---------------- 迭代 ----------------
 
     def __iter__(self) -> Iterator[list]:
         self._epoch += 1
         rng = random.Random(self._seed_for_epoch(self._epoch))
-        # 每轮换新池：轮转状态跟着 epoch 走，且同一 seed 下逐轮可复现
-        pools: dict = {}
-        for key, positions in self.dataset.buckets.items():
-            flags = self.dataset.pos_flags[positions].tolist()
-            pools[key] = (
-                _CyclicPool([int(p) for p, f in zip(positions, flags) if f], rng),
-                _CyclicPool([int(p) for p, f in zip(positions, flags) if not f], rng),
-            )
+        pos_pool = _CyclicPool(np.flatnonzero(np.asarray(self.dataset.pos_flags)).tolist(), rng)
+        neg_pool = _CyclicPool(np.flatnonzero(~np.asarray(self.dataset.pos_flags)).tolist(), rng)
 
-        keys = list(self.dataset.buckets)
-        remaining = dict(self._quota_map)
-        pending: list = []
-        while True:
-            if not pending:
-                pending = [k for k in keys if remaining.get(k, 0) > 0]
-                if not pending:
-                    break
-                rng.shuffle(pending)
-            key = pending.pop()
-            batches_left = remaining.get(key, 0)      # 含当前这一个 batch
-            remaining[key] = batches_left - 1
-            batch = self._draw_batch(key, pools[key][0], pools[key][1], rng, batches_left)
-            if batch:
-                yield batch
+        for want_pos in self._plan:
+            batch = pos_pool.take(want_pos) + neg_pool.take(self.batch_size - want_pos)
+            if len(batch) < self.batch_size:
+                self._warn_shortage(len(batch))
+            rng.shuffle(batch)   # 阴性切片不总排在 batch 尾部；用本轮 rng，保证可复现
+            yield batch
 
-        for key, budget in self.bucket_budgets().items():
-            if budget["expect"] < budget["ideal"]:
-                LOGGER.warning("桶 %s：本轮 %d 个 batch 只有 %d 个阳性层（平均 %.2f 个/批，目标 %d）"
-                               "——桶内病灶层太少，为了让一轮覆盖每一层只能降低该桶的阳性比例；"
-                               "跑完这一折后如仍如此，可考虑调低 train.batch_size 或把该桶病例并入更大桶。",
-                               format_bucket(key), budget["batches"], budget["pos_slices"],
-                               budget["pos_slices"] / max(1, budget["batches"]), budget["ideal"])
+        self._warn_coverage()
 
-    def _target_pos_per_batch(self) -> int:
-        """目标阳性数/批：``min(batch_size, max(min_pos_per_batch, round(batch_size * pos_ratio_target)))``。"""
-        n_pos = int(round(self.batch_size * self.pos_ratio_target))
-        return min(self.batch_size, max(int(self.min_pos_per_batch), n_pos))
-
-    def _draw_batch(self, key: tuple, pos_pool: _CyclicPool, neg_pool: _CyclicPool,
-                    rng: random.Random, batches_left: int) -> list:
-        """在一个桶内抽一个 batch：先抽阳性，再用阴性补足。
-
-        阳性数取自 ``positive_plan(key)``（把该桶 P 个阳性层在 B 个 batch 上均摊），
-        所以整轮下来每个阳性层出现恰好一次、且不会有「前紧后空」的偏置。
-
-        ``P`` 远小于 ``B`` 的极小桶必然存在一些**全阴性 batch**（自检会报出 ``empty_batches``）；
-        这是「一轮覆盖每一层」的代价，比反复只训同几层更可接受。
-        """
-        n_pos = self._target_pos_per_batch()
-        n_neg = self.batch_size - n_pos
-        batches_left = max(1, int(batches_left))
-        total_batches = self._quota_map.get(key, max(1, batches_left))
-        drawn_batches = max(0, total_batches - batches_left)      # 已出的 batch 数
-        plan_pos = self.positive_plan(key)[drawn_batches] if drawn_batches < total_batches else 0
-
-        want_pos = max(0, min(plan_pos, n_pos, len(pos_pool) - pos_pool.drawn, self.batch_size))
-        want_neg = min(n_neg, len(neg_pool))
-        if want_pos < n_pos or want_neg < n_neg:
-            self._warn_shortage(key, n_pos, want_pos, n_neg, want_neg)
-        # 某一边不够时用另一边补足，保住 batch 大小（比例会偏离目标）
-        deficit = self.batch_size - want_pos - want_neg
-        if deficit > 0:
-            take_neg = min(deficit, max(0, len(neg_pool) - want_neg))
-            want_neg += take_neg
-            deficit -= take_neg
-            want_pos += min(deficit, max(0, len(pos_pool) - want_pos))
-
-        batch = [pos_pool.pop() for _ in range(want_pos)]
-        batch += [neg_pool.pop() for _ in range(want_neg)]
-        rng.shuffle(batch)  # 阴性切片不总排在 batch 尾部；用本轮 rng，保证可复现
-        return batch
-
-    def _warn_shortage(self, key: tuple, n_pos: int, got_pos: int, n_neg: int, got_neg: int) -> None:
+    def _warn_shortage(self, got: int) -> None:
         if self._warnings >= self.MAX_WARNINGS:
             return
         self._warnings += 1
-        LOGGER.warning("桶 %s 样本不足：目标 %d 正 / %d 负，本 batch 抽到 %d 正 / %d 负"
-                       "（桶内病灶层或阴性层太少）。比例可能低于目标，但一轮仍会覆盖桶内每一层。",
-                       format_bucket(key), n_pos, n_neg, got_pos, got_neg)
+        LOGGER.warning("本 batch 只凑到 %d/%d 个样本（阳性或阴性层太少），比例可能偏离目标；"
+                       "一轮仍会覆盖数据集里每一层切片。", got, self.batch_size)
+
+    def _warn_coverage(self) -> None:
+        """抽样槽位装不下全部切片时给出一次告警（这会让「一轮覆盖全部切片」失效）。"""
+        slots = self._n_batches * self.batch_size
+        if slots < len(self.dataset):
+            self._warn_shortage(slots)
+            LOGGER.warning("一轮 %d 个 batch × %d = %d 个槽位 < 数据集 %d 层切片："
+                           "本轮无法覆盖全部切片，请调大 batch 数或检查 batch_size/pos_ratio_target",
+                           self._n_batches, self.batch_size, slots, len(self.dataset))
 
     def _seed_for_epoch(self, epoch: int) -> int:
         """由 (seed, epoch, 病例集合) 派生本轮种子；用 sha256 派生，跨进程、跨机器稳定。"""
@@ -1234,50 +1254,47 @@ class BucketBatchSampler(BatchSampler):
         return self._seed_for_epoch(epoch)
 
     def describe(self) -> str:
-        """返回采样器配置与逐桶配额的多行描述。"""
-        lines = [
-            f"BucketBatchSampler：batch_size={self.batch_size} "
-            f"pos_ratio_target={self.pos_ratio_target} "
-            f"n_pos={self._target_pos_per_batch()} seed={self.seed} "
-            f"每轮 batch 数={len(self)}（数据集共 {len(self.dataset)} 层切片）",
-        ]
-        for key in sorted(self.dataset.buckets):
-            n_pos, n_neg = self.bucket_counts[key]
-            b = self.bucket_budget(key)
-            extra = ""
-            if b["expect"] < b["ideal"]:
-                extra = f"  ← 病灶层不足，实际约 {b['pos_slices'] / max(1, b['batches']):.2f} 正/批"
-            lines.append(f"  桶 {format_bucket(key):>9}：切片 {len(self.dataset.buckets[key]):5d}"
-                         f"（正 {n_pos:4d} / 负 {n_neg:5d}）  每轮配额 {b['batches']:4d} 个 batch"
-                         f"，阳性 {b['pos_slices']:4d} 层 → {b['expect']} 正/批（目标 {b['ideal']}）{extra}")
-        return "\n".join(lines)
+        """返回采样器配置与一轮计划的多行描述。"""
+        plan = self._plan
+        from collections import Counter
+
+        counts = Counter(plan)
+        return "\n".join([
+            f"ProportionalBatchSampler：batch_size={self.batch_size} "
+            f"pos_ratio_target={self.pos_ratio_target} → n_pos={self._n_pos}/批 "
+            f"（实际比例 {self._n_pos / self.batch_size:.3f}）seed={self.seed}",
+            f"  数据集 {len(self.dataset)} 层切片（阳性 {self.n_positive} / 阴性 {self.n_negative}），"
+            f"一轮 {self._n_batches} 个 batch；阳性层均摊后每批 "
+            + "、".join(f"{k} 个的有 {v} 批" for k, v in sorted(counts.items())),
+            f"  每个阳性层一轮出现恰好 1 次；阴性层不足时会在 _CyclicPool 里重复抽取。",
+        ])
 
 
 def make_batch_sampler(ds: CTSliceDataset, cfg: dict, generator=None) -> BatchSampler:
-    """构造训练用 ``BatchSampler``（分桶 + batch 内阳性比例固定）。
+    """构造训练用 ``BatchSampler``（单一池 + batch 内阳性比例固定）。
 
     ``generator`` 只用来取一个额外的 seed 偏移（``torch.Generator`` 的随机数流跨进程不可靠，
-    因此真正的随机源是「seed + epoch」派生出的 ``random.Random``，见 ``BucketBatchSampler``）。
+    因此真正的随机源是「seed + epoch」派生出的 ``random.Random``，见 ``ProportionalBatchSampler``）。
     """
     train_cfg = (cfg or {}).get("train") or {}
-    data_cfg = data_config(cfg)
     seed = int(train_cfg.get("seed", 42))
     if generator is not None:
         try:
             seed = seed + int(generator.initial_seed()) % 100000
         except Exception:  # noqa: BLE001 - 自定义 generator 没有 initial_seed 时忽略
             pass
-    sampler = BucketBatchSampler(
+    sampler = ProportionalBatchSampler(
         ds,
         batch_size=int(train_cfg.get("batch_size", 8)),
         pos_ratio_target=float(train_cfg.get("pos_ratio_target", 0.30)),
         seed=seed,
-        min_pos_per_batch=int(data_cfg.get("min_pos_per_batch", 1)),
-        bucket_balance=bool(data_cfg.get("bucket_balance", True)),
     )
+    targets = sampler.batch_targets()
     LOGGER.info("训练采样器：batch_size=%d，batch 内目标阳性比例=%.2f（数据集整体阳性率 %.4f，"
-                "约 %.1f 倍过采样）", sampler.batch_size, sampler.pos_ratio_target, ds.pos_ratio,
-                sampler.pos_ratio_target / max(1e-9, ds.pos_ratio))
+                "约 %.1f 倍过采样）；一轮 %d 个 batch，每批 %d~%d 个阳性层",
+                sampler.batch_size, sampler.pos_ratio_target, ds.pos_ratio,
+                sampler.pos_ratio_target / max(1e-9, ds.pos_ratio),
+                targets["batches"], targets["floor"], targets["observed_max"])
     return sampler
 
 
@@ -1329,7 +1346,7 @@ def _fold_cases(splits: dict, fold: int, which: str) -> list:
 
 
 def make_train_loader(splits: dict | None, fold: int, cfg: dict) -> DataLoader:
-    """训练加载器：分桶采样 + 训练增强；顺序由 ``BucketBatchSampler`` 决定（不额外 shuffle）。
+    """训练加载器：定向过采样 + 训练增强；顺序由 ``ProportionalBatchSampler`` 决定（不额外 shuffle）。
 
     训练病例直接取自 ``splits`` 里该折的 ``train``（21 例 = 16 含肿瘤 + 5 仅肝脏），
     不依赖 ``cases="train"`` 的并集语义，避免「漏传 fold 时静默用上全部 25 例」。
@@ -1353,7 +1370,7 @@ def make_train_loader(splits: dict | None, fold: int, cfg: dict) -> DataLoader:
 
 
 def make_val_loader(splits: dict | None, fold: int, cfg: dict) -> DataLoader:
-    """验证加载器：顺序、无增强、不做分桶采样。
+    """验证加载器：顺序、无增强（仍然补边到 ``data.target_hw``，形状与训练侧一致）。
 
     验证阶段是「按病人整卷推理」（第 4 轮 ``src/infer.py``），逐层按 z 顺序读即可；
     这里不 shuffle 是为了让每折的验证顺序固定、指标可复现。
@@ -1368,7 +1385,6 @@ def make_val_loader(splits: dict | None, fold: int, cfg: dict) -> DataLoader:
                         augment=False, fold=int(fold))
     batch_size = data_cfg.get("val_batch_size") or int(train_cfg.get("batch_size", 8))
     generator = make_generator(int(train_cfg.get("seed", 42)) + int(fold))
-    # 验证侧逐层顺序读，batch 内同样只会出现一种面内尺寸（每例一个桶），照用同一个 collate
     verify = bool(data_cfg.get("verify_batch", True))
     return DataLoader(ds, batch_size=int(batch_size), shuffle=False, drop_last=False,
                       generator=generator, collate_fn=lambda samples: collate_samples(samples, verify=verify),

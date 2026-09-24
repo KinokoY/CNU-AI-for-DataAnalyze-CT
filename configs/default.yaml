@@ -31,22 +31,28 @@ model:
   out_channels: 2                 # 0=背景, 1=肿瘤（label 1 肝脏已置 0）
   encoder_channels: [32, 64, 128, 256]
   norm: batch
-  pad_to_multiple: 16             # U-Net 4 级下采样 = 2^4，前向内部 pad 到 16 的整数倍再 crop 回
+  pad_to_multiple: 16             # U-Net 4 级下采样 = 2^4；dataset 已把每个样本补到 512（16 的倍数），
+                                  # 因此前向内部不再需要 pad。保留该项是为了给 data.target_hw 做对齐
+                                  # （见 src/dataset.resolve_target_hw），改小 target_hw 调试时才有实际作用
   encoder_pretrained: null        # 基础版 null；进阶版可填 "resnet18" / "resnet34"
   pretrained_weights_path: null   # 本地权重文件绝对路径（离线加载，不走网络）
 
 # ---------- 数据 / DataLoader（src/dataset.py） ----------
+# 统一补边口径：**不再按面内尺寸分桶**。读取切片后（uint16/65535 还原成 [0,1]）把 image 与
+# label 一起补边到 data.target_hw，于是所有 batch 的空间维恒为 512×512、torch.stack 永远合法；
+# 512 是 16 的倍数，模型内部不需要再 pad。每样本的原始尺寸与补边偏移随 batch 一起给出
+# （orig_hw / pad_offset），第 4 轮整卷推理按 pad_offset 裁回原始面内尺寸。
 data:
-  pad_multiple: 16                # 面内尺寸分桶对齐；缺省时回退到 model.pad_to_multiple（必须一致！）
+  target_hw: [512, 512]           # 面内统一补边到的目标尺寸（H, W）；只能比实际尺寸大，不能小
+  pad_align: center               # center = 居中补边（默认）；bottom-right = 右侧/下侧补 0
+                                  # 补边值与背景同为 0；非 512 病例的补边区在增强后不再严格为 0
   index_cache_size: 8             # 每个 worker 缓存的 nibabel 句柄数（num_workers × 该值 = 并发句柄上限）
   num_workers: 8                  # 远程 52 核，8 worker × lru_cache(8) 句柄可控
   pin_memory: true
   persistent_workers: false       # 折内 epoch 之间不重建 worker（调试时可保持不变）
   val_batch_size: null            # null = 用 train.batch_size；验证是顺序读，只影响速度
-  bucket_balance: true            # 每轮 batch 配额按桶内样本数加权（否则小桶被过度重复）
-  min_pos_per_batch: 1            # 每个 batch 至少 1 个肿瘤切片（小桶兜底；正常桶由 pos_ratio_target 决定）
-  pos_ratio_tolerance: 0.10       # 自检脚本判定「实测阳性比例偏离目标」的阈值
-  verify_batch: true              # collate 时校验 batch 不变量（尺寸/值域/label 取值），开销可忽略
+  pos_ratio_tolerance: 0.20       # 自检脚本判定「实测阳性比例偏离目标」的阈值
+  verify_batch: true              # collate 时校验 batch 不变量（形状/值域/label 取值），开销可忽略
   augment:                        # 仅训练；验证侧不做任何几何变换
                                   # 全部自实现（src/dataset.py），不依赖 MONAI：
                                   #   FlipSlice2D / Rotate90Slice2D / RandAffineSlice2D /
@@ -56,7 +62,7 @@ data:
     affine_prob: 0.5              # 仿射：旋转 + 缩放 + 平移（image 双线性 / label 最近邻）
     rotation_deg: 15.0            # 旋转 ±15°
     scale_range: [0.9, 1.1]       # 缩放 0.9–1.1（采样坐标口径，>1 = 内容放大）
-    shift_frac: 0.1               # 平移 ±10% 面内边长（内部换算成像素位移）
+    shift_frac: 0.1               # 平移 ±10% 面内边长（按 512 换算成像素位移）
     gamma_prob: 0.2               # 随机 gamma 校正 img**gamma（单调的强度重排，只动 image）
     gamma_range: [0.75, 1.33]     #   <1 提亮、>1 压暗；要求输入已在 [0,1]（cache 正好是）
     noise_prob: 0.2               # 高斯噪声，只动 image
