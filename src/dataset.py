@@ -5,9 +5,10 @@
        （用于算 ``pos_flags`` 与索引），**不读 image 体素**；``__getitem__`` 用每 worker 一份的
        ``lru_cache`` 持有 nibabel 代理对象（``memmap=True``），只取 ``[:, :, z]`` 这一层，
        归一化后把 image/label **居中补边到 ``data.target_hw``（默认 512×512）**。
-    2. ``ProportionalBatchSampler`` —— 单一池 + 定向抽样的 ``BatchSampler``：每个 batch 抽
-       ``n_pos = round(batch_size * pos_ratio_target)`` 个含肿瘤切片、其余抽不含肿瘤切片。
-       因为所有样本补边后都是同一个形状，``torch.stack`` 恒成立，**不再需要按面内尺寸分桶**。
+    2. ``ProportionalBatchSampler`` —— 单一池 + 定向抽样的 ``BatchSampler``：先把含肿瘤切片
+       在整轮 batch 上均摊（每个阳性层一轮恰好出现一次，每批不超过 ``n_pos`` 上限），
+       再用不含肿瘤的切片把每个 batch 补满。因为所有样本补边后都是同一个形状，
+       ``torch.stack`` 恒成立，**不再需要按面内尺寸分桶**。
     3. ``make_train_loader`` / ``make_val_loader`` —— 训练侧定向采样+增强；验证侧顺序、无增强。
     4. ``build_transforms`` —— 仅训练用的 2D 增强：翻转 / 旋转 90° / 仿射 / 随机 gamma / 高斯噪声，
        **全部自己实现，不依赖 MONAI**（原因见 ``make_augment_steps`` 的说明）。
@@ -1039,7 +1040,7 @@ def collate_samples(samples: Sequence[dict], verify: bool = True) -> dict:
 
 
 # --------------------------------------------------------------------------------------
-# 单一池 + 定向过采样的 BatchSampler
+# 单一池 + 阳性层均摊的 BatchSampler
 # --------------------------------------------------------------------------------------
 
 class _CyclicPool:
@@ -1102,6 +1103,10 @@ class ProportionalBatchSampler(BatchSampler):
     基线口径见 docs/baseline.md）。改成「阳性总数在整轮均摊 + 阴性补满」之后，
     每个阳性层在一轮里**恰好出现一次**，也不会为了凑比例而丢弃阴性层。
 
+    ``pos_ratio_target`` 只是**每批阳性数的上限**，不是每批的实际比例：一轮的阳性层总数是固定的
+    （``P``），摊到 ``B`` 个 batch 上每批就是 ``P/B`` 个。fold 0 实测 ``P=617, B=642``
+    → 每批实际 1 个（不是上限 2 个），所以「提高每批阳性数」要靠加大 ``batch_size``。
+
     保证（自检脚本逐条验证）：
       * batch 大小恒为 ``batch_size``（池子够大时），形状恒为 ``(B,1,512,512)``；
       * 一轮 epoch 内**每一层切片至少出现一次**（阳性层恰好一次、无重复）；
@@ -1114,6 +1119,11 @@ class ProportionalBatchSampler(BatchSampler):
       * ``ceil(阴性层数 / (batch_size - n_pos))``：让阴性层尽量不要重复抽。
     所以 batch 数**可能大于** ``ceil(切片数 / batch_size)``（当 ``P`` 相对 ``n_pos`` 很大时），
     自检里不能拿「切片数/batch_size」直接等号比对。
+
+    **全阴性 batch 数由 batch 数与阳性层数共同决定**：能覆盖全部阴性层的最小 batch 数可能大于
+    ``P``（fold 0 实测：``B=642`` 而 ``P=617``），此时按均摊公式必然有 ``B-P`` 个 batch 一个阳性
+    也分不到（fold 0 是 25 个）。本地穷举过 ``B`` 的可行区间，这个数量就是该约束下的下界，
+    不是采样 bug；要减少它就得接受阴性层重复（或调 ``batch_size``，见下一段）。
     """
 
     #: 告警的打印上限，避免刷屏
@@ -1142,7 +1152,7 @@ class ProportionalBatchSampler(BatchSampler):
         by_positive = int(-(-n_pos_slices // self._n_pos)) if n_pos_slices > 0 else 0
         by_samples = int(-(-len(dataset) // self.batch_size))
         if self._n_neg > 0:
-            # 覆盖全部阴性层所需的最少 batch 数（不足时会在 _CyclicPool 里重复抽取）
+            # 让阴性层一轮不重复所需的最少 batch 数（不够时 _CyclicPool 会重复抽取）
             by_negative = int(-(-(len(dataset) - n_pos_slices) // self._n_neg))
             self._n_batches = max(1, by_samples, by_positive, by_negative)
         else:
@@ -1150,19 +1160,17 @@ class ProportionalBatchSampler(BatchSampler):
         self._plan = self._build_plan()
         self.n_positive = n_pos_slices
         self.n_negative = int(len(dataset) - n_pos_slices)
-        if sum(self._plan) < min(n_pos_slices, self._n_batches * self._n_pos):
-            LOGGER.error("阳性层 %d 个、一轮却只有 %d 个阳性槽位（%d batch × %d 正/批）："
-                         "本轮无法覆盖全部阳性层，请调大 train.batch_size 或 pos_ratio_target",
-                         n_pos_slices, self._n_batches * self._n_pos, self._n_batches, self._n_pos)
 
     # ---------------- 计划与长度 ----------------
 
     def _target_pos_per_batch(self) -> int:
         """目标阳性数/批：``min(batch_size, max(1, round(batch_size * pos_ratio_target)))``。
 
-        ``batch_size=8, pos_ratio_target=0.30`` → ``round(2.4) = 2`` → 实际比例 **0.25**
-        （≈ 原始 12.81% 的 1.95 倍）。这是取整的必然结果，不是 bug；想更贴近 0.30
-        就把 ``batch_size`` 提到 10/20，或直接改 ``pos_ratio_target``。
+        ``batch_size=8, pos_ratio_target=0.30`` → ``round(2.4) = 2``：这是每批的**上限**。
+        实际每批放几个还要看阳性层总数够不够摊（见类 docstring：fold 0 上 617 个阳性层
+        摊到 642 个 batch，于是每批实际只有 1 个，批次平均比例 0.12 而不是 0.25）。
+        想提高每批阳性数就把 ``batch_size`` 提上去：按 fold 0 的数字，``batch_size=16``（n_pos=5）
+        时一轮 351 个 batch、每批 1~2 个阳性、全阴性 0 个；``batch_size=10`` 时每批 2 个。
         """
         return min(self.batch_size, max(1, int(round(self.batch_size * self.pos_ratio_target))))
 
@@ -1261,12 +1269,13 @@ class ProportionalBatchSampler(BatchSampler):
         counts = Counter(plan)
         return "\n".join([
             f"ProportionalBatchSampler：batch_size={self.batch_size} "
-            f"pos_ratio_target={self.pos_ratio_target} → n_pos={self._n_pos}/批 "
-            f"（实际比例 {self._n_pos / self.batch_size:.3f}）seed={self.seed}",
+            f"pos_ratio_target={self.pos_ratio_target} → n_pos={self._n_pos}/批（上限）"
+            f"seed={self.seed}",
             f"  数据集 {len(self.dataset)} 层切片（阳性 {self.n_positive} / 阴性 {self.n_negative}），"
             f"一轮 {self._n_batches} 个 batch；阳性层均摊后每批 "
             + "、".join(f"{k} 个的有 {v} 批" for k, v in sorted(counts.items())),
-            f"  每个阳性层一轮出现恰好 1 次；阴性层不足时会在 _CyclicPool 里重复抽取。",
+            f"  每个阳性层一轮出现恰好 1 次；阴性层不足时会在 _CyclicPool 里重复抽取"
+            f"（含阳性的 batch 会因此被摊薄，这不是 bug）。",
         ])
 
 
@@ -1290,11 +1299,18 @@ def make_batch_sampler(ds: CTSliceDataset, cfg: dict, generator=None) -> BatchSa
         seed=seed,
     )
     targets = sampler.batch_targets()
-    LOGGER.info("训练采样器：batch_size=%d，batch 内目标阳性比例=%.2f（数据集整体阳性率 %.4f，"
-                "约 %.1f 倍过采样）；一轮 %d 个 batch，每批 %d~%d 个阳性层",
-                sampler.batch_size, sampler.pos_ratio_target, ds.pos_ratio,
-                sampler.pos_ratio_target / max(1e-9, ds.pos_ratio),
-                targets["batches"], targets["floor"], targets["observed_max"])
+    # 「实际过采样倍数」不能拿 pos_ratio_target / 整体阳性率 算：那个目标只是每批的**上限**。
+    # 正确口径是「一轮里阳性层的出现次数 / 一轮总槽位数」再除以整体阳性率
+    # （每个阳性层恰好抽一次，所以出现次数就是 P；B×bs 是一轮槽位数）。fold 0 实测
+    # 617/(642×8) = 0.120，整体 0.138 → 0.87 倍，也就是**几乎没有重复采样**。
+    slots = max(1, targets["batches"] * sampler.batch_size)
+    epoch_ratio = targets["pos_slices"] / slots
+    LOGGER.info("训练采样器：batch_size=%d，每批阳性上限 n_pos=%d（pos_ratio_target=%.2f）；"
+                "一轮 %d 个 batch，每批实际 %d~%d 个阳性层，阳性层一轮出现占比 %.4f"
+                "（整体 %.4f，约 %.2f 倍）",
+                sampler.batch_size, targets["ideal"], sampler.pos_ratio_target,
+                targets["batches"], targets["floor"], targets["observed_max"],
+                epoch_ratio, ds.pos_ratio, epoch_ratio / max(1e-9, ds.pos_ratio))
     return sampler
 
 
@@ -1346,7 +1362,7 @@ def _fold_cases(splits: dict, fold: int, which: str) -> list:
 
 
 def make_train_loader(splits: dict | None, fold: int, cfg: dict) -> DataLoader:
-    """训练加载器：定向过采样 + 训练增强；顺序由 ``ProportionalBatchSampler`` 决定（不额外 shuffle）。
+    """训练加载器：阳性层均摊采样 + 训练增强；顺序由 ``ProportionalBatchSampler`` 决定（不额外 shuffle）。
 
     训练病例直接取自 ``splits`` 里该折的 ``train``（21 例 = 16 含肿瘤 + 5 仅肝脏），
     不依赖 ``cases="train"`` 的并集语义，避免「漏传 fold 时静默用上全部 25 例」。

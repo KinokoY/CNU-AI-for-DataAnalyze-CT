@@ -31,6 +31,32 @@ conda 环境 `unet`（已激活），Python 3.11.16，解释器 `/home/phdauser0
 
 安装新包需用户在远程手动执行，优先在现有依赖内解决问题。
 
+## 命令速查（哪些是正式流程、哪些只是自检）
+
+所有命令都在**仓库根目录**执行，每步的期望输出与报错处置见 `docs/baseline.md`。
+
+正式流程（数据 → 训练 → 评估，跑一遍就够）：
+
+```bash
+python scripts/preprocess.py        # 预处理 → cache/（第 1 轮，已跑过）
+python scripts/check_cache.py       # 缓存体检（已跑过）
+python scripts/make_splits.py       # 5 折划分 → data/splits.json（已跑过）
+python -m src.train --fold 0 --debug   # 第 3 轮起：冒烟跑几个 iteration，看显存定 batch_size
+for f in 0 1 2 3 4; do python -m src.train --fold $f; done   # 正式训练
+python -m src.evaluate --all        # 第 4 轮：汇总 5 折指标
+```
+
+自检 / 核对类（改过对应代码后才需要重跑；只读 cache，不需要 GPU，不写 runs/）：
+
+```bash
+python -m src.selfcheck_data        # 第 2 轮：数据进模型的形态（shape/值域/标签/补边/增强/采样器）
+python scripts/probe_axis.py --case 31   # 只在改动写盘逻辑后需要重跑
+```
+
+`src/selfcheck_data.py` 不是开发期的临时脚本，而是**长期保留的回归自检**：它核对的是
+「cache 与配置、代码三者是否自洽」，任何一轮改了预处理、dataset、配置之后都应当重跑一遍
+（秒级到十几秒）。它不产生训练产物，也不需要 GPU（日志里的显存行只是顺带报告）。
+
 ## 其他约定
 
 - 显存 40 GiB 单卡：优先 patch-based（如 96³–128³）训练，注意 `num_workers` 与 52 核的匹配。

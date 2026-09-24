@@ -77,7 +77,11 @@ train:
   epochs: 200
   early_stop_patience: 20         # 按验证集「整卷肿瘤 Dice」早停
   amp: bf16                       # A100 支持 bf16
-  pos_ratio_target: 0.30          # batch 内含肿瘤切片的目标占比（原始约 12.81%）
+  pos_ratio_target: 0.30          # batch 内阳性层数的**上限**（round(bs×该值)，bs=8 → 2）。
+                                  # 注意实际每批阳性数 = 阳性层总数/一轮 batch 数：fold 0 实测
+                                  # bs=8 时一轮 642 个 batch、617 个阳性层 → 每批实际 1 个、25 个
+                                  # 全阴性 batch；想提高每批阳性数优先调大 batch_size（bs=16 → 1~2 个、
+                                  # 全阴性 0 个），见 docs/preprocess_notes.md 6.3
   val_every: 1
   grad_clip_norm: 0.0             # >0 时对梯度做裁剪
   seed: 42
