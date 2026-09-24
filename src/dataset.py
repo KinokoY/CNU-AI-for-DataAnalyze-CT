@@ -821,6 +821,15 @@ class CTSliceDataset(Dataset):
         """该桶里出现的病例列表（升序）。"""
         return sorted({self.index[i][0] for i in self.buckets[key]})
 
+    def bucket_of_case(self, case: int) -> tuple:
+        """某个病例所属的**桶键**（避免调用方误用 ``case_hw`` 里的原始面内尺寸）。
+
+        ``case_hw[case]`` 是原始面内尺寸（如 ``(436, 436)``），而分桶键是它向上对齐 16 之后的值
+        （``(448, 448)``）——两者不同，混用会在 ``bucket_budget()`` 里报 KeyError（已踩过）。
+        """
+        height, width = self.case_hw[int(case)]
+        return bucket_key(height, width, self.pad_multiple)
+
     def describe(self) -> str:
         """返回多行描述：split、病例、切片数、阳性比例、逐桶明细。"""
         lines = [
@@ -1086,6 +1095,10 @@ class BucketBatchSampler(BatchSampler):
 
     def bucket_budget(self, key: tuple) -> dict:
         """该桶一轮 epoch 的「阳性预算」：目标 / 可达均值 / 单批下限 / 空批个数。
+
+        ``key`` 必须是**桶键**（即 ``bucket_key(H, W, pad_multiple)`` 的结果，如 ``(448, 448)``），
+        不是原始面内尺寸（``(436, 436)`` 这种会被拒绝——早期自检就传错成后者而报 KeyError）；
+        ``ds.bucket_of_case(case)`` 可以直接拿到某个病例所属的桶键。
 
           * ``ideal``：``n_pos``（配置目标，阳性充足的桶取到它）；
           * ``expect``：``min(ideal, ceil(P/B))``，该桶实际能给出的**平均**阳性数/批；

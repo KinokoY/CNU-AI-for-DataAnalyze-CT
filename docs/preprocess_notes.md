@@ -63,7 +63,8 @@
   `ideal/expect/floor/empty_batches`，自检按它判阈值。
 - 采样器保证：一轮 epoch 内每层切片至少出现一次、**阳性层恰好各一次**；阳性充足的桶里每批阳性数
   恒为 `n_pos`；采样顺序只由 `(train.seed, epoch, 病例集合)` 决定（用 sha256 派生，不用内置
-  `hash()`），与 `num_workers` 无关，可复现。
+  `hash()`），与 `num_workers` 无关，可复现。**可复现性的正确口径**：同 epoch+同 seed 两次采样
+  必须完全一致；**相邻 epoch 必须不同**（不同 epoch 种子不同是有意设计，别误判成"不可复现"）。
 - `num_workers` 等 DataLoader 参数从 `train` 节挪到了 `data` 节（`configs/default.yaml` 已补 `data` 节）。
 - 增强 8 步（image/label 同步，仅训练；**全部自实现，不依赖 MONAI**）：
   `FlipSlice2D`（翻行、翻列各一次）、`Rotate90Slice2D`（整 90°）、`RandAffineSlice2D`

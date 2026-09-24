@@ -433,6 +433,12 @@ def check_augment(cfg: dict, ds: CTSliceDataset, n_samples: int, problems: list)
 
     传入的 ``ds`` 必须是**无增强**的数据集（``augment=False``），这样取到的是原始切片；
     增强流水线单独用 ``build_transforms`` 构造（自实现，随机源由 seed 固定）。
+
+    **抽样是刻意的**：训练集里含肿瘤的切片只占 13.8%，随机抽 8 个样本通常有 ~7 个 label 全空，
+    而全空 label 无论怎么翻转/旋转都还是全空——于是「label 被改动 0 个」这条判据会被噪声淹没
+    （远程第一次跑就出现了这个假警报）。所以这里分两组取样：
+      * ``--aug-samples`` 个**含肿瘤**的切片（``pos_flags`` 为真）→ 几何增强必须改到 label；
+      * 同样数量的全背景切片 → label 应当保持全空（顺带验证增强不会凭空造出前景）。
     """
     transforms = build_transforms(cfg, train=True, seed=int(((cfg or {}).get("train") or {}).get("seed", 42)))
     if transforms is None:
@@ -441,9 +447,23 @@ def check_augment(cfg: dict, ds: CTSliceDataset, n_samples: int, problems: list)
 
     rng = np.random.default_rng(int(((cfg or {}).get("train") or {}).get("seed", 42)))
     n = len(ds)
-    indices = [int(i) for i in rng.choice(n, size=min(n_samples, n), replace=False)]
+    pos_idx = np.flatnonzero(np.asarray(ds.pos_flags))
+    neg_idx = np.flatnonzero(~np.asarray(ds.pos_flags))
+    take = min(int(n_samples), max(1, len(pos_idx)))
+    if len(pos_idx):
+        picked_pos = [int(i) for i in rng.choice(pos_idx, size=take, replace=False)]
+    else:
+        picked_pos = [int(i) for i in rng.choice(n, size=min(int(n_samples), n), replace=False)]
+    picked_neg = ([int(i) for i in rng.choice(neg_idx, size=min(int(n_samples), len(neg_idx)), replace=False)]
+                  if len(neg_idx) else [])
+    indices = picked_pos + picked_neg
+    n_pos_group = len(picked_pos)
+    pos_group = set(picked_pos)
+
     changed = 0
     label_changed = 0
+    label_changed_pos = 0        # 含肿瘤切片这一组里 label 被改动的个数
+    empty_label_kept = 0         # 全背景切片里 label 仍为全空的个数
     shapes_ok = True
     ranges_ok = True
     labels_ok = True
@@ -474,26 +494,40 @@ def check_augment(cfg: dict, ds: CTSliceDataset, n_samples: int, problems: list)
             changed += 1
         if not np.array_equal(aug_label, raw_label):
             label_changed += 1
+            if i in pos_group:
+                label_changed_pos += 1
+        elif i not in pos_group:
+            empty_label_kept += 1
 
     info = {
         "n_samples": len(indices),
+        "n_pos_group": n_pos_group,
         "image_changed": changed,
         "image_changed_ratio": round(changed / max(1, len(indices)), 4),
         "label_changed": label_changed,
         "label_changed_ratio": round(label_changed / max(1, len(indices)), 4),
+        "label_changed_in_pos_group": label_changed_pos,
+        "pos_group_label_changed_ratio": round(label_changed_pos / max(1, n_pos_group), 4),
+        "empty_label_kept_empty": empty_label_kept,
         "shapes_preserved": shapes_ok,
         "value_range_ok": ranges_ok,
         "label_binary_ok": labels_ok,
     }
-    LOGGER.info("增强自检（%d 个样本）：image 被改动 %d 个（%.2f）、label 被改动 %d 个（%.2f）；"
-                "形状/值域/标签二值 = %s/%s/%s",
-                info["n_samples"], changed, info["image_changed_ratio"],
-                label_changed, info["label_changed_ratio"],
+    LOGGER.info("增强自检（%d 个样本 = %d 含肿瘤 + %d 全背景）：image 被改动 %d 个（%.2f）；"
+                "含肿瘤组的 label 被改动 %d/%d（%.2f）——几何增强生效与否看这一项；"
+                "全背景组 label 仍全空 %d/%d；形状/值域/标签二值 = %s/%s/%s",
+                info["n_samples"], n_pos_group, len(indices) - n_pos_group,
+                changed, info["image_changed_ratio"],
+                label_changed_pos, n_pos_group, info["pos_group_label_changed_ratio"],
+                empty_label_kept, len(indices) - n_pos_group,
                 shapes_ok, ranges_ok, labels_ok)
     if changed == 0:
-        LOGGER.warning("所有样本的 image 都没被改动：增强概率可能全为 0，或 transforms 没接上")
-    if label_changed == 0:
-        LOGGER.warning("所有样本的 label 都没被改动：几何增强可能没生效（翻转/旋转/仿射应当会改到 label）")
+        problems.append("增强自检：所有样本的 image 都没被改动（增强概率可能全为 0 或流水线没接上）")
+    if n_pos_group and label_changed_pos == 0:
+        problems.append(f"增强自检：{n_pos_group} 个含肿瘤切片的 label 一个都没被改动"
+                        f"（几何增强没生效）")
+    if empty_label_kept != len(indices) - n_pos_group:
+        problems.append("增强自检：全背景切片的 label 被增强改成了非空（不应发生）")
     return info
 
 
@@ -705,57 +739,71 @@ def check_augment_pipeline(cfg: dict, problems: list) -> dict:
 
 
 def check_sampler(ds: CTSliceDataset, cfg: dict, problems: list) -> dict:
-    """采样器自检：批数与配额、正/负覆盖、以及「同 seed 两轮完全一致」的可复现性。
+    """采样器自检：批数与配额、正/负覆盖、可复现性。
 
-    这是**唯一一处需要跑完整轮采样**的自检（566+ 个 batch，纯索引运算、秒级）。
-    两轮必须逐 batch 完全相同；不一致时会把首个差异 batch 的索引与样本形状打出来，
-    便于定位（本地用同规模 fixture 复现不出来，所以这里留了诊断输出）。
+    可复现性的正确口径（这里踩过坑）：
+      * **同一个 epoch 用同一个 seed 必须完全一致** → 用两个**新建的**采样器各跑一次比较；
+      * **相邻 epoch 必须不同**（否则过采样会退化成每轮固定同一顺序）→ 同一采样器连续两轮比较。
+
+    早期版本直接把「同一个采样器连续迭代两次」当成可复现性检查，但那两次是 epoch 1 与 epoch 2，
+    种子本来就不同（`_seed_for_epoch(1) != _seed_for_epoch(2)`），于是把一个**正常**行为报成了
+    「采样器不可复现」。
     """
-    sampler = BucketBatchSampler(ds, batch_size=int(((cfg or {}).get("train") or {}).get("batch_size", 8)),
-                                 pos_ratio_target=float((((cfg or {}).get("train") or {})
-                                                         .get("pos_ratio_target", 0.30))),
-                                 seed=int(((cfg or {}).get("train") or {}).get("seed", 42)))
+    train_cfg = (cfg or {}).get("train") or {}
+    kwargs = dict(batch_size=int(train_cfg.get("batch_size", 8)),
+                  pos_ratio_target=float(train_cfg.get("pos_ratio_target", 0.30)),
+                  seed=int(train_cfg.get("seed", 42)))
+    sampler = BucketBatchSampler(ds, **kwargs)
     LOGGER.info("%s", sampler.describe())
 
-    first = [list(b) for b in sampler]
-    second = [list(b) for b in sampler]
-    n_batches = len(first)
-    reproducible = bool(first == second)
+    # 1) 可复现性：两个新建采样器的 epoch 1 必须逐 batch 相同
+    run_a = [list(b) for b in BucketBatchSampler(ds, **kwargs)]
+    run_b = [list(b) for b in BucketBatchSampler(ds, **kwargs)]
+    reproducible = bool(run_a == run_b)
+    # 2) 相邻 epoch 应当不同（同一 sampler 连续两轮）
+    run_e1 = [list(b) for b in sampler]
+    run_e2 = [list(b) for b in sampler]
+    epochs_differ = bool(run_e1 != run_e2)
+
+    n_batches = len(run_a)
     info = {
         "n_batches_per_epoch": n_batches,
         "expected_batches": round(len(ds) / max(1, sampler.batch_size), 2),
-        "reproducible": reproducible,
+        "reproducible_same_epoch": reproducible,
+        "adjacent_epochs_differ": epochs_differ,
         "epoch1_seed": sampler.epoch_seed(1),
+        "epoch2_seed": sampler.epoch_seed(2),
         "n_pos": sampler.bucket_counts and int(sum(v[0] for v in sampler.bucket_counts.values())),
         "n_neg": sampler.bucket_counts and int(sum(v[1] for v in sampler.bucket_counts.values())),
     }
     if not reproducible:
-        detail = "两个 epoch 的 batch 数不同：" + f"{len(first)} vs {len(second)}"
-        if len(first) == len(second):
-            for k, (x, y) in enumerate(zip(first, second), 1):
+        detail = f"两个采样器的 batch 数不同：{len(run_a)} vs {len(run_b)}"
+        if len(run_a) == len(run_b):
+            for k, (x, y) in enumerate(zip(run_a, run_b), 1):
                 if x != y:
-                    bx = [ds.case_hw[ds.index[i][0]] for i in x]
-                    by = [ds.case_hw[ds.index[i][0]] for i in y]
-                    detail = (f"首个不同的 batch 是第 {k} 个：run1={x}（形状 {bx}） "
-                              f"run2={y}（形状 {by}）")
+                    detail = (f"首个不同的 batch 是第 {k} 个：run1={x}（形状 "
+                              f"{[ds.case_hw[ds.index[i][0]] for i in x]}） run2={y}（形状 "
+                              f"{[ds.case_hw[ds.index[i][0]] for i in y]}）")
                     break
-        problems.append(f"同一个 epoch 采样两次结果不同（采样器不可复现）：{detail}")
+        problems.append(f"同一 epoch 两次采样结果不同（采样器不可复现）：{detail}")
         LOGGER.error("采样器不可复现的细节：%s", detail)
-        LOGGER.error("  两个 sampler 的 epoch_seed(1)：%s vs %s",
-                     sampler.epoch_seed(1), sampler.epoch_seed(1))
+    if not epochs_differ:
+        problems.append("相邻两个 epoch 的采样顺序完全相同：过采样会退化成每轮固定同一批样本"
+                        f"（epoch1_seed={sampler.epoch_seed(1)} epoch2_seed={sampler.epoch_seed(2)}）")
 
-    # 逐 batch 校验：尺寸一致 + 阳性数落在该桶预算区间
+    # 逐 batch 校验：尺寸一致 + 阳性数落在该桶预算区间（预算要按**桶键**取，不是原始 (H,W)）
     bad_sizes = 0
     bad_pos = 0
     first_bad_size = ""
-    for k, batch in enumerate(first, 1):
+    for k, batch in enumerate(run_a, 1):
         sizes = {ds.case_hw[ds.index[i][0]] for i in batch}
         if len(sizes) != 1:
             bad_sizes += 1
             if not first_bad_size:
                 first_bad_size = f"第 {k} 个 batch：索引 {batch} → 形状 {sorted(sizes)}"
+        key = ds.bucket_of_case(ds.index[batch[0]][0])
         got = int(ds.pos_flags[batch].sum())
-        budget = sampler.bucket_budget(ds.case_hw[ds.index[batch[0]][0]])
+        budget = sampler.bucket_budget(key)
         if not (int(budget["floor"]) <= got <= int(budget["ideal"])):
             bad_pos += 1
     info["batches_with_mixed_sizes"] = bad_sizes
@@ -766,9 +814,10 @@ def check_sampler(ds: CTSliceDataset, cfg: dict, problems: list) -> dict:
         problems.append(f"{bad_pos}/{n_batches} 个 batch 的阳性切片数落在该桶预算区间之外")
     empty_total = sum(b["empty_batches"] for b in sampler.bucket_budgets().values())
     info["empty_batches_expected"] = empty_total
-    LOGGER.info("采样器自检：每轮 %d 个 batch（期望约 %.1f）；同 epoch 两轮一致=%s；"
+    LOGGER.info("采样器自检：每轮 %d 个 batch（期望约 %.1f）；同 epoch 可复现=%s；相邻 epoch 不同=%s；"
                 "混尺寸 batch=%d；阳性数越界 batch=%d；预算内全阴性 batch=%d",
-                n_batches, info["expected_batches"], reproducible, bad_sizes, bad_pos, empty_total)
+                n_batches, info["expected_batches"], reproducible, epochs_differ,
+                bad_sizes, bad_pos, empty_total)
     return info
 
 
