@@ -1061,27 +1061,50 @@ class BucketBatchSampler(BatchSampler):
         """一轮 epoch 的 batch 数（≈ 切片总数 / batch_size，小桶按配额下限保底 1）。"""
         return int(sum(self._quota_map.values()))
 
-    def bucket_budget(self, key: tuple) -> dict:
-        """该桶一轮 epoch 的「阳性预算」：目标/期望/下限各是多少。
+    def positive_plan(self, key: tuple) -> list:
+        """该桶一轮 epoch 内**每批的阳性数**清单（长度 = 该桶 batch 配额）。
 
-        因为一轮内 P 个阳性层**恰好各出现一次**，实际每批阳性数是
-        ``floor(P/B)`` 或 ``ceil(P/B)``（前 ``P%B`` 个 batch 多一个），所以：
+        规则：把 P 个阳性层在 B 个 batch 上**尽量均摊**——
+        ``第 q 批 = ceil(P*q/B) - ceil(P*(q-1)/B)``，因此每批是 ``floor(P/B)`` 或 ``ceil(P/B)``，
+        且合计恰好 P（每个阳性层在整轮里出现一次）。
 
-          * ``ideal``：``n_pos``（配置目标，正常桶取到它）；
-          * ``expect``：``ceil(P/B)``，该桶实际能给出的**平均**阳性数/批；
-          * ``floor``：``floor(P/B)``，单个 batch 的**最小**阳性数（自检按它判下界）。
-
-        ``expect < n_pos`` 说明这个桶的病灶层太少，只能牺牲比例来保证覆盖（会打告警）。
+        为什么不用「保证前几批达标」的 ``max(q, ceil(P*q/B))``：在 P < B 的桶里它会退化成
+        「前 P 批每批 1 个、后面全 0」，一轮里出现大段**完全没有正样本**的 batch
+        （远程真实数据上 566 个 batch 里就有 117 个），这些 step 的监督信号为零。
+        均摊后阳性仍然一个不浪费，但铺满整轮、分布更平稳。
         """
         if key not in self._quota_map:
             raise KeyError(f"未知的桶 {key}；可选：{sorted(self._quota_map)}")
         batches = max(1, int(self._quota_map[key]))
         n_pos_slices = int(self.dataset.pos_flags[self.dataset.buckets[key]].sum())
         ideal = self._target_pos_per_batch()
+
+        def cum(q: int) -> int:
+            return min(n_pos_slices, int(math.ceil(n_pos_slices * q / batches)))
+
+        return [min(ideal, cum(q) - cum(q - 1)) for q in range(1, batches + 1)]
+
+    def bucket_budget(self, key: tuple) -> dict:
+        """该桶一轮 epoch 的「阳性预算」：目标 / 可达均值 / 单批下限 / 空批个数。
+
+          * ``ideal``：``n_pos``（配置目标，阳性充足的桶取到它）；
+          * ``expect``：``min(ideal, ceil(P/B))``，该桶实际能给出的**平均**阳性数/批；
+          * ``floor``：``min(ideal, floor(P/B))``，单个 batch 的**最小**阳性数（自检判下界用）；
+          * ``empty_batches``：按 ``positive_plan`` 预测有多少个 batch 完全没有阳性
+            （P 远小于 B 时无法避免）。
+
+        ``expect < ideal`` 说明这个桶的病灶层太少，只能牺牲比例来保证覆盖（会打告警）。
+        """
+        plan = self.positive_plan(key)
+        batches = max(1, int(self._quota_map[key]))
+        n_pos_slices = int(self.dataset.pos_flags[self.dataset.buckets[key]].sum())
+        ideal = self._target_pos_per_batch()
         expect = min(ideal, int(math.ceil(n_pos_slices / batches))) if n_pos_slices else 0
         floor = min(ideal, n_pos_slices // batches)
         return {"batches": batches, "pos_slices": n_pos_slices,
-                "ideal": ideal, "expect": expect, "floor": floor}
+                "ideal": ideal, "expect": expect, "floor": floor,
+                "empty_batches": int(sum(1 for v in plan if v == 0)),
+                "plan_head": plan[:12]}
 
     def bucket_budgets(self) -> dict:
         """所有桶的阳性预算（自检与报告用）。"""
@@ -1137,31 +1160,20 @@ class BucketBatchSampler(BatchSampler):
                     rng: random.Random, batches_left: int) -> list:
         """在一个桶内抽一个 batch：先抽阳性，再用阴性补足。
 
-        阳性数按「累计配额」算，而不是每个 batch 各自 round：
+        阳性数取自 ``positive_plan(key)``（把该桶 P 个阳性层在 B 个 batch 上均摊），
+        所以整轮下来每个阳性层出现恰好一次、且不会有「前紧后空」的偏置。
 
-            target_cum(q) = max(q, ceil(P × q / B))       # 上限受 P 与 n_pos 双重约束
-
-        其中 ``q`` = 已出 batch 数（含当前）、``P`` = 本轮该桶的阳性池大小、``B`` = 本轮该桶的
-        batch 数、``n_pos`` = 目标阳性数/批。由于配额已由 ``_quota()`` 保证 ``B ≥ ceil(P / n_pos)``，
-        实际抽到的阳性数就是 ``min(n_pos, target_cum 的差分)``：一轮内 P 个阳性层**恰好各出现一次**，
-        且每批阳性数恒等于 ``n_pos``（正比于目标比例）；不会出现「前期抽太狠、后期全阴性」
-        （早期版本用「每 batch 各自 ceil」就踩了这个坑：比例掉到 0.25，还有若干层一次没见到）。
-
-        ``P < B`` 的极小桶做不到「每批都有阳性且每层只出现一次」，此时选择**覆盖优先**：
-        阳性按整数节奏稀疏出现，比例低于目标，并在轮末汇总告警。
+        ``P`` 远小于 ``B`` 的极小桶必然存在一些**全阴性 batch**（自检会报出 ``empty_batches``）；
+        这是「一轮覆盖每一层」的代价，比反复只训同几层更可接受。
         """
         n_pos = self._target_pos_per_batch()
         n_neg = self.batch_size - n_pos
         batches_left = max(1, int(batches_left))
         total_batches = self._quota_map.get(key, max(1, batches_left))
         drawn_batches = max(0, total_batches - batches_left)      # 已出的 batch 数
-        pool_size = len(pos_pool)
+        plan_pos = self.positive_plan(key)[drawn_batches] if drawn_batches < total_batches else 0
 
-        def target_cum(q: int) -> int:
-            return min(pool_size, max(q, int(math.ceil(pool_size * q / max(1, total_batches)))))
-
-        want_pos = target_cum(drawn_batches + 1) - target_cum(drawn_batches)
-        want_pos = max(0, min(want_pos, n_pos, pool_size - pos_pool.drawn, self.batch_size))
+        want_pos = max(0, min(plan_pos, n_pos, len(pos_pool) - pos_pool.drawn, self.batch_size))
         want_neg = min(n_neg, len(neg_pool))
         if want_pos < n_pos or want_neg < n_neg:
             self._warn_shortage(key, n_pos, want_pos, n_neg, want_neg)

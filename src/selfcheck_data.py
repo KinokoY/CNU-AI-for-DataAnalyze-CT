@@ -259,8 +259,12 @@ def check_batch(idx: int, batch: dict, problems: list, tolerance: dict) -> dict:
     shapes = {tuple(int(s) for s in image[i].shape) for i in range(n)}
     if len(shapes) != 1:
         problems.append(f"batch {idx}：同 batch 内 image 尺寸不一致 {sorted(shapes)}（分桶失效）")
-    if tuple(image.shape[1:]) != tuple(label.shape[1:]) or int(image.shape[0]) != int(label.shape[0]):
-        problems.append(f"batch {idx}：image {tuple(image.shape)} 与 label {tuple(label.shape)} 不匹配")
+    # image 是 (B,1,H,W)、label 是 (B,H,W)：比较空间维时要错开一个通道维
+    if tuple(image.shape[2:]) != tuple(label.shape[1:]) or int(image.shape[0]) != int(label.shape[0]):
+        problems.append(f"batch {idx}：image {tuple(image.shape)} 与 label {tuple(label.shape)} 空间维不匹配"
+                        f"（期望 image (B,1,H,W) / label (B,H,W)）")
+    if int(image.shape[1]) != 1:
+        problems.append(f"batch {idx}：image 通道维是 {int(image.shape[1])}，期望 1")
     if info["bucket"] != format_bucket(bucket_key(int(image.shape[2]), int(image.shape[3]))):
         problems.append(f"batch {idx}：桶键与 shape 不符")
     if any(tuple(hw) != (int(image.shape[2]), int(image.shape[3])) for hw in info["orig_hw"]):
@@ -496,49 +500,66 @@ def check_augment(cfg: dict, ds: CTSliceDataset, n_samples: int, problems: list)
 def check_affine_geometry(problems: list) -> dict:
     """用一个人造图案验证 ``GridAffine2D`` 的几何口径（纯 CPU、毫秒级）。
 
-    图案：正中心一个方块 + 右上角一个标记。检查
-      * 旋转 90°：右上角的标记应转到左上角（正角度 = 内容逆时针转）；
-      * 平移：整体位移方向与给定量一致；
-      * 缩放 0.5：前景体素变少、但仍集中在中心。
+    图案：正中心一个方块 + **右上角**一个标记，标记质心为 ``(row=9.5, col=53.5)``。
+
+    期望值一律按 ``GridAffine2D`` 的坐标约定实测/推导（theta 作用在**像素**坐标、最后统一归一化）：
+
+      * **旋转 +90°**（内容逆时针）：右上角标记转到**左上角**，列 53.5 → 63-53.5 = 9.5、行保持 9.5；
+      * **shift_xy=(+8, 0) 像素**：这是**内容**位移（正 = 向右），标记 x 53.5 → 61.5；
+      * **scale=0.5**：采样点只铺一半范围 → 视野放大 2 倍 → 内容放大，前景面积约为 **4 倍**。
+
+    历史教训：这里的期望值我曾两次写反（`shift_xy` 还在用「比例」口径时就按像素写、以及把
+    scale 的面积比方向写反），两次都是远程自检把它抓出来的——所以现在期望值都按实测口径钉死，
+    并把具体数值打进日志便于对照；断言只判方向与数量级（±2 像素 / 区间），不追求逐位相等。
     """
     size = 64
     canvas = np.zeros((size, size), dtype=np.float32)
     canvas[size // 2 - 8:size // 2 + 8, size // 2 - 8:size // 2 + 8] = 1.0          # 中心方块
     canvas[6:14, size - 14:size - 6] = 2.0                                          # 右上角标记（值 2 便于追踪）
-    checks: dict = {}
+    ys0, xs0 = np.nonzero(canvas > 1.5)
+    marker_row, marker_col = float(ys0.mean()), float(xs0.mean())                   # (9.5, 53.5)
+    checks: dict = {"marker_center_xy": [round(marker_col, 2), round(marker_row, 2)]}
 
     rotated = GridAffine2D(rotate_deg=90.0).warp(canvas)
     ys, xs = np.nonzero(rotated > 1.5)
     checks["rotate90_marker_center_xy"] = [round(float(xs.mean()), 2), round(float(ys.mean()), 2)]
-    checks["rotate90_expected_xy"] = [round(size - 1 - (6 + 13) / 2, 2), round((6 + 13) / 2, 2)]
+    checks["rotate90_expected_xy"] = [round(size - 1 - marker_col, 2), round(marker_row, 2)]
     ok_rot = abs(checks["rotate90_marker_center_xy"][0] - checks["rotate90_expected_xy"][0]) <= 2 \
         and abs(checks["rotate90_marker_center_xy"][1] - checks["rotate90_expected_xy"][1]) <= 2
     checks["rotate90_ok"] = bool(ok_rot)
     if not ok_rot:
         problems.append(f"GridAffine2D 旋转 90° 的几何不对：标记落在 "
-                        f"{checks['rotate90_marker_center_xy']}，期望 {checks['rotate90_expected_xy']}")
+                        f"{checks['rotate90_marker_center_xy']}，期望 {checks['rotate90_expected_xy']}"
+                        f"（右上角标记应转到左上角）")
 
-    shifted = GridAffine2D(rotate_deg=0.0, shift_xy=(0.125, 0.0)).warp(canvas)
+    shift_px = 8.0     # 单位是像素（不是比例）
+    shifted = GridAffine2D(rotate_deg=0.0, shift_xy=(shift_px, 0.0)).warp(canvas)
     ys2, xs2 = np.nonzero(shifted > 1.5)
     checks["shift_marker_center_x"] = round(float(xs2.mean()), 2)
-    checks["shift_expected_x"] = round((size - 1 - (6 + 13) / 2) + 0.125 * size, 2)
+    checks["shift_expected_x"] = round(marker_col + shift_px, 2)
     ok_shift = abs(checks["shift_marker_center_x"] - checks["shift_expected_x"]) <= 2
     checks["shift_ok"] = bool(ok_shift)
     if not ok_shift:
-        problems.append(f"GridAffine2D 平移方向不对：标记 x={checks['shift_marker_center_x']}，"
-                        f"期望 {checks['shift_expected_x']}（+x 应向右）")
+        problems.append(f"GridAffine2D 平移方向/幅度不对：标记 x={checks['shift_marker_center_x']}，"
+                        f"期望 {checks['shift_expected_x']}（shift_xy 单位是像素、正 = 内容向右）")
 
     small = GridAffine2D(rotate_deg=0.0, scale=0.5).warp(canvas)
     area_raw = float((canvas > 0.5).sum())
     area_small = float((small > 0.5).sum())
     checks["scale_area_ratio"] = round(area_small / max(1.0, area_raw), 4)
-    checks["scale_ok"] = bool(area_small < area_raw)
+    # scale<1 → 采样范围变小 → 视野放大 → 内容放大（面积比 ≈ 1/scale² = 4，即 > 1）
+    checks["scale_ok"] = bool(area_small > area_raw)
     if not checks["scale_ok"]:
-        problems.append(f"GridAffine2D 缩放 0.5 后前景没变小：{area_small} vs {area_raw}")
-    LOGGER.info("仿射几何自检：旋转 90° %s（标记 %s，期望 %s）；平移 %s；缩放面积比 %.3f",
+        problems.append(f"GridAffine2D 缩放 0.5 后前景没变大：{area_small} vs {area_raw}"
+                        f"（scale<1 应放大内容，面积比 ≈ 1/scale²）")
+    LOGGER.info("仿射几何自检：标记原点 %s；旋转 90° %s（实测 %s，期望 %s）；平移 %s（实测 x=%s，"
+                "期望 %s）；缩放 0.5 面积比 %.3f（应 > 1）",
+                checks["marker_center_xy"],
                 "通过" if checks["rotate90_ok"] else "失败",
                 checks["rotate90_marker_center_xy"], checks["rotate90_expected_xy"],
-                "通过" if checks["shift_ok"] else "失败", checks["scale_area_ratio"])
+                "通过" if checks["shift_ok"] else "失败",
+                checks["shift_marker_center_x"], checks["shift_expected_x"],
+                checks["scale_area_ratio"])
     return checks
 
 
@@ -684,7 +705,12 @@ def check_augment_pipeline(cfg: dict, problems: list) -> dict:
 
 
 def check_sampler(ds: CTSliceDataset, cfg: dict, problems: list) -> dict:
-    """采样器自检：批数与配额、正/负覆盖、以及「同 seed 两轮完全一致」的可复现性。"""
+    """采样器自检：批数与配额、正/负覆盖、以及「同 seed 两轮完全一致」的可复现性。
+
+    这是**唯一一处需要跑完整轮采样**的自检（566+ 个 batch，纯索引运算、秒级）。
+    两轮必须逐 batch 完全相同；不一致时会把首个差异 batch 的索引与样本形状打出来，
+    便于定位（本地用同规模 fixture 复现不出来，所以这里留了诊断输出）。
+    """
     sampler = BucketBatchSampler(ds, batch_size=int(((cfg or {}).get("train") or {}).get("batch_size", 8)),
                                  pos_ratio_target=float((((cfg or {}).get("train") or {})
                                                          .get("pos_ratio_target", 0.30))),
@@ -704,30 +730,45 @@ def check_sampler(ds: CTSliceDataset, cfg: dict, problems: list) -> dict:
         "n_neg": sampler.bucket_counts and int(sum(v[1] for v in sampler.bucket_counts.values())),
     }
     if not reproducible:
-        problems.append("同一个 epoch 采样两次结果不同：采样器不可复现（检查种子派生是否用了 hash()）")
+        detail = "两个 epoch 的 batch 数不同：" + f"{len(first)} vs {len(second)}"
+        if len(first) == len(second):
+            for k, (x, y) in enumerate(zip(first, second), 1):
+                if x != y:
+                    bx = [ds.case_hw[ds.index[i][0]] for i in x]
+                    by = [ds.case_hw[ds.index[i][0]] for i in y]
+                    detail = (f"首个不同的 batch 是第 {k} 个：run1={x}（形状 {bx}） "
+                              f"run2={y}（形状 {by}）")
+                    break
+        problems.append(f"同一个 epoch 采样两次结果不同（采样器不可复现）：{detail}")
+        LOGGER.error("采样器不可复现的细节：%s", detail)
+        LOGGER.error("  两个 sampler 的 epoch_seed(1)：%s vs %s",
+                     sampler.epoch_seed(1), sampler.epoch_seed(1))
 
-    # 逐 batch 校验：尺寸一致 + 阳性数量符合目标
-    n_pos_target = int(round(sampler.batch_size * sampler.pos_ratio_target))
+    # 逐 batch 校验：尺寸一致 + 阳性数落在该桶预算区间
     bad_sizes = 0
     bad_pos = 0
+    first_bad_size = ""
     for k, batch in enumerate(first, 1):
         sizes = {ds.case_hw[ds.index[i][0]] for i in batch}
         if len(sizes) != 1:
             bad_sizes += 1
+            if not first_bad_size:
+                first_bad_size = f"第 {k} 个 batch：索引 {batch} → 形状 {sorted(sizes)}"
         got = int(ds.pos_flags[batch].sum())
-        if got != n_pos_target:
+        budget = sampler.bucket_budget(ds.case_hw[ds.index[batch[0]][0]])
+        if not (int(budget["floor"]) <= got <= int(budget["ideal"])):
             bad_pos += 1
     info["batches_with_mixed_sizes"] = bad_sizes
-    info["batches_with_wrong_pos_count"] = bad_pos
-    info["pos_count_target"] = n_pos_target
+    info["batches_out_of_budget"] = bad_pos
     if bad_sizes:
-        problems.append(f"{bad_sizes}/{n_batches} 个 batch 混了不同面内尺寸（分桶失效）")
+        problems.append(f"{bad_sizes}/{n_batches} 个 batch 混了不同面内尺寸（分桶失效）：{first_bad_size}")
     if bad_pos:
-        LOGGER.warning("%d/%d 个 batch 的阳性切片数不等于目标 %d（桶内样本不足时会如此，"
-                       "若数量很多需要调低 batch_size 或改采样策略）", bad_pos, n_batches, n_pos_target)
+        problems.append(f"{bad_pos}/{n_batches} 个 batch 的阳性切片数落在该桶预算区间之外")
+    empty_total = sum(b["empty_batches"] for b in sampler.bucket_budgets().values())
+    info["empty_batches_expected"] = empty_total
     LOGGER.info("采样器自检：每轮 %d 个 batch（期望约 %.1f）；同 epoch 两轮一致=%s；"
-                "混尺寸 batch=%d；阳性数偏离目标的 batch=%d",
-                n_batches, info["expected_batches"], reproducible, bad_sizes, bad_pos)
+                "混尺寸 batch=%d；阳性数越界 batch=%d；预算内全阴性 batch=%d",
+                n_batches, info["expected_batches"], reproducible, bad_sizes, bad_pos, empty_total)
     return info
 
 

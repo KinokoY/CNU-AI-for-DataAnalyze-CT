@@ -56,8 +56,11 @@
   `batch_size=8, pos_ratio_target=0.30` → `n_pos=2` → 实际比例 **0.25**（≈ 原始 12.81% 的 1.95 倍）。
   这是取整的必然结果，不是 bug；想贴近 0.30 就把 batch_size 提到 10/20。
 - **小桶会被摊薄**：`352/432/448` 三个桶各只有 1–2 例病人、20–49 个阳性层，而一轮要出几十上百个
-  batch → 只能做到约 1 个阳性层/批。`BucketBatchSampler.bucket_budget()` 会算出每桶的
-  `ideal/expect/floor`（自检按它判阈值，不会误报成"比例不达标"）。
+  batch → 每批阳性数只能是 `floor(P/B)`~`ceil(P/B)`（0 或 1），且必然有少量**全阴性 batch**。
+  分配用「均摊」公式 ``第 q 批 = ceil(P*q/B) - ceil(P*(q-1)/B)``（**不要**用
+  ``max(q, ceil(P*q/B))``：那会把阳性前置到前 P 批、后面整段全 0，远程实测 566 个 batch 里
+  有 117 个全阴性，均摊后降到 16 个）。`BucketBatchSampler.bucket_budget()` 给出每桶的
+  `ideal/expect/floor/empty_batches`，自检按它判阈值。
 - 采样器保证：一轮 epoch 内每层切片至少出现一次、**阳性层恰好各一次**；阳性充足的桶里每批阳性数
   恒为 `n_pos`；采样顺序只由 `(train.seed, epoch, 病例集合)` 决定（用 sha256 派生，不用内置
   `hash()`），与 `num_workers` 无关，可复现。
