@@ -788,15 +788,17 @@ def run_debug(*, model, criterion, optimizer, train_loader, val_cases, cache_dir
     if device.type == "cuda":
         peak_alloc = float(torch.cuda.max_memory_allocated(device)) / 1024 ** 2
         peak_reserved = float(torch.cuda.max_memory_reserved(device)) / 1024 ** 2
-        LOGGER.info("峰值显存（batch_size=%d，512×512 输入，bf16/amp=%s）：allocated %.0f MB / "
-                    "reserved %.0f MB（40 GiB 卡上还很有余量）",
+        LOGGER.info("峰值显存（batch_size=%d，512×512 输入，amp=%s）：allocated %.0f MB / "
+                    "reserved %.0f MB（含约 4.7 GB 不随 batch 增长的静态开销：cuDNN autotune 工作区；"
+                    "两点标定见 docs/baseline.md 4.1）",
                     batch_size, amp["name"], peak_alloc, peak_reserved)
-        LOGGER.info("按 batch 线性外推（粗略：静态开销与优化器状态不随 batch 增长，仅供参考）："
-                    "batch_size=8 → allocated ≈ %.0f MB；batch_size=16 → ≈ %.0f MB",
-                    peak_alloc * 8.0 / max(1, batch_size), peak_alloc * 16.0 / max(1, batch_size))
-        if batch_size == 2:
-            LOGGER.info("要实测某个 batch_size：python -m src.train --fold %d --debug "
-                        "--set train.batch_size=8", int(fold))
+        # 只给「下一个该测多少」的建议，**不做线性外推**：实测 bs=16 → 10920 MB，
+        # 而把静态开销一起按 batch 缩放会算出 bs=8 ≈ 5460 MB（真实值 7671 MB），偏小得离谱。
+        configured = int((cfg.get("train") or {}).get("batch_size", batch_size) or batch_size)
+        suggest = configured if configured != batch_size else (batch_size * 2 if batch_size < 32 else 48)
+        LOGGER.info("要标定更大的 batch 就直接复测（一次约 1 分钟，比任何外推都准）："
+                    "python -m src.train --fold %d --debug --set train.batch_size=%d",
+                    int(fold), int(suggest))
     else:
         LOGGER.info("设备是 CPU：显存统计不可用（正式训练在 A100 上进行，本机只验证链路）")
 

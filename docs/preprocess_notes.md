@@ -232,7 +232,7 @@ selfcheck_data / train）共用。对当前配置，它算出的值与 manifest 
 - 模型参数量实测 **9.243 M**（含解码器与 head；早期文档里写的 7.76 M 是估算，已按实测改正）。
 - 随机初始化下的损失量级：dice 项 ≈0.68 + CE ≈0.91 ≈ **1.6**（不是 1.2；见 baseline 第 4.1 节的判读）。
 
-**已修（第 3 轮）**：`predict_volume` 单例 76 s 的根因就是压缩缓存——`.nii.gz` 无法 mmap，
+**已修并远程验证（第 3 轮）**：`predict_volume` 单例 76 s 的根因就是压缩缓存——`.nii.gz` 无法 mmap，
 nibabel **每读一层都把整卷解压一遍**。probe 实测（远程）：
 
 | 读法 | 单层耗时 | 说明 |
@@ -244,6 +244,17 @@ nibabel **每读一层都把整卷解压一遍**。probe 实测（远程）：
 训练侧同病：`make_train_loader` 纯取数 812 ms/batch（bs=8，num_workers=8）≈ **8.7 分钟/epoch**，
 而 GPU 稳态只要 0.112 s/step ≈ 1.2 分钟/epoch。eval 前向 bf16 0.019 s / fp32 0.031 s，
 说明 GPU 侧本来就没有问题（排查时先量这三件事，别先怀疑模型）。
+
+转换后的实测（`inflate_cache.py --remove-gz` + `selfcheck_data` + `--debug --set train.batch_size=16`）：
+
+- 50/50 个文件转换并逐体素校验通过，压缩原件已删；磁盘 1.27 GB → 3.24 GB；
+  性能抽检 `mmap 逐层读取 0.00 ms/层`。
+- `selfcheck_data` 照旧通过、指纹仍是 `7b4c48b4dc7ef880`（**不需要重跑预处理/重建清单**）；
+  首个 train batch 冷读 6.803 s → **0.609 s**；采样器 bs=16：351 个 batch、每批 1~2 个阳性、
+  **全阴性 batch = 0**、阳性层 617 次/去重 617、覆盖切片 4469/4469。
+- `--debug`：**整卷推理 77 s → 2.6 s**；单步 0.183 s（前向 0.065 + 反向 0.117）；
+  **峰值显存 bs=16 = 10920 MB / reserved 12152 MB**（bs=2 5416、bs=8 7671，三点拟合
+  376 MB/样本 + 4.7 GB 静态）—— 与两点外推的 10.7 GB 只差 2%，`batch_size=16` 就此定稿。
 
 ### 7.8 缓存格式：未压缩 `.nii`（第 3 轮改的默认值）
 

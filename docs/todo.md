@@ -61,7 +61,7 @@ CT 肝脏肿瘤分割 · 基础版（2D 闭环）后续编码计划
   校验要点（必须打印/断言）：batch 形状恒为 (B,1,512,512)；值域 ∈ [0,1]；label ⊂ {0,1}；
     训练侧每批阳性数落在采样器计划区间（验证侧不判阳性数——旧版在这里误报过）。
 
-■ 第 3 轮：模型 + 损失 + 训练 —— 已完成编码（**待远程 `--debug` 实测**）
+■ 第 3 轮：模型 + 损失 + 训练 —— 已完成编码，远程 `--debug` 通过（**首折正式训练待跑**）
   交付：src/unet.py、src/losses.py、src/train.py
   src/unet.py：
     class DoubleConv2d(nn.Module)        # Conv3x3(+BN)+ReLU ×2
@@ -120,8 +120,14 @@ CT 肝脏肿瘤分割 · 基础版（2D 闭环）后续编码计划
      与 manifest 里已记录的 7b4c48b4dc7ef880 保持一致，远程**不需要重跑预处理**。
   9. 配置新增：loss 节（8 项）、train.min_lr_ratio / log_every / tensorboard、
      eval.threshold / infer_batch_slices。
-  待远程验证（先跑 4.1 再跑 4.2）：batch 形状与值域、loss 量级与下降趋势、分段耗时与显存、
-     整卷推理的 prob/pred/GT 形状与 pad_offset、单 epoch 耗时、早停轮数与 best Dice。
+  远程验证结果（fold 0，`--debug --set train.batch_size=16`，逐项已核对）：
+    - 形状 `image (16,1,512,512)` / `label (16,512,512)` / `logits (16,2,512,512)`，值域 [0,1]、label ⊂ {0,1}；
+    - 初始 loss 1.593（dice 0.683 + ce 0.909）——随机权重下的正常量级，随 step 下降；
+    - 单步 0.183 s（前向 0.065 + 反向 0.117）→ 351 step ≈ 70 s/epoch；
+    - 峰值显存 **10920 MB**（reserved 12152）；采样器 351 batch、每批 1~2 阳性、**全阴性 batch 0**；
+    - 整卷推理 `prob/pred (512,512,135)` 与 GT 同形，GT 前景 434721 = splits.json 的 430k mm³ 口径吻合；
+    - `selfcheck_data` 通过、指纹 7b4c48b4dc7ef880 不变；采样器 617/617 阳性层、覆盖 4469/4469 切片。
+  仍在等待：首折前几轮的 train loss 与 val macro Dice 曲线、单 epoch 墙钟、早停轮数、5 折汇总。
   【远程实测后追加的修复（第 3 轮 `--debug` 暴露）】
   - 症状：`predict_volume` 单例 76 s、训练 loader 纯取数 8.7 分钟/epoch，而 GPU 前向只要 0.019 s。
   - 根因：缓存是 `.nii.gz`，nibabel 无法 mmap，**每读一层都整卷解压**（probe 实测 557 ms/层）。
