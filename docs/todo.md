@@ -122,6 +122,15 @@ CT 肝脏肿瘤分割 · 基础版（2D 闭环）后续编码计划
      eval.threshold / infer_batch_slices。
   待远程验证（先跑 4.1 再跑 4.2）：batch 形状与值域、loss 量级与下降趋势、分段耗时与显存、
      整卷推理的 prob/pred/GT 形状与 pad_offset、单 epoch 耗时、早停轮数与 best Dice。
+  【远程实测后追加的修复（第 3 轮 `--debug` 暴露）】
+  - 症状：`predict_volume` 单例 76 s、训练 loader 纯取数 8.7 分钟/epoch，而 GPU 前向只要 0.019 s。
+  - 根因：缓存是 `.nii.gz`，nibabel 无法 mmap，**每读一层都整卷解压**（probe 实测 557 ms/层）。
+  - 修法（已实施）：缓存默认改**未压缩 `.nii`**（mmap，0.00 ms/层），读取端
+    `src.utils.cache_file` 按「`.nii` 优先、`.nii.gz` 兼容」解析；
+    新增 `scripts/inflate_cache.py` 把已有压缩缓存就地转换（逐体素校验后删原件，指纹/清单不变）；
+    `preprocess.py` 默认写 `.nii`（`--compressed` 可退回）；dataset/infer/train/selfcheck/check_cache/
+    fetch_manifest/probe_axis 七处的路径与「按文件清点病例」统一走 `cache_file` / `cache_cases`。
+  - 另：`train.py` 每轮日志新增 `［取数 x s + 计算 y s］`，首轮数据成为瓶颈时会显式告警。
 
 ■ 第 4 轮：整卷推理 + 3D 后处理 + 指标 + 评估
   交付：src/infer.py、src/postprocess.py、src/metrics.py、src/evaluate.py
@@ -155,7 +164,9 @@ CT 肝脏肿瘤分割 · 基础版（2D 闭环）后续编码计划
     - 标注本版不含：2.5D 三层输入、肝脏通道/三分类、期相分层报告、ImageNet 预训练对照。
 
 ■ 第 6 轮：按首次训练结果微调（预留）
-    - 依据 --debug 的实测显存定稿 batch_size / num_workers；
+    - ~~依据 --debug 的实测显存定稿 batch_size~~ → **第 3 轮已定稿：`train.batch_size=16`**
+      （实测 bs=2/bs=8 显存两点外推 ≈ 376 MB/样本 + 4.7 GB → 16 约 10.7 GB；fold 0 上 351 个 batch、
+      每批 1~2 个阳性、全阴性 batch 0 个）。首折跑起来后再看是否需要按曲线回调；
     - 现基线：`bs=8` 时每批实际只有 1 个阳性层、25 个全阴性 batch（第 2 轮远程实测；
       阳性层一轮恰好各一次，`pos_ratio_target=0.30` 只是每批上限）。要真正提高每批阳性数、
       消掉全阴性 batch，优先把 batch_size 提到 16（按 fold 0 数字：351 个 batch、每批 1~2 个阳性、

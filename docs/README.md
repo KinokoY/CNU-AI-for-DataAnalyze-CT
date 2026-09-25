@@ -38,7 +38,8 @@ conda 环境 `unet`（已激活），Python 3.11.16，解释器 `/home/phdauser0
 正式流程（数据 → 训练 → 评估，跑一遍就够）：
 
 ```bash
-python scripts/preprocess.py        # 预处理 → cache/（第 1 轮，已跑过）
+python scripts/preprocess.py        # 预处理 → cache/（第 1 轮，已跑过；现在默认写未压缩 .nii）
+python scripts/inflate_cache.py --remove-gz   # 第 3 轮：把已有的 .nii.gz 缓存就地转成 .nii（一次性，可省则省）
 python scripts/check_cache.py       # 缓存体检（已跑过）
 python scripts/make_splits.py       # 5 折划分 → data/splits.json（已跑过）
 python -m src.train --fold 0 --debug   # 第 3 轮：冒烟跑 3 个 iteration，看形状/显存/耗时（不落盘）

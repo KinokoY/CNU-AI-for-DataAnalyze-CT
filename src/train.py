@@ -64,6 +64,7 @@ try:
     from src.unet import build_unet, count_parameters, load_encoder_pretrained
     from src.utils import (
         autocast_context,
+        cache_file,
         cache_fingerprint,
         config_fingerprint,
         load_config,
@@ -84,6 +85,7 @@ except ModuleNotFoundError:  # pragma: no cover - 兜底：把仓库根塞进 sy
     from src.unet import build_unet, count_parameters, load_encoder_pretrained  # type: ignore
     from src.utils import (  # type: ignore
         autocast_context,
+        cache_file,
         cache_fingerprint,
         config_fingerprint,
         load_config,
@@ -314,7 +316,7 @@ def check_prerequisites(cfg: dict, fold: int) -> tuple:
 
     for sub in ("image", "label"):
         missing_files = [c for c in train_cases + val_cases
-                         if not (cache_dir / sub / f"{c}.nii.gz").exists()]
+                         if not cache_file(cache_dir, sub, c).exists()]
         if missing_files:
             problems.append(f"cache/{sub}/ 下缺 {len(missing_files)} 例：{missing_files[:8]}"
                             f"（先跑 python scripts/preprocess.py）")
@@ -403,20 +405,28 @@ def train_one_epoch(model: nn.Module, loader, criterion, optimizer, scaler, devi
 
     梯度路径只写一条：``scaler`` 在 bf16/fp32 下是直通替身（``is_enabled() == False``），
     只有 fp16 时才真的缩放。
+
+    耗时分成两段分别累计（``data_seconds`` = 等 DataLoader 出 batch，``compute_seconds`` = 前向+反向+优化器）：
+    缓存是 ``.nii.gz`` 时取数会成为瓶颈（远程实测 557 ms/层），这两段能一眼看出是「数据等 GPU」
+    还是「GPU 等数据」——第 3 轮就是靠它定位到压缩缓存的。
     """
     train_cfg = (cfg or {}).get("train") or {}
     clip = float(train_cfg.get("grad_clip_norm", 0.0) or 0.0)
     model.train()
     loss_sum = dice_sum = ce_sum = 0.0
     n_batches = n_slices = n_pos = 0
+    data_seconds = compute_seconds = 0.0
     first_batch: dict = {}
     started = time.perf_counter()
     iterator = iter(loader)
     while True:
+        data_started = time.perf_counter()
         try:
             batch = next(iterator)
         except StopIteration:
             break
+        data_seconds += time.perf_counter() - data_started
+        compute_started = time.perf_counter()
         images = batch["image"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
         if images.ndim != 4 or labels.ndim != 3:
@@ -461,13 +471,13 @@ def train_one_epoch(model: nn.Module, loader, criterion, optimizer, scaler, devi
         n_batches += 1
         n_slices += int(labels.shape[0])
         n_pos += int((labels.reshape(int(labels.shape[0]), -1).max(dim=1).values > 0).sum())
+        compute_seconds += time.perf_counter() - compute_started
 
         if log_every and n_batches % int(log_every) == 0:
             LOGGER.info("  epoch %d | batch %d | loss %.4f（dice %.4f + ce %.4f）| "
-                        "已跑 %.1f s（%.2f s/batch）", epoch, n_batches,
+                        "已跑 %.1f s（取数 %.1f s / 计算 %.1f s）", epoch, n_batches,
                         loss_sum / n_batches, dice_sum / n_batches, ce_sum / n_batches,
-                        time.perf_counter() - started,
-                        (time.perf_counter() - started) / max(1, n_batches))
+                        time.perf_counter() - started, data_seconds, compute_seconds)
         if max_iters and n_batches >= int(max_iters):
             break
 
@@ -481,6 +491,8 @@ def train_one_epoch(model: nn.Module, loader, criterion, optimizer, scaler, devi
         "pos_slices": n_pos,
         "pos_ratio": n_pos / max(1, n_slices),
         "seconds": seconds,
+        "data_seconds": data_seconds,
+        "compute_seconds": compute_seconds,
         "sec_per_batch": seconds / max(1, n_batches),
         "peak_memory_mb": peak_memory_mb(device),
         "first_batch": first_batch,
@@ -1033,6 +1045,13 @@ def main(argv=None) -> int:
                             tuple(first["image"]), tuple(first["label"]), first["cases"],
                             first["z"][:8], first["image_range"][0], first["image_range"][1],
                             first["orig_hw"][:3], first["pad_offset"][:3])
+            if epoch == start_epoch + 1 and train_stats["data_seconds"] > train_stats["compute_seconds"]:
+                LOGGER.warning("取数耗时 %.1f s 超过计算耗时 %.1f s：**数据加载是瓶颈**。"
+                               "缓存若是 .nii.gz，先跑 python scripts/inflate_cache.py 生成未压缩 .nii"
+                               "（nibabel 每读一层会整卷解压，实测 557 ms/层）；已用 .nii 再考虑调大 "
+                               "data.num_workers（当前 %d）。",
+                               train_stats["data_seconds"], train_stats["compute_seconds"],
+                               int(data_cfg.get("num_workers", 8)))
             if scheduler is not None:
                 scheduler.step()
             current_lr = float(optimizer.param_groups[0]["lr"])
@@ -1093,19 +1112,22 @@ def main(argv=None) -> int:
                 per_case = " ".join(f"{int(c)}:{float(v['dice']):.3f}"
                                     for c, v in sorted(val_stats["cases"].items()))
                 LOGGER.info("epoch %d/%d | lr %.2e | 训练 loss %.4f（dice %.4f + ce %.4f）| "
-                            "%d 个 batch / %.1f s | 验证整卷 Dice %.4f［%s；min %.3f max %.3f］/ %.1f s | "
+                            "%d 个 batch / %.1f s［取数 %.1f s + 计算 %.1f s］| "
+                            "验证整卷 Dice %.4f［%s；min %.3f max %.3f］/ %.1f s | "
                             "best %.4f@ep%d | patience %d/%d | 峰值显存 %.0f MB",
                             epoch, epochs, current_lr, train_stats["loss"], train_stats["dice_loss"],
                             train_stats["ce_loss"], train_stats["batches"], train_stats["seconds"],
+                            train_stats["data_seconds"], train_stats["compute_seconds"],
                             val_stats["dice_mean"], per_case, val_stats["dice_min"],
                             val_stats["dice_max"], val_stats["seconds"], float(best["dice"]),
                             int(best["epoch"]), patience, early_stop, train_stats["peak_memory_mb"])
             else:
                 LOGGER.info("epoch %d/%d | lr %.2e | 训练 loss %.4f（dice %.4f + ce %.4f）| "
-                            "%d 个 batch / %.1f s | 本轮不验证（val_every=%d）| best %.4f@ep%d | "
-                            "峰值显存 %.0f MB",
+                            "%d 个 batch / %.1f s［取数 %.1f s + 计算 %.1f s］| "
+                            "本轮不验证（val_every=%d）| best %.4f@ep%d | 峰值显存 %.0f MB",
                             epoch, epochs, current_lr, train_stats["loss"], train_stats["dice_loss"],
                             train_stats["ce_loss"], train_stats["batches"], train_stats["seconds"],
+                            train_stats["data_seconds"], train_stats["compute_seconds"],
                             val_every, float(best["dice"]), int(best["epoch"]),
                             train_stats["peak_memory_mb"])
 

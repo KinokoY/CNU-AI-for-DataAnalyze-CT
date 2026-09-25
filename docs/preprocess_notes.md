@@ -9,6 +9,8 @@
   同一文件 `SimpleITK` 读回是其转置 `(nz,ny,nx)`；**两库互为转置，不可混用**。
 - 影像：`uint16`，HU 窗 `[-1000,1000]` 线性映射到 `[0,1]` 后按 `1/65535` 量化 → `/65535` 得 [0,1]（1 步长≈0.0305 HU）。
 - 掩膜：`uint8`，只含 {0,1}（label 2 = 肿瘤；label 1 肝脏已置 0）。
+- **文件：`cache/<kind>/<case>.nii`（未压缩，可 mmap）优先，兼容旧的 `.nii.gz`**；
+  一律用 `src.utils.cache_file` / `cache_cases` 解析，不要手写扩展名。理由见 7.8。
 
 ## 二、关键数字（写 dataset / train 直接用）
 
@@ -207,10 +209,52 @@ manifest 里的 `cfg_hash` 原来由两处**不同**的写法产生：`scripts/p
 selfcheck_data / train）共用。对当前配置，它算出的值与 manifest 里已记录的
 `7b4c48b4dc7ef880` 保持一致（`preprocess` 节本轮没动），所以远程不需要重跑预处理。
 
-### 7.7 待远程实测回填（跑过 `--debug` 与首折后补进本节）
+### 7.7 远程实测（第 3 轮 `--debug` 之后，fold 0）
 
-1. `--debug`：实测 batch 形状、loss 量级、分段耗时、峰值显存（batch_size=2/8/16 各一份）；
-2. `--debug` 的整卷推理自检：`prob/pred/GT` 形状、`pad_offset`、单例推理秒数；
-3. 首折前 3 轮的 train loss 与 val macro Dice，以及单 epoch 耗时（训练 + 验证）；
-4. 早停发生在第几轮、best Dice 是多少；
-5. 5 折跑完后：每折 best Dice 与总耗时（第 4 轮评估要用）。
+结构类核对**全部通过**（`selfcheck_data` 也仍然通过，指纹 `7b4c48b4dc7ef880` 一致）：
+
+- 形状：`image (B,1,512,512)` / `label (B,512,512)` / `logits (B,2,512,512)`，值域 [0,1]、label ⊂ {0,1}；
+  补边偏移与 `orig_hw` 自洽（342→512 是 `(85,85)`、351→512 是 `(80,80)`、436→512 是 `(38,38)`）。
+- 采样器：bs=2 时 `n_pos=n_neg=1`，一轮 batch 数 = 阴性层数（230 层 → 193 批，公式吻合）；
+  bs=8 时一轮 33 批（2 例子集）、每批 1~2 个阳性。
+- 整卷推理：`prob/pred (512,512,135)` 与 `GT` 同形状，`pad_offset=(0,0)`；
+  **GT 前景 434721 体素 = `data/splits.json` 里 case 33 的 434721 mm³**（1mm³/体素）——
+  这是「切片轴 → 拼卷 → transpose(1,0,2) → 裁回」整条链路正确的最硬证据。
+- 显存（`max_memory_allocated`）：bs=2 → 5416 MB，bs=8 → 7671 MB；
+  两点线性拟合 ≈ **376 MB/样本 + 4.7 GB 静态开销**（静态里主要是 cuDNN benchmark 的 autotune 工作区）。
+  推算 bs=16 ≈ 10.7 GB、bs=32 ≈ 16.7 GB、bs=48 ≈ 22.7 GB（40 GB 卡）。
+- **batch_size 定为 16**（第 3 轮按上面的实测定稿，不再是估算）：fold 0 上一轮 351 个 batch、
+  每批 1~2 个阳性、**全阴性 batch 归零**，每 epoch 仍有 351 次参数更新；
+  bs=32 虽然也能消除全阴性 batch，但更新次数掉到 176 —— 样本量这么小时不划算。
+- 单步耗时（bs=8，稳态，排除第 1 个 iteration 的 autotune）：前向+损失 0.040 s / 反向 0.071 s /
+  优化器 0.001 s ≈ **0.112 s/step**；第 1 个 iteration 的 forward 2.05 s + backward 10.4 s 是
+  `cudnn.benchmark=True` 的一次性 autotune，属正常。
+- 模型参数量实测 **9.243 M**（含解码器与 head；早期文档里写的 7.76 M 是估算，已按实测改正）。
+- 随机初始化下的损失量级：dice 项 ≈0.68 + CE ≈0.91 ≈ **1.6**（不是 1.2；见 baseline 第 4.1 节的判读）。
+
+**已修（第 3 轮）**：`predict_volume` 单例 76 s 的根因就是压缩缓存——`.nii.gz` 无法 mmap，
+nibabel **每读一层都把整卷解压一遍**。probe 实测（远程）：
+
+| 读法 | 单层耗时 | 说明 |
+| --- | --- | --- |
+| `.nii.gz` + `np.asanyarray(proxy)[:, :, z]`（原路径） | **557 ms/层** | 135 层外推 75 s，与 76 s 实测吻合 |
+| 整卷读一次再切层 | 0.45 s 读 + **0.00 ms/层** | 内存里切 |
+| **未压缩 `.nii` + mmap** | **0.00 ms/层** | 打开 1 ms；就是现在采用的方案 |
+
+训练侧同病：`make_train_loader` 纯取数 812 ms/batch（bs=8，num_workers=8）≈ **8.7 分钟/epoch**，
+而 GPU 稳态只要 0.112 s/step ≈ 1.2 分钟/epoch。eval 前向 bf16 0.019 s / fp32 0.031 s，
+说明 GPU 侧本来就没有问题（排查时先量这三件事，别先怀疑模型）。
+
+### 7.8 缓存格式：未压缩 `.nii`（第 3 轮改的默认值）
+
+- `scripts/preprocess.py` 现在默认写 **`.nii`**（未压缩）；`--compressed` 才写 `.nii.gz`。
+- 读取端统一走 `src.utils.cache_file`（**`.nii` 优先、`.nii.gz` 兼容**）与 `cache_cases`（按目录清点病例，
+  同一 case 两种扩展名只算一次）；遇到压缩缓存会打一次告警。涉及 dataset / infer / train / selfcheck /
+  check_cache / fetch_manifest / probe_axis 七处，都不要再手写 `f"{case}.nii.gz"`。
+- 已有压缩缓存不用重跑预处理：`python scripts/inflate_cache.py --remove-gz` 在同目录就地转成 `.nii`，
+  逐体素校验（shape/dtype/affine/数组全等）后才删原件；**指纹与清单都不变**，不需要 fetch_manifest。
+- 代价：磁盘约 3 GB → 4 GB（影像 uint16 ≈ 68 MB/例 + 掩膜 uint8 ≈ 34 MB/例）。
+- `src/train.py` 每轮日志新增 `［取数 x s + 计算 y s］`，第 1 轮若出现
+  `数据加载是瓶颈` 的告警，先查缓存格式再调 `num_workers`。
+
+其余待回填：首折前几轮的 train loss 与 val macro Dice、单 epoch 耗时、早停轮数、5 折汇总。

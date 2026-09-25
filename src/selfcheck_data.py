@@ -67,6 +67,8 @@ try:
         reset_open_cache,
     )
     from src.utils import (
+        cache_cases,
+        cache_file,
         cache_fingerprint,
         load_config,
         load_json,
@@ -100,6 +102,8 @@ except ModuleNotFoundError:  # pragma: no cover - 兜底：把仓库根塞进 sy
         reset_open_cache,
     )
     from src.utils import (  # type: ignore
+        cache_cases,
+        cache_file,
         cache_fingerprint,
         load_config,
         load_json,
@@ -167,11 +171,20 @@ def check_prerequisites(cfg: dict) -> tuple:
     for sub in ("image", "label"):
         if not (cache_dir / sub).is_dir():
             problems.append(f"cache 子目录不存在：{rel_to_root(cache_dir / sub)}（先跑 preprocess.py）")
-    n_img = len(list((cache_dir / "image").glob("*.nii.gz"))) if (cache_dir / "image").is_dir() else 0
-    n_lab = len(list((cache_dir / "label").glob("*.nii.gz"))) if (cache_dir / "label").is_dir() else 0
-    LOGGER.info("cache：%s（image=%d，label=%d）", rel_to_root(cache_dir), n_img, n_lab)
+    n_img = len(cache_cases(cache_dir, "image"))
+    n_lab = len(cache_cases(cache_dir, "label"))
+    LOGGER.info("cache：%s（image=%d，label=%d；.nii 优先、兼容 .nii.gz）",
+                rel_to_root(cache_dir), n_img, n_lab)
     if n_img != n_lab:
         problems.append(f"cache 里 image({n_img}) 与 label({n_lab}) 数量不一致")
+    for kind in ("image", "label"):
+        compressed = [c for c in cache_cases(cache_dir, kind)
+                      if str(cache_file(cache_dir, kind, c)).endswith(".gz")]
+        if compressed:
+            LOGGER.warning("cache/%s 里有 %d 例仍是压缩的 .nii.gz（如 %s）：nibabel 每读一层都会"
+                           "整卷解压，训练取数会慢到 ~9 分钟/epoch。跑一次 "
+                           "python scripts/inflate_cache.py 生成同名未压缩 .nii 即可。",
+                           kind, len(compressed), compressed[:5])
 
     manifest_path = paths.get("cache_manifest", "cache/cache_manifest.json")
     manifest = load_json(manifest_path, default=None)
@@ -433,7 +446,7 @@ def check_slice_axis(ds: CTSliceDataset, case: int, manifest: dict, problems: li
     曲线应集中在肝脏所在的中段；若阳性全挤在 ``z≈0`` 或 ``z≈nz-1``，说明切片轴被搞反了
     （例如把 ``a[:, :, k]`` 写成了 ``a[k]``）。
     """
-    with open_volume(ds.label_dir / f"{case}.nii.gz") as lab_img:
+    with open_volume(ds.label_path(case)) as lab_img:
         lab = np.asanyarray(lab_img.dataobj)
         nx, ny, nz = (int(lab.shape[0]), int(lab.shape[1]), int(lab.shape[2]))
         per_slice = (lab > 0).sum(axis=(0, 1))      # 对 (x, y) 求和 → 长度 nz

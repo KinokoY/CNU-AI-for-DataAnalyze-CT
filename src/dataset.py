@@ -22,8 +22,9 @@
     第 3 轮的 loss 可以考虑忽略补边区域，见 ``pad_to_target`` 的说明。
 
 依赖：numpy / torch / nibabel（+ 可选 scipy 的连通域，不在本文件用）。
-前后接口：上游是 ``scripts/preprocess.py`` 产出的 ``cache/image/<case>.nii.gz``（uint16 归一化）
-        与 ``cache/label/<case>.nii.gz``（uint8 二值）、``data/splits.json``、``cache/cache_manifest.json``；
+前后接口：上游是 ``scripts/preprocess.py`` 产出的 ``cache/image/<case>.nii``（uint16 归一化；
+         **未压缩优先**，也兼容旧的 ``.nii.gz``）与 ``cache/label/<case>.nii``（uint8 二值）、
+         ``data/splits.json``、``cache/cache_manifest.json``；
         下游是 ``src/selfcheck_data.py``（自检，先跑）与 ``src/train.py``（训练）。
 用法：``python -m src.selfcheck_data`` 做数据形态自检；训练侧由 ``src.train`` 调用本模块的工厂函数。
 """
@@ -44,15 +45,25 @@ import torch.nn.functional as F
 from torch.utils.data import BatchSampler, DataLoader, Dataset
 
 try:
-    from src.utils import load_config, load_json, rel_to_root, resolve_path, setup_logger
-except ModuleNotFoundError:  # pragma: no cover - 兜底：把仓库根塞进 sys.path
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from src.utils import (  # type: ignore
+    from src.utils import (
+        cache_file,
         load_config,
         load_json,
         rel_to_root,
         resolve_path,
         setup_logger,
+        warn_compressed_cache,
+    )
+except ModuleNotFoundError:  # pragma: no cover - 兜底：把仓库根塞进 sys.path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from src.utils import (  # type: ignore
+        cache_file,
+        load_config,
+        load_json,
+        rel_to_root,
+        resolve_path,
+        setup_logger,
+        warn_compressed_cache,
     )
 
 LOGGER = setup_logger("dataset")
@@ -727,6 +738,9 @@ class CTSliceDataset(Dataset):
         self.target_hw = tuple(int(v) for v in self.data_cfg.get("target_hw", DEFAULT_TARGET_HW))
         self.pad_align = str(self.data_cfg.get("pad_align", DEFAULT_PAD_ALIGN))
         self.index_cache_size = int(self.data_cfg.get("index_cache_size", 8))
+        # 注意：下面两个目录只用来「拼路径给人看」；真正取文件一律走 src.utils.cache_file
+        # （.nii 优先、兼容 .nii.gz）或本类的 image_path()/label_path()，
+        # 不要再写 f"{case}.nii.gz" 这种把扩展名写死的拼接。
         self.image_dir = self.cache_dir / "image"
         self.label_dir = self.cache_dir / "label"
 
@@ -751,6 +765,7 @@ class CTSliceDataset(Dataset):
         self.case_pad_offset: dict = {}  # case -> (top, left) 内容在补边画布里的左上角
         self.case_n_slices: dict = {}    # case -> nz
         self.case_pos_slices: dict = {}  # case -> 含肿瘤切片数
+        self.case_paths: dict = {}       # case -> (image 路径, label 路径)，已按 .nii > .nii.gz 解析
         self.image_dtype: str | None = None
         self._build_index()
 
@@ -760,19 +775,26 @@ class CTSliceDataset(Dataset):
         """逐 case 读 label 体素，建 ``index`` / ``pos_flags``，并做一致性自检。
 
         读的是 label（几 MB/例）而不是 image（几十 MB/例）：索引只需要「哪些层有肿瘤」。
+        文件路径统一走 ``src.utils.cache_file``：**未压缩 ``.nii`` 优先**（可 mmap，逐层读是页缓存读），
+        没有才退回 ``.nii.gz``（会打一次「压缩缓存很慢」的告警）。解析出的路径记进 ``self.case_paths``，
+        ``__getitem__`` 直接取用，不再每次拼字符串 + ``exists()``。
         """
         problems: list = []
         missing = [c for c in self.case_ids
-                   if not (self.image_dir / f"{c}.nii.gz").exists()
-                   or not (self.label_dir / f"{c}.nii.gz").exists()]
+                   if not cache_file(self.cache_dir, "image", c).exists()
+                   or not cache_file(self.cache_dir, "label", c).exists()]
         if missing:
             raise FileNotFoundError(
                 f"{len(missing)} 个病例在 {rel_to_root(self.cache_dir)} 下缺 image/label：{missing}；"
                 f"请先跑 python scripts/preprocess.py（或确认 case 名单与 cache 一致）")
 
         for case in self.case_ids:
-            img_shape, img_dtype, spacing = _read_header(str(self.image_dir / f"{case}.nii.gz"))
-            lab_img = _open_nii(str(self.label_dir / f"{case}.nii.gz"))
+            image_path = cache_file(self.cache_dir, "image", case)
+            label_path = cache_file(self.cache_dir, "label", case)
+            warn_compressed_cache(image_path, LOGGER)
+            warn_compressed_cache(label_path, LOGGER)
+            img_shape, img_dtype, spacing = _read_header(str(image_path))
+            lab_img = _open_nii(str(label_path))
             lab_arr = np.asanyarray(lab_img.dataobj)
             if lab_arr.ndim != 3:
                 problems.append(f"case {case} 的 label 不是 3D：shape={lab_arr.shape}")
@@ -830,6 +852,7 @@ class CTSliceDataset(Dataset):
             self.case_pad_offset[int(case)] = offset
             self.case_n_slices[int(case)] = nz
             self.case_pos_slices[int(case)] = n_pos
+            self.case_paths[int(case)] = (image_path, label_path)
 
             # 索引只需要「每层有没有肿瘤」，读完这一例就把映射丢掉（不留在 lru_cache 里）：
             # 真正按层读取发生在 __getitem__，届时会重新打开。
@@ -916,6 +939,14 @@ class CTSliceDataset(Dataset):
         """
         return self.case_pad_offset[int(case)]
 
+    def image_path(self, case: int) -> Path:
+        """该病例影像在 cache 里的实际路径（``.nii`` 优先，没有才是 ``.nii.gz``）。"""
+        return self.case_paths[int(case)][0]
+
+    def label_path(self, case: int) -> Path:
+        """该病例掩膜在 cache 里的实际路径（``.nii`` 优先，没有才是 ``.nii.gz``）。"""
+        return self.case_paths[int(case)][1]
+
     # ---------------- 取样本 ----------------
 
     def _to_unit_range(self, arr: np.ndarray) -> np.ndarray:
@@ -935,9 +966,11 @@ class CTSliceDataset(Dataset):
 
     def __getitem__(self, i: int) -> dict:
         case, z = self.index[i]
-        # 只取第 z 层：a[:, :, z] 的形状是 (ny, nx) = (H, W)，与 case_hw 记录的一致
-        image = np.asanyarray(_open_nii(str(self.image_dir / f"{case}.nii.gz")).dataobj)[:, :, z]
-        label = np.asanyarray(_open_nii(str(self.label_dir / f"{case}.nii.gz")).dataobj)[:, :, z]
+        image_path, label_path = self.case_paths[case]
+        # 只取第 z 层：a[:, :, z] 的形状是 (ny, nx) = (H, W)，与 case_hw 记录的一致。
+        # 未压缩 .nii 走 mmap，这一句是页缓存读；.nii.gz 会整卷解压（见 src.utils.cache_file 的说明）
+        image = np.asanyarray(_open_nii(str(image_path)).dataobj)[:, :, z]
+        label = np.asanyarray(_open_nii(str(label_path)).dataobj)[:, :, z]
 
         # 先归一化，再补边（uint16 的 0 就是窗下界，补边补 0 与「背景」同值）
         image = np.ascontiguousarray(self._to_unit_range(image))

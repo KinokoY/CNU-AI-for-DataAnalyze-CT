@@ -3,6 +3,8 @@
 整体功能：剔除 data/exclude_cases.json 中的病例（48-52 几何错位）→ 把地板值 padding 夹到 -1000 →
         统一 RAS → 重采样到 1x1x1mm（影像线性 / 掩膜最近邻）→ 按全局窗 clip(-1000,1000) →
         影像按缓存口径转成归一化 uint16、掩膜只保留 label 2 存 uint8 到 cache/，同时产出可粘贴的统计报告。
+        落盘默认是**未压缩** ``cache/image/<case>.nii``（可 mmap，逐层读取 0.00 ms/层）；
+        ``--compressed`` 才写 ``.nii.gz``（省磁盘，但每读一层整卷解压，实测 557 ms/层）。
 前后接口：上游是 data/volume-<id>.nii + segmentation-<id>.nii 与 configs/default.yaml；
         下游给 scripts/make_splits.py 提供 reports/preprocess_stats.json、给 src/dataset.py 提供 cache/
         （cache 里影像是 uint16 的 [0,1] 归一化值，除以 65535 即为 [0,1]）。
@@ -22,6 +24,7 @@ import numpy as np
 
 try:  # 允许从仓库根直接 python scripts/preprocess.py 运行
     from src.utils import (
+        cache_cases,
         cache_fingerprint,
         format_kv_table,
         load_config,
@@ -35,6 +38,7 @@ try:  # 允许从仓库根直接 python scripts/preprocess.py 运行
 except ModuleNotFoundError:  # pragma: no cover - 兜底：把仓库根塞进 sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from src.utils import (  # type: ignore
+        cache_cases,
         cache_fingerprint,
         format_kv_table,
         load_config,
@@ -51,6 +55,12 @@ LOGGER = setup_logger("preprocess")
 VOLUME_RE = re.compile(r"^volume[-_](\d+)$")
 SEG_RE = re.compile(r"^segmentation[-_](\d+)$")
 NII_SUFFIXES = (".nii.gz", ".nii")
+
+#: cache 落盘用的扩展名：**默认未压缩 ``.nii``**。
+#: 原因见 ``src/utils.CACHE_SUFFIXES``：``.nii.gz`` 无法 mmap，nibabel 每读一层都会整卷解压
+#: （远程实测 557 ms/层 → 训练取数 8.7 分钟/epoch、整卷推理 76 s/例），而 ``.nii`` 是 0.00 ms/层。
+#: 需要省磁盘时用 ``--compressed`` 写回压缩格式（读取端两种都认，未压缩优先）。
+DEFAULT_CACHE_SUFFIX = ".nii"
 
 # 与 config 中 preprocess 节同名的默认值；config 里的值会覆盖它，因此这里只是兜底
 DEFAULTS = {
@@ -219,11 +229,14 @@ def crop_origin_to_nonzero(img, arr: np.ndarray):
 # --------------------------------------------------------------------------------------
 
 def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, pre: dict,
-                 verbose: bool = False) -> dict:
+                 verbose: bool = False, cache_suffix: str = DEFAULT_CACHE_SUFFIX) -> dict:
     """处理一个 case：地板夹取 → RAS → 1mm 重采样 → 全局窗 → 落盘 cache，返回该 case 的统计。
 
     verbose=True 时在每一步几何操作前打印标记：SITK 是 C++ 实现，异常会以 SIGSEGV（段错误）
     直接杀掉进程而不抛 Python 异常，留下"最后一条标记"是定位崩溃点的唯一手段。
+
+    ``cache_suffix`` 默认 ``.nii``（**未压缩**，nibabel 可 mmap、逐层读取是页缓存读）；
+    传 ``.nii.gz`` 则写压缩文件（省磁盘，但每读一层都要整卷解压，训练取数会慢两个数量级）。
     """
     import SimpleITK as sitk
 
@@ -342,7 +355,7 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     # 6) 统计：以「像素数 + spacing」为准换算 mm3，不依赖 affine。
     #    轴序实测结论（scripts/probe_axis.py 在远程确认，下游 dataset.py 依赖它）：
     #      * SimpleITK 内存数组是 (nz, ny, nx)（本函数内 seg_arr / img_arr 就是这个顺序）；
-    #      * 写成 .nii.gz 后，用 nibabel 读回得到的是 (nx, ny, nz) —— 两个库互为转置；
+    #      * 写成 .nii / .nii.gz 后，用 nibabel 读回得到的是 (nx, ny, nz) —— 两个库互为转置；
     #      * 因此「切片轴在 cache 文件的最后一维」，nib 读回时 a[:, :, k] 才是一层 (ny, nx) 切片。
     #    统计放在写盘之前：统计若失败就不该留下看似成功的缓存文件。
     step("统计切片与连通域")
@@ -361,7 +374,7 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
 
     # 三种形状全部记录下来，避免下游再猜轴序：
     #   sitk_shape_zyx：本函数用的 SimpleITK 内存布局
-    #   nib_shape_xyz ：cache 文件（.nii.gz）用 nibabel 读回时的布局，切片轴在最后
+    #   nib_shape_xyz ：cache 文件（.nii / .nii.gz）用 nibabel 读回时的布局，切片轴在最后
     #   inplane_hw    ：面内尺寸 (ny, nx)；nz 为切片数
     rec["new_shape_zyx"] = tuple(int(s) for s in img_arr.shape)
     rec["new_shape_xyz"] = tuple(int(s) for s in img_arr.shape[::-1])
@@ -402,20 +415,23 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     label_dir = cache_dir / "label"
     image_dir.mkdir(parents=True, exist_ok=True)
     label_dir.mkdir(parents=True, exist_ok=True)
+    image_path = image_dir / f"{case_id}{cache_suffix}"
+    label_path = label_dir / f"{case_id}{cache_suffix}"
+    compressed = str(cache_suffix).endswith(".gz")
 
     image_writer = sitk.ImageFileWriter()
-    image_writer.SetFileName(str(image_dir / f"{case_id}.nii.gz"))
-    image_writer.SetUseCompression(True)
+    image_writer.SetFileName(str(image_path))
+    image_writer.SetUseCompression(compressed)
     image_writer.Execute(image_with_origin)
 
     label_writer = sitk.ImageFileWriter()
-    label_writer.SetFileName(str(label_dir / f"{case_id}.nii.gz"))
-    label_writer.SetUseCompression(True)
+    label_writer.SetFileName(str(label_path))
+    label_writer.SetUseCompression(compressed)
     label_writer.Execute(sitk.Cast(mask_with_origin, sitk.sitkUInt8))
 
     # 7) 回读自校验：从刚写的文件独立复算一遍关键量，确认落盘内容与内存统计一致。
     #    目的是让"体积/切片数这类统计量"不再依赖人眼判断是否合理 —— 写错轴、写错量都会当场暴露。
-    written = sitk.ReadImage(str(label_dir / f"{case_id}.nii.gz"))
+    written = sitk.ReadImage(str(label_path))
     written_arr = np.asarray(sitk.GetArrayFromImage(written))
     written_spacing = [float(s) for s in written.GetSpacing()]
     written_voxel_mm3 = float(np.prod(written_spacing))
@@ -443,7 +459,7 @@ def process_case(case_id: int, vol_path: Path, seg_path: Path, cache_dir: Path, 
     #    避免以后改动写盘逻辑时又悄悄换掉轴序。
     import nibabel as nib
 
-    nib_arr = np.asanyarray(nib.load(str(label_dir / f"{case_id}.nii.gz")).dataobj)
+    nib_arr = np.asanyarray(nib.load(str(label_path)).dataobj)
     if tuple(nib_arr.shape) != rec["new_shape_xyz"]:
         raise RuntimeError(f"case {case_id}：nibabel 读回 shape {tuple(nib_arr.shape)} "
                            f"与记录的 {rec['new_shape_xyz']} 不一致（轴序约定被破坏）")
@@ -591,6 +607,9 @@ def main(argv=None) -> int:
     parser.add_argument("--limit", type=int, default=0, help="只处理前 N 个 case（0 = 全部），用于崩溃定位")
     parser.add_argument("--verbose", action="store_true",
                         help="每个 case 打印逐步标记（SITK 段错误时靠最后一条标记定位）")
+    parser.add_argument("--compressed", action="store_true",
+                        help="cache 写成 .nii.gz（省磁盘，但每读一层都要整卷解压，训练会慢两个数量级）"
+                             "；默认写未压缩 .nii（可 mmap）")
     parser.add_argument("--set", dest="overrides", action="append", default=None,
                         help="覆盖配置项，如 --set preprocess.target_spacing=[1,1,1]（可多次）")
     args = parser.parse_args(argv)
@@ -637,12 +656,16 @@ def main(argv=None) -> int:
     # 缓存指纹只由 preprocess 节决定（src.utils.cache_fingerprint）：
     # 第 3 轮新增的 loss 节与缓存无关，不应让清单失效
     cfg_hash = cache_fingerprint(cfg)
+    cache_suffix = ".nii.gz" if args.compressed else DEFAULT_CACHE_SUFFIX
+    LOGGER.info("cache 落盘格式：%s（%s）", cache_suffix,
+                "压缩：省磁盘，但每读一层整卷解压，训练取数会慢两个数量级"
+                if cache_suffix.endswith(".gz") else "未压缩：nibabel 可 mmap，逐层读取是页缓存读")
     records: list = []
     for i, case_id in enumerate(cases, 1):
         LOGGER.info("[%d/%d] case %d ...", i, len(cases), case_id)
         try:
             rec = process_case(case_id, volumes[case_id], segs[case_id], cache_dir, pre,
-                               verbose=bool(args.verbose or args.debug))
+                               verbose=bool(args.verbose or args.debug), cache_suffix=cache_suffix)
         except Exception as exc:  # noqa: BLE001 - 单 case 失败不中断整体
             LOGGER.exception("case %d 处理失败：%s", case_id, exc)
             rec = {"case": case_id, "status": "FAILED", "error": f"{type(exc).__name__}: {exc}"}
@@ -705,12 +728,11 @@ def main(argv=None) -> int:
 
     # ---- 自检 ----
     expected_ids = {str(int(c)) for c in cases}
-    present_img = {p.name.split(".")[0] for p in (cache_dir / "image").glob("*.nii.gz")} \
-        if (cache_dir / "image").is_dir() else set()
-    present_lab = {p.name.split(".")[0] for p in (cache_dir / "label").glob("*.nii.gz")} \
-        if (cache_dir / "label").is_dir() else set()
+    present_img = {str(c) for c in cache_cases(cache_dir, "image")}
+    present_lab = {str(c) for c in cache_cases(cache_dir, "label")}
     n_written, n_label = len(present_img), len(present_lab)
-    LOGGER.info("cache 中 image=%d，label=%d（本次期望 %d 例）", n_written, n_label, len(expected_ids))
+    LOGGER.info("cache 中 image=%d，label=%d（本次期望 %d 例；按 .nii 优先、兼容 .nii.gz 计数）",
+                n_written, n_label, len(expected_ids))
 
     ran_without_failure = aggregate["n_cases_failed"] == 0
     next_step = "python scripts/check_cache.py"

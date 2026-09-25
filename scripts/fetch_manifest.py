@@ -3,8 +3,8 @@
 整体功能：直接扫描 cache/image 与 cache/label，统计每例的形状、spacing、含肿瘤切片数、肿瘤体积与
         连通域个数，生成与 scripts/preprocess.py 同构的清单；用于"缓存数据本身正确、只是清单口径
         过期（例如轴序修正后）"时刷新清单，省掉几分钟的重新预处理。
-前后接口：上游是 cache/ 下已有的 nii.gz；下游与 preprocess.py 产出的清单同格式，
-        供 scripts/check_cache.py 与 src/train.py 校验；**不修改任何 nii.gz**。
+前后接口：上游是 cache/ 下已有的 ``.nii``（未压缩优先，兼容 ``.nii.gz``）；下游与 preprocess.py
+        产出的清单同格式，供 scripts/check_cache.py 与 src/train.py 校验；**不修改任何缓存文件**。
 用法：仓库根目录执行 ``python scripts/fetch_manifest.py``。
 """
 
@@ -17,16 +17,29 @@ from pathlib import Path
 import numpy as np
 
 try:
-    from src.utils import cache_fingerprint, load_config, rel_to_root, resolve_path, save_json, setup_logger
-except ModuleNotFoundError:  # pragma: no cover
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from src.utils import (  # type: ignore
+    from src.utils import (
+        cache_cases,
+        cache_file,
         cache_fingerprint,
         load_config,
         rel_to_root,
         resolve_path,
         save_json,
         setup_logger,
+        warn_compressed_cache,
+    )
+except ModuleNotFoundError:  # pragma: no cover
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from src.utils import (  # type: ignore
+        cache_cases,
+        cache_file,
+        cache_fingerprint,
+        load_config,
+        rel_to_root,
+        resolve_path,
+        save_json,
+        setup_logger,
+        warn_compressed_cache,
     )
 
 LOGGER = setup_logger("fetch_manifest")
@@ -56,10 +69,13 @@ def main(argv=None) -> int:
     cfg_hash = cache_fingerprint(cfg)
 
     cases: list = []
-    for path in sorted(label_dir.glob("*.nii.gz"), key=lambda p: int(p.name.split(".")[0])):
-        case = int(path.name.split(".")[0])
-        lab = np.asanyarray(nib.load(str(path)).dataobj)
-        img_img = nib.load(str(image_dir / f"{case}.nii.gz"))
+    case_ids = cache_cases(cache_dir, "label")
+    LOGGER.info("扫描 cache：label %d 例（.nii 优先，兼容 .nii.gz）", len(case_ids))
+    for case in case_ids:
+        label_path = cache_file(cache_dir, "label", case)
+        warn_compressed_cache(label_path, LOGGER)
+        lab = np.asanyarray(nib.load(str(label_path)).dataobj)
+        img_img = nib.load(str(cache_file(cache_dir, "image", case)))
         spacing = [round(float(z), 4) for z in img_img.header.get_zooms()[:3]]
         voxel_mm3 = float(np.prod(spacing))
         # 轴序实测（probe_axis.py）：nib 布局 (nx, ny, nz)，切片轴在最后一维

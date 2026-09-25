@@ -1,6 +1,7 @@
 """轴序探针：确认 cache 文件被 nibabel / SimpleITK 读回时的真实数组形状与切片轴。
 
-整体功能：对同一个 .nii.gz 分别用 SimpleITK 与 nibabel 读取，打印各自的数组形状、spacing 与
+整体功能：对同一个缓存文件（``<case>.nii`` / ``.nii.gz`` 都支持）分别用 SimpleITK 与 nibabel 读取，
+        打印各自的数组形状、spacing 与
         "沿各轴求和得到的前景层数"，从而唯一确定切片轴在数组的哪一维，并检查两个库是否互为转置。
 前后接口：只读 data/ 下的原始 NIfTI 与 cache/ 下的缓存（若存在）、以及 cache_manifest.json，不写任何文件。
 用法：当改动过写盘 / 重采样逻辑、或怀疑轴序被破坏时执行 ``python scripts/probe_axis.py --case 31``，
@@ -16,6 +17,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.utils import cache_file  # noqa: E402  （路径口径见 src.utils.cache_file）
 
 
 def describe(tag: str, arr: np.ndarray, spacing) -> None:
@@ -51,9 +54,9 @@ def main() -> int:
               f"{tuple(nib_arr.shape) == tuple(reversed(sitk_arr.shape))}")
         print(f"nibabel header zooms = {tuple(round(float(z), 4) for z in nib_img.header.get_zooms()[:3])}")
 
-    # ---- 2) 缓存文件 ----
-    lab_path = Path(args.cache_dir) / "label" / f"{args.case}.nii.gz"
-    img_path = Path(args.cache_dir) / "image" / f"{args.case}.nii.gz"
+    # ---- 2) 缓存文件（.nii 优先，兼容 .nii.gz）----
+    lab_path = cache_file(args.cache_dir, "label", args.case)
+    img_path = cache_file(args.cache_dir, "image", args.case)
     if lab_path.exists():
         print("\n=== 缓存 label ===")
         s_lab = sitk.GetArrayFromImage(sitk.ReadImage(str(lab_path)))

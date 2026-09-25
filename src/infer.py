@@ -36,13 +36,19 @@ import torch
 
 try:
     from src.dataset import CTSliceDataset, format_hw, reset_open_cache
-    from src.utils import autocast_context, resolve_amp, resolve_path, setup_logger
+    from src.utils import autocast_context, cache_file, resolve_amp, setup_logger, warn_compressed_cache
 except ModuleNotFoundError:  # pragma: no cover - 兜底：把仓库根塞进 sys.path
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from src.dataset import CTSliceDataset, format_hw, reset_open_cache  # type: ignore
-    from src.utils import autocast_context, resolve_amp, resolve_path, setup_logger  # type: ignore
+    from src.utils import (  # type: ignore
+        autocast_context,
+        cache_file,
+        resolve_amp,
+        setup_logger,
+        warn_compressed_cache,
+    )
 
 LOGGER = setup_logger("infer")
 
@@ -106,10 +112,11 @@ def load_label_volume(case, cache_dir, cfg: dict | None = None, binary: bool = T
     ``cfg`` 只用于兼容调用签名（路径解析统一走 ``cache_dir``），可以不传。
     """
     del cfg   # 路径一律由 cache_dir 给出，保留参数只是为了调用处一致
-    path = resolve_path(cache_dir) / "label" / f"{int(case)}.nii.gz"
+    path = cache_file(cache_dir, "label", case)
     if not path.exists():
         raise FileNotFoundError(f"找不到 {path}（先跑 python scripts/preprocess.py，"
                                 f"或确认 cache 位置与 --cache-dir 一致）")
+    warn_compressed_cache(path, LOGGER)
     import nibabel as nib
 
     image = nib.load(str(path))

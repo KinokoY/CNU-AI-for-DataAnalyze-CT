@@ -26,7 +26,13 @@ python scripts/preprocess.py
 ```
 
 做什么：剔除 48-52 → 地板值 padding 夹到 -1000 → 统一 RAS → 重采样到 1×1×1mm（影像线性 / 掩膜最近邻）
-→ `clip(-1000,1000)` → `cache/image/<case>.nii.gz`（**uint16，已归一化**）+ `cache/label/<case>.nii.gz`（uint8，仅 label 2）。
+→ `clip(-1000,1000)` → `cache/image/<case>.nii`（**uint16，已归一化，未压缩**）+ `cache/label/<case>.nii`（uint8，仅 label 2）。
+
+> **为什么缓存不压缩**（第 3 轮实测后改的默认值，别改回去）：`.nii.gz` 没法 mmap，
+> nibabel 读一层 `a[:, :, z]` 会把**整卷解压一遍** = **557 ms/层**；未压缩 `.nii` 走 mmap = **0.00 ms/层**。
+> 后果对比：训练取数 8.7 分钟/epoch → 秒级；整卷推理 76 s/例 → ~2 s/例。
+> 需要省磁盘时可以用 `python scripts/preprocess.py --compressed` 写回 `.nii.gz`
+> （读取端两种都认、未压缩优先，见 1.3）。
 
 **缓存约定（下游 dataset.py 依赖，经 `scripts/probe_axis.py` 在远程实测确认，不要改动）**：
 
@@ -37,12 +43,14 @@ python scripts/preprocess.py
 - **影像数值**：`uint16`，把 HU 窗 `[-1000, 1000]` 线性映射到 `[0, 1]` 后按 `1/65535` 量化存储。
   **dataset.py 里 `image.float() / 65535.0` 即得到 [0,1] 输入**，1 个量化步长 ≈ 0.0305 HU。
   （SimpleITK 没有 float16 像素类型；如需存原始 HU 可把 `preprocess.image_out_dtype` 设为 `float32`。）
+- **扩展名**：`<case>.nii` 优先、`<case>.nii.gz` 兼容；一律通过 `src.utils.cache_file` 解析，
+  不要在脚本里手写 `f"{case}.nii.gz"`。
 
 产出：
 
 | 文件 | 说明 |
 | --- | --- |
-| `cache/image/*.nii.gz`、`cache/label/*.nii.gz` | 每例两个文件，共 25 例 |
+| `cache/image/*.nii`、`cache/label/*.nii` | 每例两个文件，共 25 例（未压缩，可 mmap；旧的 `*.nii.gz` 也认） |
 | `cache/cache_manifest.json` | 训练启动时校验 cache 与配置是否匹配；**只存在于远程**（不入库） |
 | `reports/preprocess_stats.json` / `.md` | 逐 case 统计 + 尺寸分布汇总（**贴回这个 .md**） |
 
@@ -51,7 +59,8 @@ python scripts/preprocess.py
 期望输出（日志尾部）：
 
 ```
-cache 中 image=25，label=25
+cache 落盘格式：.nii（未压缩：nibabel 可 mmap，逐层读取是页缓存读）
+cache 中 image=25，label=25（本次期望 25 例；按 .nii 优先、兼容 .nii.gz 计数）
 完整性自检通过：25 例全部成功，image/label 文件集合与预期一致。
 下一步：python scripts/check_cache.py（再跑 python scripts/make_splits.py）
 ```
@@ -103,6 +112,31 @@ python scripts/probe_axis.py --case 31
 
 用途：确认 cache 文件被 nibabel / SimpleITK 读回时的真实形状与切片轴。
 它同时打印沿每个轴求和得到的"非零层数"，用清单里的 `tumor_slices` 交叉验证哪一维是切片轴。
+
+### 1.3 缓存格式：已有 `.nii.gz` 缓存怎么办（第 3 轮新增，一次性）
+
+远程已有的是**压缩缓存**（`cache/image/<case>.nii.gz`）。`preprocess.py` 现在默认写未压缩 `.nii`，
+读取端（`src/dataset.py` / `src/infer.py`）按「`.nii` 优先、`.nii.gz` 兼容」解析，
+所以**不用重跑预处理、也不用改配置或指纹**，跑一次转换脚本即可：
+
+```bash
+python scripts/inflate_cache.py --dry-run      # 先看计划（不写文件）
+python scripts/inflate_cache.py --remove-gz    # 转换成 .nii，校验通过后删掉 .nii.gz
+```
+
+做什么：对 `image/`、`label/` 两个子目录里的每个 `.nii.gz`，**在同目录**写出同名 `.nii`
+（目录结构、文件名、体素、dtype、affine 全都不变，只差扩展名），逐体素比对通过后才删原件；
+任何一例校验失败就报错退出且不删任何东西。
+
+判读：
+- 输出里应有 `image：25 例，其中压缩的 25 例` / `label：25 例，其中压缩的 25 例`；
+- 每行 `xxx.nii.gz → xxx.nii：12.3 MB → 68.1 MB（uint16 (512,512,135)，0.45 s）；校验通过`；
+- 结束打印 `转换完成：成功 50 个，跳过 0 个，失败 0 个（另有 0 个本来就是未压缩 .nii）`，
+  以及一行性能抽检 `性能抽检（33.nii）：mmap 逐层读取 0.00 ms/层（压缩缓存实测 557 ms/层）`；
+- 转换后 `python -m src.selfcheck_data` 应照旧通过（指纹 `7b4c48b4dc7ef880` 不变，清单不用重建）。
+
+> 判断当前用的是哪种格式：`python -m src.selfcheck_data` 的 `cache：...（image=25，label=25；.nii 优先、兼容 .nii.gz）`
+> 一行，若下面出现 `cache/image 里有 N 例仍是压缩的 .nii.gz` 的告警，就说明还没转换。
 
 ---
 
@@ -292,25 +326,34 @@ iteration 1：image (2, 1, 512, 512) / label (2, 512, 512)（logits (2, 2, 512, 
 
 - **`image (B,1,512,512)` / `label (B,512,512)` / `logits (B,2,512,512)`**：形状必须逐字对得上，
   这是「dataset 补边 → 模型 → 损失」三处口径对齐的唯一证据。
-- **首个 iteration 的 loss 在 1.0~1.3 之间是正常的**：随机权重时背景 Dice≈0.97、肿瘤 Dice≈0，
-  于是 dice 项≈0.5；CE≈ln2≈0.69。**注意这是「两项各 1.0 权重」的合计值**，不是异常。
+- **首个 iteration 的 loss 在 1.4~1.7 之间是正常的**：随机初始化时 logits 近似为 0，
+  背景类拿不到「几乎全对」的 Dice（实测 dice 项 ≈0.68，对应背景 Dice≈0.65 而不是 0.97），
+  CE 也略高于 ln2（实测 ≈0.91，说明随机权重下模型是"自信地乱猜"）。
+  这是**两项各 1.0 权重**的合计值，不是异常；判读要看它随训练下降的趋势。
 - **`--debug` 的「一轮 batch 数」看着偏大是正常的**：`batch_size=2` 时采样器算出的
   `n_pos=1, n_neg=1`，于是「阴性槽位」这条下界变成 ≈ 阴性层数（远大于 `切片数/2`）。
-  正式训练用 `batch_size=8` 时是 642 个 batch（口径见 `docs/preprocess_notes.md` 6.3）；
-  想看真实量级的 batch 数就用 `--set train.batch_size=8` 再跑一次 `--debug`。
+  当前默认 `batch_size=16` 时是全折 351 个 batch（口径见 `docs/preprocess_notes.md` 6.3）；
+  想看真实量级就按默认配置再跑一次 `--debug`（不加 `--set`）。
 - **实测阳性比例不等于 `pos_ratio_target`**：`0.30` 是每批阳性数的**上限**，实际每批几个由
   「阳性层总数 / 一轮 batch 数」决定（第 2 轮已实测：fold 0 上 bs=8 → 每批 1 个）。`--debug` 只跑 3 个
   batch，抽到 1~2 个阳性都算正常。
 - **`pad_offset` 与 `nz`**：`pad_offset` 只对非 512 病例非零（342→512 是 `(85,85)`）；若这里打印的
   面内尺寸与 `docs/preprocess_notes.md` 的面内尺寸表不符，说明 cache 或划分对不上，先别继续。
-- **显存与单步耗时用来定 `batch_size`**（第 6 轮的依据）。A100 40 GiB 上按上面量级线性外推，
-  `batch_size=16` 也只有十几 GB，实际以实测为准。
+- **显存与单步耗时用来定 `batch_size`**（第 6 轮的依据）。实测（`max_memory_allocated`）：
+  `batch_size=2` → 5416 MB、`batch_size=8` → 7671 MB，拟合 ≈ **376 MB/样本 + 4.7 GB 静态开销**
+  （静态里主要是 cuDNN autotune 的工作区）→ `batch_size=16 ≈ 10.7 GB`、`32 ≈ 16.7 GB`、`48 ≈ 22.7 GB`。
+  40 GB 卡上推荐 **16**：每批 1~2 个阳性、全阴性 batch 归零，同时每 epoch 仍有 351 次参数更新。
+- **第 1 个 iteration 的 forward/backward 特别慢是正常的**（实测 2.05 s / 10.4 s）：
+  `cudnn.benchmark=True` 的一次性 autotune，稳态是 0.040 s / 0.071 s。
+- **整卷推理那一步的耗时**（实测 77 s）在把缓存换成未压缩 `.nii`（见 1.3）后会掉到 ~2 s；
+  若仍是几十秒，先确认缓存格式，再怀疑模型。
 
-标定某个 `batch_size`（**给了 `--set train.batch_size=` 就不会再用默认的 2**）：
+标定某个 `batch_size`（**不给 `--set train.batch_size=` 时 `--debug` 固定用 2**，与正式训练无关）：
 
 ```bash
-python -m src.train --fold 0 --debug --set train.batch_size=8
-python -m src.train --fold 0 --debug --set train.batch_size=16
+python -m src.train --fold 0 --debug                            # bs=2：最省事的链路自检
+python -m src.train --fold 0 --debug --set train.batch_size=16  # 按正式训练的 batch_size 复测显存/耗时（推荐）
+python -m src.train --fold 0 --debug --set train.batch_size=32  # 想试更大 batch 时用
 ```
 
 想跳过整卷推理那一步：`--debug-val-cases 0`；想多跑几个 iteration：`--debug-iters 10`。
@@ -330,20 +373,26 @@ python -m src.train --fold 0
 
 ```
 设备：cuda（NVIDIA A100-PCIE-40GB）；随机种子：42；目标面内尺寸：512x512（pad_align=center）
-模型：UNet2D(in=1, out=2, encoder=[32, 64, 128, 256], bottleneck=512, 下采样 4 次（对齐 16）, norm=batch, 可训练参数 7.762 M)
+训练配置：epochs=200，batch_size=16，lr=0.001，val_every=1，早停 patience=20，grad_clip_norm=0，num_workers=8
+模型：UNet2D(in=1, out=2, encoder=[32, 64, 128, 256], bottleneck=512, 下采样 4 次（对齐 16）, norm=batch, 可训练参数 9.243 M)
 DiceCELoss（自实现）：λ_dice=1 λ_ce=1；softmax=True batch=True include_background=True smooth=1e-05；to_onehot_y=False（内部一律 one-hot）；ce_class_weights=None
 优化器：AdamW(lr=0.001, weight_decay=0.0001)；调度器：CosineAnnealingLR(T_max=200, eta_min=0)
 AMP：bf16 autocast（**不启用 GradScaler**：bf16 与 fp32 同指数范围，不需要 loss scaling）
 前置校验通过：fold 0 的 train 21 例 [...] / val 4 例 [...]
-训练 loader：21 例 / 4469 层切片 → 一轮 642 个 batch（batch_size=8）；验证 4 例（整卷推理）
-首个 batch 形态：image (8, 1, 512, 512) / label (8, 512, 512)；病例 ['34', '37', ...]；z=[...]；值域 [0.0000, 1.0000]；orig_hw [[512, 512], [436, 436], ...]；补边偏移 [[0, 0], [38, 38], ...]
-epoch 1/200 | lr 1.00e-03 | 训练 loss 1.1842（dice 0.5031 + ce 0.6811）| 642 个 batch / 118.3 s | 验证整卷 Dice 0.0731［33:0.101 57:0.052 59:0.000 60:0.139；min 0.000 max 0.139］/ 21.4 s | best 0.0731@ep1 | patience 0/20 | 峰值显存 3187 MB
-epoch 2/200 | lr 1.00e-03 | 训练 loss 0.8917（dice 0.4102 + ce 0.4815）| 642 个 batch / 117.9 s | 验证整卷 Dice 0.2864［...］/ 21.2 s | best 0.2864@ep2 | patience 0/20 | 峰值显存 3187 MB
+训练 loader：21 例 / 4469 层切片 → 一轮 351 个 batch（batch_size=16）；验证 4 例（整卷推理）
+首个 batch 形态：image (16, 1, 512, 512) / label (16, 512, 512)；病例 ['31', '32', '34', ...]；z=[...]；值域 [0.0000, 1.0000]；orig_hw [[512, 512], [512, 512], ...]；补边偏移 [[0, 0], [0, 0], ...]
+epoch 1/200 | lr 1.00e-03 | 训练 loss 1.5921（dice 0.6827 + ce 0.9094）| 351 个 batch / 84.7 s［取数 6.2 s + 计算 78.5 s］| 验证整卷 Dice 0.0731［33:0.101 57:0.052 59:0.000 60:0.139；min 0.000 max 0.139］/ 8.6 s | best 0.0731@ep1 | patience 0/20 | 峰值显存 ~10700 MB
+epoch 2/200 | lr 1.00e-03 | 训练 loss 0.8917（dice 0.4102 + ce 0.4815）| 351 个 batch / 84.1 s［取数 6.0 s + 计算 78.1 s］| 验证整卷 Dice 0.2864［...］/ 8.4 s | best 0.2864@ep2 | patience 0/20 | 峰值显存 ~10700 MB
 ...
-epoch 68/200 | lr 4.42e-04 | 训练 loss 0.2134（dice 0.1502 + ce 0.0632）| 642 个 batch / 118.1 s | 验证整卷 Dice 0.6127［...］/ 21.5 s | best 0.6231@ep61 | patience 7/20 | 峰值显存 3187 MB
-训练结束：best 整卷 Dice 0.6231 @ epoch 61；本次跑完 81 轮（epoch 1 → 81），用时 188.4 分钟
+epoch 68/200 | lr 4.42e-04 | 训练 loss 0.2134（dice 0.1502 + ce 0.0632）| 351 个 batch / 84.3 s［取数 6.1 s + 计算 78.2 s］| 验证整卷 Dice 0.6127［...］/ 8.7 s | best 0.6231@ep61 | patience 7/20 | 峰值显存 ~10700 MB
+训练结束：best 整卷 Dice 0.6231 @ epoch 61；本次跑完 81 轮（epoch 1 → 81），用时 125.6 分钟
 产物：runs/fold0（best.pt / last.pt / metrics.csv / run.json / train.log / tensorboard/）
 ```
+
+> 上面的 loss / Dice 是**形态示例**（数字本身没有意义），batch 数与耗时按当前口径估：
+> `batch_size=16` 时 fold 0 一轮 351 个 batch、GPU 约 0.22 s/step ≈ 78 s；
+> 显存 `~10700 MB` 由 bs=2/bs=8 两点实测外推（376 MB/样本 + 4.7 GB），**以首次 --debug 的实测为准**。
+> 若还是 `.nii.gz` 缓存，`取数` 会涨到 8~9 分钟、`验证` 会涨到 5 分钟——看到那种日志先去跑 1.3 的转换脚本。
 
 判读要点：
 
@@ -357,6 +406,11 @@ epoch 68/200 | lr 4.42e-04 | 训练 loss 0.2134（dice 0.1502 + ce 0.0632）| 64
 - **`best` 与 `patience`**：只有验证轮才更新；`patience` 达到 `early_stop_patience` 就停在那一轮，
   `best.pt` 仍指向历史最优。每轮都会覆盖 `last.pt`（续跑用），`best.pt` 只在刷新时写。
 - **`峰值显存`** 是本次运行的历史峰值；把它与 `--debug` 的外推值对照，可以判断还能不能再加 batch。
+- **每轮那行的 `［取数 x s + 计算 y s］` 是判断瓶颈的唯一依据**：正常应是「计算远大于取数」
+  （未压缩缓存下取数几秒、计算一两分钟）。若 `取数 > 计算`，说明数据加载拖住了 GPU：
+  先看 `python -m src.selfcheck_data` 有没有 `仍是压缩的 .nii.gz` 告警（有就按 1.3 转换），
+  已经是 `.nii` 再考虑调大 `data.num_workers`（52 核，可到 16）。第 1 轮 epoch 若出现
+  `取数耗时 ... 超过计算耗时 ...：**数据加载是瓶颈**` 的告警，也是同一件事。
 
 5 折依次跑：
 
@@ -423,7 +477,7 @@ python -m src.train --fold 0 --resume
 
 | 参数 | 作用 | 备注 |
 | --- | --- | --- |
-| `train.batch_size` | 每批样本数；**直接决定每批阳性切片数**（bs=8 → 1 个，bs=16 → 1~2 个、全阴性 batch 0 个） | 先按 `--debug` 的显存标定，512×512 下 A100 余量很大 |
+| `train.batch_size` | 每批样本数；**直接决定每批阳性切片数**（bs=8 → 每批 0~1 个、25 个全阴性 batch；**bs=16 → 每批 1~2 个、全阴性 0 个**） | 第 3 轮已按实测定为 **16**（≈10.7 GB）；按 `--debug` 的显存标定，512×512 下 A100 余量很大 |
 | `train.pos_ratio_target` | 每批阳性数的**上限**（`round(bs×该值)`），不是实际比例 | 实际比例由「阳性层总数 / 一轮 batch 数」决定，见 `docs/preprocess_notes.md` 6.3 |
 | `train.lr` / `train.min_lr_ratio` | 初始学习率 / 余弦退火的下界（`eta_min = lr × 该值`） | `min_lr_ratio=0` 是退火到 0 |
 | `train.early_stop_patience` | 连续多少轮没有提升就停 | 默认 20；首折看曲线再定 |
@@ -452,7 +506,7 @@ python -m src.train --fold 0 --debug --set train.batch_size=4 --set train.epochs
 
 ## 6. 运行产物与 git 边界
 
-- **不入库且只存在于远程**：`cache/`（含 `cache_manifest.json`）、`reports/`、`runs/`，以及所有 `*.pt` / `*.nii.gz`。
+- **不入库且只存在于远程**：`cache/`（含 `cache_manifest.json`）、`reports/`、`runs/`，以及所有 `*.pt` / `*.nii*`。
   数据受保密协议约束不能下载，所以本地仓库看不到这些文件；后续编码所需的关键数字都记在
   `docs/preprocess_notes.md` 里。
 - **入库**：`data/splits.json`、`data/exclude_cases.json`、`configs/*.yaml`、`src/*.py`、`scripts/*.py`、`docs/*.md`。

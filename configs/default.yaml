@@ -82,7 +82,11 @@ loss:
 
 # ---------- 训练 ----------
 train:
-  batch_size: 8                   # 第 3 轮 --debug 实测显存后再定稿；标定：--debug --set train.batch_size=8
+  batch_size: 16                  # 第 3 轮按 --debug 实测定的：显存两点外推 ≈ 376 MB/样本 + 4.7 GB 静态
+                                  #   → bs=16 峰值 ≈ 10.7 GB（bs=2 实测 5416 MB、bs=8 实测 7671 MB，
+                                  #   40 GB 卡余量充足）。选 16 而不是更大：fold 0 上 bs=16 → 一轮 351 个
+                                  #   batch、每批 1~2 个阳性、**全阴性 batch 归零**，且每 epoch 仍有 351 次
+                                  #   参数更新（bs=32 只剩 176 次，样本量这么小时更新次数更值钱）。
   lr: 0.001
   weight_decay: 0.0001
   scheduler: cosine               # CosineAnnealingLR（none = 不用调度器）

@@ -3,7 +3,8 @@
 整体功能：对每一例检查 image/label 是否成对、shape 是否一致、spacing 是否为约定的 1mm 三项相同、
         label 取值是否只含 {0,1}、有无肿瘤、影像数值是否落在约定范围（uint16 时为 [0,65535]），
         并把实测结果与 cache_manifest.json 逐例比对，不一致就报错并以非零码退出。
-前后接口：上游是 scripts/preprocess.py（或 fetch_manifest.py）产出的 cache/ 与 cache_manifest.json；
+前后接口：上游是 scripts/preprocess.py（或 fetch_manifest.py）产出的 cache/ 与 cache_manifest.json
+        （cache 文件为 ``<case>.nii``，未压缩优先，兼容旧的 ``.nii.gz``）；
         下游给 src/dataset.py / src/train.py 一个"缓存可信"的前置保证。
 用法：仓库根目录执行 ``python scripts/check_cache.py``；只要汇总不要逐例明细就加 ``--quiet``。
 """
@@ -18,16 +19,29 @@ from pathlib import Path
 import numpy as np
 
 try:
-    from src.utils import load_config, load_json, rel_to_root, resolve_path, save_json, setup_logger
-except ModuleNotFoundError:  # pragma: no cover
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from src.utils import (  # type: ignore
+    from src.utils import (
+        cache_cases,
+        cache_file,
         load_config,
         load_json,
         rel_to_root,
         resolve_path,
         save_json,
         setup_logger,
+        warn_compressed_cache,
+    )
+except ModuleNotFoundError:  # pragma: no cover
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from src.utils import (  # type: ignore
+        cache_cases,
+        cache_file,
+        load_config,
+        load_json,
+        rel_to_root,
+        resolve_path,
+        save_json,
+        setup_logger,
+        warn_compressed_cache,
     )
 
 LOGGER = setup_logger("check_cache")
@@ -64,14 +78,18 @@ def main(argv=None) -> int:
     LOGGER.info("期望的缓存口径：image_out_dtype=%s，target_spacing=%s，值域 %s",
                 expect_out_dtype, target_spacing, val_desc)
 
-    images = sorted(image_dir.glob("*.nii.gz"), key=lambda p: int(p.name.split(".")[0]))
-    labels = sorted(label_dir.glob("*.nii.gz"), key=lambda p: int(p.name.split(".")[0]))
+    case_ids = cache_cases(cache_dir, "image")
+    label_ids = cache_cases(cache_dir, "label")
+    images = [cache_file(cache_dir, "image", c) for c in case_ids]
+    labels = [cache_file(cache_dir, "label", c) for c in label_ids]
+    for path in images[:1] + labels[:1]:
+        warn_compressed_cache(path, LOGGER)      # 压缩缓存只提醒一次（逐层读取会整卷解压）
     problems: list = []
 
     if len(images) != len(labels):
         problems.append(f"image 文件数 {len(images)} != label 文件数 {len(labels)}")
-    img_ids = {p.name.split(".")[0] for p in images}
-    lab_ids = {p.name.split(".")[0] for p in labels}
+    img_ids = {str(c) for c in case_ids}
+    lab_ids = {str(c) for c in label_ids}
     if img_ids != lab_ids:
         problems.append(f"image/label 文件名不成对，差集：{sorted(img_ids ^ lab_ids)}")
 
@@ -90,11 +108,10 @@ def main(argv=None) -> int:
                            "请跑 python scripts/fetch_manifest.py 刷新清单")
 
     rows: list = []
-    for path in images:
-        case = path.name.split(".")[0]
-        img = nib.load(str(path))
+    for case in case_ids:
+        img = nib.load(str(cache_file(cache_dir, "image", case)))
         arr = np.asanyarray(img.dataobj)
-        lab_img = nib.load(str(label_dir / f"{case}.nii.gz"))
+        lab_img = nib.load(str(cache_file(cache_dir, "label", case)))
         lab = np.asanyarray(lab_img.dataobj)
         zooms = tuple(round(float(z), 4) for z in img.header.get_zooms()[:3])
         lab_zooms = tuple(round(float(z), 4) for z in lab_img.header.get_zooms()[:3])

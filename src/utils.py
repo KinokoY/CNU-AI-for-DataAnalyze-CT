@@ -2,7 +2,7 @@
 
 整体功能：被 scripts/ 与 src/ 下所有脚本复用的一层薄工具，保证路径、随机性与产物格式跨轮次一致。
 前后接口：上游读 configs/*.yaml 与 json 清单；下游给 dataset/unet/train/evaluate 提供 cfg 字典、REPO_ROOT 与报告写入函数。
-用法：``from src.utils import load_config, REPO_ROOT, set_seed, save_report, config_fingerprint, cache_fingerprint``。
+用法：``from src.utils import load_config, REPO_ROOT, set_seed, save_report, config_fingerprint, cache_fingerprint, cache_file``。
 """
 
 from __future__ import annotations
@@ -46,6 +46,67 @@ def rel_to_root(path: str | os.PathLike) -> str:
         return str(p.resolve().relative_to(REPO_ROOT))
     except Exception:  # noqa: BLE001 - 不在仓库内就原样返回
         return str(p)
+
+
+# --------------------------------------------------------------------------------------
+# cache 文件布局（唯一事实来源）：<cache>/<kind>/<case>.nii
+# --------------------------------------------------------------------------------------
+
+#: cache 文件的候选扩展名，**未压缩 ``.nii`` 优先**。
+#:
+#: 为什么必须优先未压缩：nibabel 对未压缩 ``.nii`` 走 mmap，读一层 ``a[:, :, z]`` 是页缓存读
+#: （远程实测 **0.00 ms/层**）；而 ``.nii.gz`` 无法 mmap（未装 indexed_gzip），
+#: **每读一层都会把整卷解压一遍**（远程实测 **557 ms/层**）——训练取数 8.7 分钟/epoch、
+#: 整卷推理 76 s/例都是它造成的。两种扩展名共用同一套目录结构与文件名，只差扩展名。
+CACHE_SUFFIXES = (".nii", ".nii.gz")
+
+#: 「检测到压缩缓存」的提醒只打一次（每个进程），避免在 DataLoader worker 里刷屏
+_COMPRESSED_NOTICE_EMITTED = False
+
+
+def cache_file(cache_dir: str | os.PathLike, kind: str, case) -> Path:
+    """返回 cache 里某例的文件路径：``<cache_dir>/<kind>/<case>.nii``（没有则退回 ``.nii.gz``）。
+
+    ``kind`` 是 ``"image"`` 或 ``"label"``。两种扩展名都不存在时不抛错，而是返回首选名的路径，
+    由调用方按自己的口径报「缺文件」——这样错误信息里能带上完整路径。
+    """
+    base = resolve_path(cache_dir) / str(kind)
+    for suffix in CACHE_SUFFIXES:
+        path = base / f"{int(case)}{suffix}"
+        if path.exists():
+            return path
+    return base / f"{int(case)}{CACHE_SUFFIXES[0]}"
+
+
+def cache_cases(cache_dir: str | os.PathLike, kind: str = "label") -> list:
+    """列出 cache 某子目录里已有的病例号（同一 case 的 ``.nii`` 与 ``.nii.gz`` 只算一次）。
+
+    给「按文件清点病例」的脚本用（check_cache / fetch_manifest / selfcheck / preprocess 自检），
+    避免各处各写一遍 ``glob("*.nii.gz")``——把未压缩缓存漏掉（会数出 0 个文件）。
+    """
+    base = resolve_path(cache_dir) / str(kind)
+    found: dict = {}
+    if base.is_dir():
+        for suffix in reversed(CACHE_SUFFIXES):     # 先收 .nii.gz，再用 .nii 覆盖 ⇒ .nii 优先
+            for path in base.glob(f"*{suffix}"):
+                stem = path.name[: -len(suffix)]
+                if stem.isdigit():
+                    found[int(stem)] = path
+    return sorted(found)
+
+
+def warn_compressed_cache(path, logger=None) -> bool:
+    """第一次遇到 ``.nii.gz`` 缓存时提醒一次（每个进程一次），返回是否用的压缩文件。"""
+    global _COMPRESSED_NOTICE_EMITTED
+    compressed = str(path).endswith(".gz")
+    if compressed and not _COMPRESSED_NOTICE_EMITTED:
+        _COMPRESSED_NOTICE_EMITTED = True
+        (logger or logging.getLogger("ct")).warning(
+            "检测到压缩缓存 %s：.nii.gz 无法 mmap，nibabel 每读一层都要整卷解压"
+            "（远程实测 557 ms/层 → 训练取数 8.7 分钟/epoch、整卷推理 76 s/例）。"
+            "跑一次 python scripts/inflate_cache.py 生成同名未压缩 .nii 即可（读取端已优先用 .nii）。",
+            path)
+    return compressed
 
 
 # --------------------------------------------------------------------------------------
