@@ -125,3 +125,92 @@
 
 自检脚本：`python -m src.selfcheck_data`（只读 cache，不需要 GPU；**不再需要 MONAI**）。
 想核对某个不在当前折里的病例（如 case 56 在 fold 2 的 val）：`--probe-case 56`。
+
+## 七、第 3 轮（模型 + 损失 + 训练）的编码口径
+
+> 本节是**编码时定下的口径**（本地写代码时就钉死），远程跑过 `--debug` 与首折后回填实测数字。
+> 运行手册（命令、期望输出、报错处置）在 `docs/baseline.md` 第 4 节。
+
+### 7.1 网络（`src/unet.py`，从 `torch.nn` 手搓）
+
+- `DoubleConv2d` = `Conv3x3(无 bias) → Norm → ReLU` × 2；`Down2d` = `MaxPool2d(2)` + `DoubleConv2d`；
+  `Up2d` = `ConvTranspose2d(2,2)` + 拼接跳跃连接 + `DoubleConv2d`。
+- `UNet2D`：编码 `encoder_channels=(32,64,128,256)`，瓶颈 `512`（最后一级 ×2），
+  解码逐级回到 `32`，`1x1` 卷积输出 `out_channels=2`（0=背景，1=肿瘤）。
+  **4 级下采样 = 16**，与 `model.pad_to_multiple=16` 对齐。
+- 前向内部 `_pad_input`：H/W 不是 16 的整数倍时**补在右下**（`replicate`，不是补 0——补 0 等于贴一圈
+  “空气”，会给第一层卷积造出假边界），算完再裁回原 H/W。`data.target_hw=512` 已是 16 的倍数，
+  正式流程不触发这一步。
+- 权重显式初始化：卷积 `kaiming_normal_(fan_in, relu)`、偏置 0、归一化 weight/bias = 1/0。
+  写出来是为了「换 torch 版本默认初始化变了也不影响复现」。
+- `norm` 支持 `batch`（默认）/ `instance` / `group` / `none`，第 6 轮想换只改配置。
+- `load_encoder_pretrained(model, name, path)`：基础版 `name=None` → 记一行日志直接返回（随机初始化）；
+  给 `resnet18/34` **直接报错并说明原因**（本版编码器是 DoubleConv，通道 32/64/128/256，
+  与 resnet 的 64/128/256/512 残差块参数形状对不上），进阶版才做移植（只读本地权重文件、不走网络）。
+
+### 7.2 损失（`src/losses.py`，不依赖 `monai.losses`）
+
+- `DiceCELoss = λ_dice×(1 - Dice) + λ_ce×CE`，默认 `λ=1.0/1.0`；`softmax=True`、`batch=True`、
+  `include_background=True`、`smooth=1e-5`、`to_onehot_y=False`（内部一律 one-hot）。
+- **`batch=True` 的含义**：交集/并集先在 `(batch, H, W)` 上求和，每个类得到一个 Dice，再对类平均。
+  batch 内常只有 1~2 个含肿瘤切片，逐样本口径会让「整批无肿瘤」的样本把梯度带偏。
+- 数值口径：`softmax` 与 `CE` 都在 **float32** 上做（autocast 下也不降精度）；Dice 用 float32 概率。
+- 随机权重时的量级参考：背景 Dice≈0.97、肿瘤 Dice≈0 → dice 项 ≈0.5；CE≈ln2≈0.69 → 合计 ≈1.2。
+- **本轮不做补边区域 ignore mask**（用户拍板）：非 512 的 8 例补边占比 27%~55%，但补边值就是背景 0。
+  第 6 轮若要做，口径是 `orig_hw` + `pad_offset` 生成 mask——注意仿射增强会把真实前景挪出内容框、
+  同时把补边噪声挪进框内，mask 本身有轻微错配，得在文档里写清。
+
+### 7.3 验证口径与整卷推理（`src/infer.py`，本轮提前落地）
+
+- **指标**：验证集每例做整卷推理，逐例算整卷肿瘤 Dice，再对 4 例取平均（**macro**，每例等权）。
+  不用「逐层平均」——空切片会把指标稀释；不用「全局聚合」——肿瘤体积跨 3 个数量级，会被大病灶主导。
+- `predict_volume(model, case, cache_dir, cfg, device, pad_to_multiple=16, batch_slices=8,
+  threshold=…, amp=…, tumor_channel=1) -> (prob[H,W,Z] float32, pred uint8, meta)`：
+  逐层经 `CTSliceDataset` 读取（与训练同一套 `/65535` + 居中补边口径）→ 概率写进
+  `(target_h, target_w, nz)` 画布 → **按 `pad_offset` 裁回原始面内尺寸**（写死 `[:H,:W]` 会整体错位）。
+- **轴序**：cache 是 nibabel `(nx,ny,nz)`，逐层拼出来的卷是 **`(ny,nx,nz) = (H,W,Z)`**，
+  与直接读出的 label 数组差一次**前两维转置**。`load_label_volume` 统一 `transpose(1,0,2)`，
+  训练期验证与第 4 轮评估都用它，别在别处再写一遍。
+- 阈值：`eval.threshold=0.5`（用 `>=`）；推理精度默认与训练一致（`eval.amp` → `train.amp`）。
+- 显存/内存：整卷画布 float32，`512×512×488 ≈ 512 MB` 主机内存；前向是 `torch.no_grad`，
+  `eval.infer_batch_slices` 控制一次几层。
+- Dice 公式（训练期 `src/train.volume_dice` 与第 4 轮 `src/metrics.dice` 必须一致）：
+  `(2|A∩B| + eps) / (|A| + |B| + eps)`，`eps=1e-6`，两边都空记 1.0。
+
+### 7.4 AMP / 优化器 / 早停
+
+- `train.amp: bf16` → 只用 autocast，**不启用 GradScaler**（bf16 与 fp32 同指数范围，不需要 loss scaling）；
+  `fp16` 才启用 GradScaler；`off` = 纯 fp32。跨版本入口是 `src/utils.autocast_context` / `make_grad_scaler`
+  （`torch.amp.*` 优先，回退 `torch.cuda.amp.*`；非 CUDA 设备给直通替身，训练循环只写一条梯度路径）。
+- 优化器 `AdamW(lr=1e-3, wd=1e-4)` + `CosineAnnealingLR(T_max=epochs, eta_min=lr×min_lr_ratio)`；
+  每 **epoch** 走一次 scheduler（不是每 batch）。
+- 早停：按验证 macro Dice，`train.early_stop_patience=20`；`best.pt` 只在刷新时写，`last.pt` 每轮覆盖。
+- 训练期数值保护：损失出现 NaN/Inf 立刻抛 `NonFiniteLoss` 并以退出码 3 结束（不把 NaN 权重写进 checkpoint）。
+
+### 7.5 产物与续跑（`runs/fold<k>/`，不入库）
+
+- `best.pt`（评估用）/ `last.pt`（续跑用）/ `metrics.csv`（每轮一行，列固定）/
+  `run.json`（配置快照 + `cfg_hash` + `preprocess_cfg_hash` + 病例 + 环境）/ `train.log` / `tensorboard/`。
+- `--resume`：从 `last.pt` 恢复 model/optimizer/scheduler/已完成轮数/`best`/`patience`，
+  并用 `ProportionalBatchSampler.set_epoch(已完成轮数)` 把采样序列接上（`src/dataset.py` 本轮新增的方法）。
+- checkpoint 指纹 = 配置去掉 `paths` 与 `train.epochs` 后的 hash：允许「先跑 5 轮试水再续到 200」，
+  其余配置改动一律拒绝续跑（退出码 4）并打印差异行。
+
+### 7.6 本轮修掉的一个坑：缓存指纹口径
+
+manifest 里的 `cfg_hash` 原来由两处**不同**的写法产生：`scripts/preprocess.py` / `fetch_manifest.py`
+用「排除 paths/train/model/eval」，`src/selfcheck_data.py` 用「排除 paths/train/model/eval/**data**」。
+旧配置下两者恰好都只剩 `preprocess` 节，所以一直没暴露；但第 3 轮往配置里新增了与预处理无关的
+`loss` 节，排除式写法会把 `loss` 算进指纹 → **缓存没变、训练启动校验却报「缓存来自别的预处理参数」**。
+
+现在统一用 `src.utils.cache_fingerprint(cfg)`（**只取 `preprocess` 节**），四处（preprocess / fetch_manifest /
+selfcheck_data / train）共用。对当前配置，它算出的值与 manifest 里已记录的
+`7b4c48b4dc7ef880` 保持一致（`preprocess` 节本轮没动），所以远程不需要重跑预处理。
+
+### 7.7 待远程实测回填（跑过 `--debug` 与首折后补进本节）
+
+1. `--debug`：实测 batch 形状、loss 量级、分段耗时、峰值显存（batch_size=2/8/16 各一份）；
+2. `--debug` 的整卷推理自检：`prob/pred/GT` 形状、`pad_offset`、单例推理秒数；
+3. 首折前 3 轮的 train loss 与 val macro Dice，以及单 epoch 耗时（训练 + 验证）；
+4. 早停发生在第几轮、best Dice 是多少；
+5. 5 折跑完后：每折 best Dice 与总耗时（第 4 轮评估要用）。

@@ -22,7 +22,7 @@ import numpy as np
 
 try:  # 允许从仓库根直接 python scripts/preprocess.py 运行
     from src.utils import (
-        config_fingerprint,
+        cache_fingerprint,
         format_kv_table,
         load_config,
         load_json,
@@ -35,7 +35,7 @@ try:  # 允许从仓库根直接 python scripts/preprocess.py 运行
 except ModuleNotFoundError:  # pragma: no cover - 兜底：把仓库根塞进 sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from src.utils import (  # type: ignore
-        config_fingerprint,
+        cache_fingerprint,
         format_kv_table,
         load_config,
         load_json,
@@ -634,7 +634,9 @@ def main(argv=None) -> int:
         LOGGER.error("没有任何可处理的 case，请检查 --data-dir 与排除清单。")
         return 2
 
-    cfg_hash = config_fingerprint(cfg, drop=["paths", "train", "model", "eval"])
+    # 缓存指纹只由 preprocess 节决定（src.utils.cache_fingerprint）：
+    # 第 3 轮新增的 loss 节与缓存无关，不应让清单失效
+    cfg_hash = cache_fingerprint(cfg)
     records: list = []
     for i, case_id in enumerate(cases, 1):
         LOGGER.info("[%d/%d] case %d ...", i, len(cases), case_id)

@@ -68,22 +68,39 @@ data:
     noise_prob: 0.2               # 高斯噪声，只动 image
     noise_std: 0.01               #   sigma 每次从 U(0, noise_std) 抽，故 0.01 是强度上界
 
+# ---------- 损失（src/losses.py，手搓 Dice + CE，不依赖 MONAI） ----------
+loss:
+  softmax: true                   # 对 logits 做 softmax（多类互斥：0=背景 1=肿瘤）
+  to_onehot_y: false              # 本版 label 是 (B,H,W) 整数；Dice 内部一律转 one-hot
+  batch: true                     # true = 交集/并集在整个 batch 上聚合；false = 逐样本再平均
+                                  #   batch 内常只有 1~2 个含肿瘤切片，逐样本口径更容易被空样本带偏
+  lambda_dice: 1.0                # 总损失 = λ_dice × (1 - Dice) + λ_ce × CE
+  lambda_ce: 1.0
+  include_background: true        # Dice 是否把背景类算进去（false = 只优化肿瘤，第 6 轮可试）
+  smooth: 0.00001                 # Dice 平滑项（防「预测与 GT 都为空」时 0/0）
+  ce_class_weights: null          # 例：[0.2, 1.0] 给肿瘤类加权；null = 不加权
+
 # ---------- 训练 ----------
 train:
-  batch_size: 8                   # 第 1 轮实测尺寸后再定稿；--debug 会打印显存占用供标定
+  batch_size: 8                   # 第 3 轮 --debug 实测显存后再定稿；标定：--debug --set train.batch_size=8
   lr: 0.001
   weight_decay: 0.0001
-  scheduler: cosine               # CosineAnnealingLR
+  scheduler: cosine               # CosineAnnealingLR（none = 不用调度器）
+  min_lr_ratio: 0.0               # eta_min = lr × 该值（0 = 余弦退火到 0；0.01 = 留 1% 学习率）
   epochs: 200
-  early_stop_patience: 20         # 按验证集「整卷肿瘤 Dice」早停
-  amp: bf16                       # A100 支持 bf16
+  early_stop_patience: 20         # 按验证集「整卷肿瘤 Dice」的 macro 均值早停
+  amp: bf16                       # A100 支持 bf16；bf16 只用 autocast、**不启用 GradScaler**
+                                  #   （bf16 与 fp32 同指数范围，不需要 loss scaling；fp16 才会开）
+                                  #   off = 纯 fp32（排查 NaN 时可用）
   pos_ratio_target: 0.30          # batch 内阳性层数的**上限**（round(bs×该值)，bs=8 → 2）。
                                   # 注意实际每批阳性数 = 阳性层总数/一轮 batch 数：fold 0 实测
                                   # bs=8 时一轮 642 个 batch、617 个阳性层 → 每批实际 1 个、25 个
                                   # 全阴性 batch；想提高每批阳性数优先调大 batch_size（bs=16 → 1~2 个、
                                   # 全阴性 0 个），见 docs/preprocess_notes.md 6.3
-  val_every: 1
+  val_every: 1                    # 每多少轮做一次整卷验证（早停与 best.pt 只看验证轮）
   grad_clip_norm: 0.0             # >0 时对梯度做裁剪
+  log_every: 50                   # 每多少个 batch 打一行进度（0 = 只在 epoch 结束时打）
+  tensorboard: true               # 写 runs/fold<k>/tensorboard/（metrics.csv 不受它影响）
   seed: 42
 
 # ---------- 评估 ----------
@@ -91,4 +108,6 @@ eval:
   min_lesion_mm3: 50.0            # 3D 后处理：删掉小于该体积的孤立连通块
   detect_min_mm3: 10.0            # 病灶级检出：单病灶 >= 该体积即算检出
   connectivity: 1                 # 连通域邻域：1 = 6 邻域，2 = 18，3 = 26
+  threshold: 0.5                  # 概率 → 二值 的阈值（训练期整卷验证与第 4 轮评估共用）
+  infer_batch_slices: 8           # 整卷推理一次前向几层（无梯度；显存富余时可调到 16 提速）
   save_pred: false                # true 时把预测卷存到 runs/fold<k>/pred/<case>.nii.gz

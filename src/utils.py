@@ -2,7 +2,7 @@
 
 整体功能：被 scripts/ 与 src/ 下所有脚本复用的一层薄工具，保证路径、随机性与产物格式跨轮次一致。
 前后接口：上游读 configs/*.yaml 与 json 清单；下游给 dataset/unet/train/evaluate 提供 cfg 字典、REPO_ROOT 与报告写入函数。
-用法：``from src.utils import load_config, REPO_ROOT, set_seed, save_report, config_fingerprint``。
+用法：``from src.utils import load_config, REPO_ROOT, set_seed, save_report, config_fingerprint, cache_fingerprint``。
 """
 
 from __future__ import annotations
@@ -137,6 +137,23 @@ def config_fingerprint(cfg: dict, drop: Sequence[str] = ()) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+#: 「缓存指纹」只由这些配置节决定（目前就是 preprocess）：
+#: cache/ 与 cache_manifest.json 的内容只取决于预处理参数，别的节怎么加、怎么改都不该让缓存失效。
+CACHE_FINGERPRINT_SECTIONS = ("preprocess",)
+
+
+def cache_fingerprint(cfg: dict) -> str:
+    """算「预处理 / 缓存指纹」：**只取 ``preprocess`` 节**，用于 cache_manifest 的一致性校验。
+
+    preprocess.py / fetch_manifest.py 写清单、selfcheck_data.py / train.py 读清单，四处必须同一口径。
+    **不要改回「排除若干节」的写法**：第 3 轮新增了与预处理完全无关的 ``loss`` 节，
+    排除式写法会把它算进指纹里，于是缓存明明没变、训练启动校验却报
+    「缓存来自别的预处理参数」——那正是这个函数存在的理由。
+    """
+    subset = {name: (cfg or {}).get(name) or {} for name in CACHE_FINGERPRINT_SECTIONS}
+    return config_fingerprint(subset)
+
+
 # --------------------------------------------------------------------------------------
 # JSON / 报告
 # --------------------------------------------------------------------------------------
@@ -213,6 +230,105 @@ def make_generator(seed: int):
     g = torch.Generator()
     g.manual_seed(int(seed))
     return g
+
+
+# --------------------------------------------------------------------------------------
+# 混合精度（AMP）：把「torch 版本差异」和「bf16 不要 GradScaler」这两件事收在一处
+# --------------------------------------------------------------------------------------
+
+#: amp 配置允许的规范化取值
+AMP_CHOICES = ("bf16", "fp16", "off")
+
+
+def resolve_amp(amp: str | None) -> tuple:
+    """把配置里的 ``train.amp`` / ``eval.amp`` 解析成 ``(规范化名, torch.dtype 或 None)``。
+
+    支持 ``bf16`` / ``bfloat16``、``fp16`` / ``float16`` / ``half``、``off`` / ``none`` / ``fp32``；
+    dtype 为 ``None`` 表示不做 autocast（纯 fp32）。
+
+    **bf16 与 GradScaler 的关系**：bf16 与 fp32 的指数范围相同（8 位指数），不存在 fp16 那种
+    下溢问题，PyTorch 官方口径是 bf16 **不需要** loss scaling。所以本项目只在 ``fp16`` 时启用
+    GradScaler，``bf16`` 只用 autocast（见 ``make_grad_scaler`` 与 src/train.py 的日志）。
+    """
+    import torch
+
+    key = str(amp if amp is not None else "off").strip().lower()
+    if key in ("bf16", "bfloat16"):
+        return "bf16", torch.bfloat16
+    if key in ("fp16", "float16", "half"):
+        return "fp16", torch.float16
+    if key in ("off", "none", "fp32", "no", "false", ""):
+        return "off", None
+    raise ValueError(f"amp 只支持 {AMP_CHOICES}，收到 {amp!r}")
+
+
+def autocast_context(device_type: str, dtype, enabled: bool = True):
+    """返回 autocast 上下文管理器：优先 ``torch.amp.autocast``，回退 ``torch.cuda.amp.autocast``。
+
+    torch 2.x 起新 API 是 ``torch.amp.autocast(device_type=..., dtype=...)``，
+    老版本只有 ``torch.cuda.amp.autocast(dtype=...)``；这里统一成一处，训练与推理共用，
+    避免每个脚本各写一遍 try/except。``dtype=None`` 或 ``enabled=False`` 时返回空上下文。
+    """
+    import contextlib
+
+    import torch
+
+    if not enabled or dtype is None:
+        return contextlib.nullcontext()
+    amp = getattr(torch, "amp", None)
+    if amp is not None and hasattr(amp, "autocast"):
+        try:
+            return amp.autocast(device_type=str(device_type), dtype=dtype)
+        except TypeError:      # 老版本签名不同 → 落回 cuda.amp
+            pass
+    return torch.cuda.amp.autocast(dtype=dtype)
+
+
+class NullGradScaler:
+    """``GradScaler`` 的直通替身（非 CUDA 设备用）：接口一致，什么都不做。"""
+
+    def scale(self, loss):
+        return loss
+
+    def unscale_(self, optimizer) -> None:
+        return None
+
+    def step(self, optimizer, *args, **kwargs):
+        return optimizer.step(*args, **kwargs)
+
+    def update(self, *args, **kwargs) -> None:
+        return None
+
+    def is_enabled(self) -> bool:
+        return False
+
+    def state_dict(self) -> dict:
+        return {}
+
+    def load_state_dict(self, state) -> None:
+        return None
+
+
+def make_grad_scaler(device_type: str, enabled: bool = True):
+    """返回 ``GradScaler``：CUDA 上优先 ``torch.amp.GradScaler``，其余情况返回直通替身。
+
+    * ``enabled=False``（bf16 / fp32）时 scaler 的 ``scale``/``step``/``update`` 都退化为原操作，
+      于是训练循环只需要写一条路径；
+    * 非 CUDA 设备（本地 CPU 调试）没有 GradScaler，直接给 ``NullGradScaler``，
+      不依赖「None buffer / 空 scaler」这类版本相关的边界行为。
+    """
+    import torch
+
+    device_type = str(device_type)
+    if device_type != "cuda":
+        return NullGradScaler()
+    amp = getattr(torch, "amp", None)
+    if amp is not None and hasattr(amp, "GradScaler"):
+        try:
+            return amp.GradScaler(device_type, enabled=bool(enabled))
+        except TypeError:      # 老版本没有 device_type 参数 → 落回 cuda.amp
+            pass
+    return torch.cuda.amp.GradScaler(enabled=bool(enabled))
 
 
 # --------------------------------------------------------------------------------------

@@ -15,7 +15,7 @@ CT 肝脏肿瘤分割 · 基础版（2D 闭环）后续编码计划
 - 5 例仅肝脏（32/34/38/41/47）只进训练集，永不进验证集。
 
 --------------------------------------------------------
-剩余 5 轮，每轮都能独立运行 + 独立验证
+剩余 4 轮（第 3 轮已编码、待远程实测；第 4–6 轮待做），每轮都能独立运行 + 独立验证
 --------------------------------------------------------
 
 ■ 第 2 轮：Dataset + 采样器 + 增强 —— 已完成（含一次口径简化），远程自检通过
@@ -61,7 +61,7 @@ CT 肝脏肿瘤分割 · 基础版（2D 闭环）后续编码计划
   校验要点（必须打印/断言）：batch 形状恒为 (B,1,512,512)；值域 ∈ [0,1]；label ⊂ {0,1}；
     训练侧每批阳性数落在采样器计划区间（验证侧不判阳性数——旧版在这里误报过）。
 
-■ 第 3 轮：模型 + 损失 + 训练
+■ 第 3 轮：模型 + 损失 + 训练 —— 已完成编码（**待远程 `--debug` 实测**）
   交付：src/unet.py、src/losses.py、src/train.py
   src/unet.py：
     class DoubleConv2d(nn.Module)        # Conv3x3(+BN)+ReLU ×2
@@ -92,6 +92,36 @@ CT 肝脏肿瘤分割 · 基础版（2D 闭环）后续编码计划
       实测正样本比例、torch.cuda.max_memory_allocated()/reserved、单步耗时，然后退出不落盘。
       这是标定 batch_size（先按 8）的依据。
   逐折执行：for f in 0 1 2 3 4; do python -m src.train --fold $f; done
+
+  【本轮实际交付与口径（用户拍板 + 编码时定稿，细节见 docs/baseline.md 第 4 节、
+    docs/preprocess_notes.md 第七节）】
+  交付文件：src/unet.py、src/losses.py、src/train.py，外加**提前落地的 src/infer.py**
+    （predict_volume / seg_prob_to_label / load_label_volume）——每轮验证要整卷推理，
+    第 4 轮只在它上面补 postprocess / metrics / evaluate。
+  1. 网络：4 级下采样 U-Net（32/64/128/256 + 瓶颈 512），MaxPool 下采样 / ConvTranspose 上采样 +
+     跳跃拼接，BatchNorm；前向按 pad_to_multiple=16 内部补 replicate 再裁回（512 下不触发）。
+     预训练接口保留但基础版不实现：给 resnet18/34 直接报错说明原因，不静默忽略。
+  2. 损失：手搓 DiceCELoss（softmax + CE + soft Dice），batch=True 在整 batch 上聚合，
+     include_background=true、smooth=1e-5；**本轮不做补边区域 ignore mask**（第 6 轮再定）。
+  3. 验证口径：每轮对 4 例做**整卷推理**，逐例算整卷肿瘤 Dice 再平均（macro，每例等权），
+     用它选 best.pt 与早停；`eval.threshold=0.5`、`eval.infer_batch_slices=8`。
+  4. AMP：bf16 只用 autocast，**不启用 GradScaler**（bf16 与 fp32 同指数范围，不需要 loss scaling）；
+     fp16 才启用；off = 纯 fp32。跨版本入口在 src/utils.py。
+  5. `--resume`：从 runs/fold<k>/last.pt 恢复 model/optimizer/scheduler/已完成轮数/best/patience，
+     并用本轮新增的 ProportionalBatchSampler.set_epoch() 把采样序列接上；
+     指纹只忽略 paths 与 train.epochs，其余配置改动一律拒绝续跑（退出码 4）。
+  6. `--debug`：2 例 / batch_size=2（显式给 --set train.batch_size=N 就用 N）/ 3 个 iteration，
+     打印 shape、实测阳性比例、分段耗时、显存峰值，再对 1 例做整卷推理自检，**不写 runs/**。
+  7. 新增命令行：--fold/--debug/--debug-cases/--debug-val-cases/--debug-iters/--resume/
+     --device/--out-dir/--set；退出码 0/2/3/4/130（前置校验/NaN/续跑不一致/中断）。
+  8. 顺手修的一个坑：缓存指纹口径统一为 src.utils.cache_fingerprint（只取 preprocess 节）。
+     原来的排除式写法会把本轮新增的 loss 节算进指纹，导致「缓存没变但训练拒绝启动」；
+     现在四处（preprocess / fetch_manifest / selfcheck_data / train）共用同一函数，
+     与 manifest 里已记录的 7b4c48b4dc7ef880 保持一致，远程**不需要重跑预处理**。
+  9. 配置新增：loss 节（8 项）、train.min_lr_ratio / log_every / tensorboard、
+     eval.threshold / infer_batch_slices。
+  待远程验证（先跑 4.1 再跑 4.2）：batch 形状与值域、loss 量级与下降趋势、分段耗时与显存、
+     整卷推理的 prob/pred/GT 形状与 pad_offset、单 epoch 耗时、早停轮数与 best Dice。
 
 ■ 第 4 轮：整卷推理 + 3D 后处理 + 指标 + 评估
   交付：src/infer.py、src/postprocess.py、src/metrics.py、src/evaluate.py

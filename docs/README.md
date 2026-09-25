@@ -41,8 +41,10 @@ conda 环境 `unet`（已激活），Python 3.11.16，解释器 `/home/phdauser0
 python scripts/preprocess.py        # 预处理 → cache/（第 1 轮，已跑过）
 python scripts/check_cache.py       # 缓存体检（已跑过）
 python scripts/make_splits.py       # 5 折划分 → data/splits.json（已跑过）
-python -m src.train --fold 0 --debug   # 第 3 轮起：冒烟跑几个 iteration，看显存定 batch_size
-for f in 0 1 2 3 4; do python -m src.train --fold $f; done   # 正式训练
+python -m src.train --fold 0 --debug   # 第 3 轮：冒烟跑 3 个 iteration，看形状/显存/耗时（不落盘）
+python -m src.train --fold 0           # 正式训练（每轮整卷验证 + 早停 + best.pt）
+python -m src.train --fold 0 --resume  # 中断后续跑（从 runs/fold0/last.pt 恢复）
+for f in 0 1 2 3 4; do python -m src.train --fold $f; done   # 5 折
 python -m src.evaluate --all        # 第 4 轮：汇总 5 折指标
 ```
 
@@ -56,6 +58,17 @@ python scripts/probe_axis.py --case 31   # 只在改动写盘逻辑后需要重�
 `src/selfcheck_data.py` 不是开发期的临时脚本，而是**长期保留的回归自检**：它核对的是
 「cache 与配置、代码三者是否自洽」，任何一轮改了预处理、dataset、配置之后都应当重跑一遍
 （秒级到十几秒）。它不产生训练产物，也不需要 GPU（日志里的显存行只是顺带报告）。
+
+## 模块一览（第 3 轮后）
+
+| 文件 | 作用 |
+| --- | --- |
+| `src/dataset.py` | 切片数据集（补边到 512×512）、`ProportionalBatchSampler`、自实现 2D 增强、batch 契约 |
+| `src/unet.py` | 手搓 2D U-Net（`DoubleConv2d` / `UNet2D`），预训练接口占位 |
+| `src/losses.py` | 手搓 `DiceCELoss`（softmax + CE + soft Dice）与 `build_loss(cfg)` |
+| `src/infer.py` | 整卷推理：`predict_volume` / `seg_prob_to_label` / `load_label_volume`（第 3 轮提前落地） |
+| `src/train.py` | 训练入口：前置校验 → 训练 → 每轮整卷验证 → 早停 → checkpoint / metrics.csv / TensorBoard；`--debug` / `--resume` |
+| `src/selfcheck_data.py` | 数据侧回归自检（只读 cache） |
 
 ## 其他约定
 

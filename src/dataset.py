@@ -1261,6 +1261,15 @@ class ProportionalBatchSampler(BatchSampler):
         """公开的种子派生（自检脚本用它复现某个 epoch 的采样顺序）。"""
         return self._seed_for_epoch(epoch)
 
+    def set_epoch(self, epoch: int) -> None:
+        """把内部 epoch 计数器设成 ``epoch``：下一次 ``iter()`` 就从 ``epoch + 1`` 开始。
+
+        用途：``src/train.py --resume`` 续跑时，让采样顺序与「一口气跑完」严格一致。
+        注意 ``__iter__`` 是**先自增再派生种子**（``_epoch += 1`` 之后用 ``epoch_seed(_epoch)``），
+        所以这里传的应当是「已经完成的轮数」。
+        """
+        self._epoch = int(epoch)
+
     def describe(self) -> str:
         """返回采样器配置与一轮计划的多行描述。"""
         plan = self._plan

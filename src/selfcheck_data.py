@@ -67,7 +67,7 @@ try:
         reset_open_cache,
     )
     from src.utils import (
-        config_fingerprint,
+        cache_fingerprint,
         load_config,
         load_json,
         rel_to_root,
@@ -100,7 +100,7 @@ except ModuleNotFoundError:  # pragma: no cover - 兜底：把仓库根塞进 sy
         reset_open_cache,
     )
     from src.utils import (  # type: ignore
-        config_fingerprint,
+        cache_fingerprint,
         load_config,
         load_json,
         rel_to_root,
@@ -180,7 +180,7 @@ def check_prerequisites(cfg: dict) -> tuple:
                        "建议先跑 python scripts/fetch_manifest.py", rel_to_root(manifest_path))
         manifest = {}
     else:
-        expect_hash = config_fingerprint(cfg, drop=["paths", "train", "model", "eval", "data"])
+        expect_hash = cache_fingerprint(cfg)
         got_hash = manifest.get("cfg_hash")
         LOGGER.info("清单：%d 例，预处理指纹 %s（当前配置 %s）%s",
                     len(manifest["cases"]), got_hash, expect_hash,
@@ -330,7 +330,7 @@ def check_batch(idx: int, batch: dict, problems: list, tolerance: dict, tag: str
         problems.append(f"batch {idx}：image 值域 [{info['image_min']}, {info['image_max']}] 超出 [0,1]")
     bad = [v for v in info["label_values"] if v not in (0, 1)]
     if bad:
-        problems.append(f"batch {idx}：label 出现了 {bad}，不是 {0,1}")
+        problems.append(f"batch {idx}：label 出现了 {bad}，不是 {{0,1}}")
     if info["image_dtype"] != "torch.float32":
         problems.append(f"batch {idx}：image dtype={info['image_dtype']}，期望 float32")
     if info["label_dtype"] not in ("torch.int64", "torch.int32"):

@@ -17,11 +17,11 @@ from pathlib import Path
 import numpy as np
 
 try:
-    from src.utils import config_fingerprint, load_config, rel_to_root, resolve_path, save_json, setup_logger
+    from src.utils import cache_fingerprint, load_config, rel_to_root, resolve_path, save_json, setup_logger
 except ModuleNotFoundError:  # pragma: no cover
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from src.utils import (  # type: ignore
-        config_fingerprint,
+        cache_fingerprint,
         load_config,
         rel_to_root,
         resolve_path,
@@ -52,8 +52,8 @@ def main(argv=None) -> int:
         LOGGER.error("cache 目录不完整：%s", rel_to_root(cache_dir))
         return 2
 
-    # 与 preprocess.py 用同一套口径指纹（只依赖预处理配置）
-    cfg_hash = config_fingerprint(cfg, drop=["paths", "train", "model", "eval"])
+    # 与 preprocess.py / selfcheck_data.py / train.py 用同一套口径指纹（只依赖 preprocess 节）
+    cfg_hash = cache_fingerprint(cfg)
 
     cases: list = []
     for path in sorted(label_dir.glob("*.nii.gz"), key=lambda p: int(p.name.split(".")[0])):
