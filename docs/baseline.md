@@ -416,6 +416,11 @@ epoch 68/200 | lr 4.42e-04 | 训练 loss 0.2134（dice 0.1502 + ce 0.0632）| 35
 - **`验证整卷 Dice` 是 macro 均值**（先逐例算、再平均），括号里是逐例值（fold 0 的 val 是
   33/57/59/60，见 `data/splits.json`）：某例长期为 0 通常说明该例病灶最小/最难
   （`docs/data.md`：肿瘤体积跨 3 个数量级），不是 bug。
+- **每轮那行的 `dice` / `ce` 两项要一起看**：`include_background=false` 之后，
+  `dice` 项就是 `1 - 肿瘤 soft Dice`，所以它**贴着 0.5 左右不动 + `ce` 掉到 0.01 以下是「坍缩到
+  全预测背景」的特征**（第 3 轮首次正式训练的真实现象：`dice 0.4996 + ce 0.0078`、
+  验证整卷 Dice 恒 0.0000）。健康曲线应该是 `dice` 项从 1.0 附近往下走、`ce` 稳在 0.05~0.3 量级，
+  验证整卷 Dice 从 0.0x 抬起来。判坍缩的详细分析与修法见 `docs/preprocess_notes.md` 7.2。
 - **`best` 与 `patience`**：只有验证轮才更新；`patience` 达到 `early_stop_patience` 就停在那一轮，
   `best.pt` 仍指向历史最优。每轮都会覆盖 `last.pt`（续跑用），`best.pt` 只在刷新时写。
 - **`峰值显存`** 是本次运行的历史峰值；把它与 `--debug` 的外推值对照，可以判断还能不能再加 batch。
@@ -425,7 +430,30 @@ epoch 68/200 | lr 4.42e-04 | 训练 loss 0.2134（dice 0.1502 + ce 0.0632）| 35
   已经是 `.nii` 再考虑调大 `data.num_workers`（52 核，可到 16）。第 1 轮 epoch 若出现
   `取数耗时 ... 超过计算耗时 ...：**数据加载是瓶颈**` 的告警，也是同一件事。
 
-5 折依次跑：
+### 4.2.1 短跑烟测：先拿一份「能预测出东西」的权重给下游开发用
+
+```bash
+python -m src.train --fold 0 --out-dir runs/smoke_fold0 --set train.epochs=12
+```
+
+用途：第 4 轮（整卷推理 → 3D 后处理 → 指标 → 报告）的开发需要一份**真实**的 `best.pt`；
+12 个 epoch 约 17 分钟，足够让模型从「全预测背景」变成「至少圈得出肿瘤」，于是后处理、
+病灶级检出、FP 统计这些代码路径才真的被走到（空预测会把所有分支都走成退化路径，掩盖 bug）。
+
+判读：
+- `dice` 项应从 1.0 附近明显下降（它就是 `1 - 肿瘤 soft Dice`）；
+- `验证整卷 Dice` 至少有一例 > 0，`metrics.csv` 里 `best_dice` 不为 0；
+- **不要求指标好看**，它只是下游代码的输入。
+
+注意：
+- **写进独立目录** `--out-dir runs/smoke_fold0`，别和正式训练的 `runs/fold0` 混在一起；
+- 全新开始（非 `--resume`）时 `train.py` 会把同目录里上一轮的
+  `best.pt` / `last.pt` / `metrics.csv` / `tensorboard` 改名成 `*.prev` 只留一代 ——
+  否则 `metrics.csv` 是追加写的，新一轮的 epoch 1..N 会接在旧内容后面，同一个 epoch 号出现两次；
+- 12 epoch 的权重**不是结果**，第 4 轮的评估报告里要标注它的来源（epoch 数与 run 目录）。
+- 下游要评这份权重时，`python -m src.evaluate --fold 0 --run-dir runs/smoke_fold0`（第 4 轮交付该开关）。
+
+### 4.2.2 5 折依次跑
 
 ```bash
 for f in 0 1 2 3 4; do python -m src.train --fold $f; done
@@ -495,7 +523,7 @@ python -m src.train --fold 0 --resume
 | `train.lr` / `train.min_lr_ratio` | 初始学习率 / 余弦退火的下界（`eta_min = lr × 该值`） | `min_lr_ratio=0` 是退火到 0 |
 | `train.early_stop_patience` | 连续多少轮没有提升就停 | 默认 20；首折看曲线再定 |
 | `train.val_every` | 每多少轮验证一次 | 验证要跑 4 例整卷，`val_every=2` 可省一半时间 |
-| `loss.include_background` | Dice 是否含背景类 | `false` = 只优化肿瘤，可作对照 |
+| `loss.include_background` | Dice 是否含背景类 | **必须 false**（true 会坍缩到全预测背景，实测证据见 `docs/preprocess_notes.md` 7.2） |
 | `loss.lambda_dice` / `loss.lambda_ce` | 两项权重 | 默认 1.0 / 1.0 |
 | `eval.threshold` / `eval.infer_batch_slices` | 概率→标签阈值 / 整卷推理批大小 | 训练期验证与第 4 轮评估共用同一口径 |
 

@@ -76,7 +76,12 @@ loss:
                                   #   batch 内常只有 1~2 个含肿瘤切片，逐样本口径更容易被空样本带偏
   lambda_dice: 1.0                # 总损失 = λ_dice × (1 - Dice) + λ_ce × CE
   lambda_ce: 1.0
-  include_background: true        # Dice 是否把背景类算进去（false = 只优化肿瘤，第 6 轮可试）
+  include_background: false       # Dice 只算**肿瘤类**（不含背景）。这是第 3 轮首次正式训练踩出来的：
+                                  #   include_background=true 时，损失存在一个「全预测背景」的平凡最优解
+                                  #   （loss = 1-(1+0)/2 + CE ≈ 0.51，实测 epoch 2/3 的 dice 0.4996 + ce 0.006
+                                  #   就是这个解，验证整卷 Dice 恒为 0.0000），模型两个 epoch 就掉进去出不来。
+                                  #   改成 false 后 dice 项 = 1 - 肿瘤 soft Dice，全背景解的损失是 1.0，
+                                  #   必须找到肿瘤才能下降——与我们的上报指标（肿瘤整卷 Dice）同向。
   smooth: 0.00001                 # Dice 平滑项（防「预测与 GT 都为空」时 0/0）
   ce_class_weights: null          # 例：[0.2, 1.0] 给肿瘤类加权；null = 不加权
 

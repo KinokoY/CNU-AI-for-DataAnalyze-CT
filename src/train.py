@@ -49,6 +49,7 @@ import copy
 import csv
 import hashlib
 import math
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -656,6 +657,35 @@ def make_summary_writer(log_dir, enabled: bool = True):
         return None
 
 
+def rotate_run_artifacts(out_dir, names=("best.pt", "last.pt", "metrics.csv", "tensorboard")) -> list:
+    """全新开始（非 ``--resume``）时，把上一轮的同名产物改名成 ``*.prev``（只保留一代）。
+
+    为什么需要：``metrics.csv`` 与 TensorBoard 事件都是**追加**写的，直接重跑会把新一轮的
+    epoch 1..N 接在旧内容后面 —— 同一个 epoch 号出现两次、曲线直接画不出来
+    （第 3 轮「先跑 3 个 epoch 试水、再正式跑」就撞上了）。``best.pt`` / ``last.pt`` 虽然会被覆盖，
+    但留着上一轮权重容易被误当成新一轮结果，所以一起改名。
+
+    ``--resume`` 时**不调用**本函数：那时要的正是接着上一轮的状态。
+    """
+    out_dir = Path(out_dir)
+    moved: list = []
+    for name in names:
+        path = out_dir / name
+        if not path.exists():
+            continue
+        backup = out_dir / f"{name}.prev"
+        if backup.exists():
+            if backup.is_dir():
+                shutil.rmtree(backup)
+            else:
+                backup.unlink()
+        path.rename(backup)
+        moved.append(f"{name} → {name}.prev")
+    if moved:
+        LOGGER.info("该目录下已有上一轮产物，已改名保留一代：%s", "；".join(moved))
+    return moved
+
+
 def cfg_diff(old_cfg: dict, new_cfg: dict, limit: int = 8) -> list:
     """列出两份配置里取值不同的点分键（``--resume`` 拒绝时用来解释原因）。"""
     def flatten(node, prefix: str = "") -> dict:
@@ -862,6 +892,10 @@ def main(argv=None) -> int:
     if not args.debug:
         out_dir.mkdir(parents=True, exist_ok=True)
     setup_logger("train", log_file=(None if args.debug else out_dir / "train.log"))
+    if not args.debug and not args.resume:
+        # 全新开始时先把上一轮的 best/last/metrics.csv/tensorboard 挪成 .prev，
+        # 否则 csv 会把新一轮的 epoch 接在旧内容后面（--resume 时当然不动）
+        rotate_run_artifacts(out_dir)
     set_seed(seed)
     device = resolve_device(args.device)
 

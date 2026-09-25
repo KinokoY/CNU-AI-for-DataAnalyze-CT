@@ -153,7 +153,20 @@
 ### 7.2 损失（`src/losses.py`，不依赖 `monai.losses`）
 
 - `DiceCELoss = λ_dice×(1 - Dice) + λ_ce×CE`，默认 `λ=1.0/1.0`；`softmax=True`、`batch=True`、
-  `include_background=True`、`smooth=1e-5`、`to_onehot_y=False`（内部一律 one-hot）。
+  **`include_background=false`**、`smooth=1e-5`、`to_onehot_y=False`（内部一律 one-hot）。
+- **`include_background` 必须为 false（第 3 轮首次正式训练踩出来的坑，教科书式的坍缩）**：
+  `true` 时损失存在一个「**全预测背景**」的平凡最优解 —— 背景 Dice→1、肿瘤 Dice→0，
+  于是 dice 项 = `1-(1+0)/2 = 0.5`，加上 CE 可以压到 ≈0，合计 ≈0.5；
+  而"找到肿瘤"要难得多。实测轨迹：初始 1.59 → epoch 2 `dice 0.4996 + ce 0.0078 = 0.507`、
+  epoch 3 `0.5046`，每轮只降 0.001，**验证整卷 Dice 4 例恒为 0.0000**（一个肿瘤体素都没预测）。
+  改成 `false` 后 dice 项 = `1 - 肿瘤 soft Dice`：全背景解的损失是 1.0，不找到肿瘤就降不下去，
+  而且与上报指标（肿瘤整卷 Dice）同向。
+  看日志判坍缩只需两件事：**`dice` 项贴在 0.5 附近不动 + `ce` 掉到 0.01 以下** → 已坍缩，别继续跑。
+  若改成 false 后仍然欠检出（val Dice 长期为 0），下一批杠杆依次是
+  `loss.ce_class_weights=[0.2, 1.0]`、`loss.lambda_ce=0.5`、`train.lr`。
+- 为什么小病灶特别容易坍缩：一个 batch（16 层 × 512² ≈ 420 万像素）里肿瘤只占 **0.2%~0.4%**，
+  背景 Dice 一项就占了 Dice 损失的 1/2，CE 也被背景像素主导 —— 这也正是 bs=16 有用的原因
+  （每批必有 1~2 个阳性切片，肿瘤信号不会整批缺席）。
 - **`batch=True` 的含义**：交集/并集先在 `(batch, H, W)` 上求和，每个类得到一个 Dice，再对类平均。
   batch 内常只有 1~2 个含肿瘤切片，逐样本口径会让「整批无肿瘤」的样本把梯度带偏。
 - 数值口径：`softmax` 与 `CE` 都在 **float32** 上做（autocast 下也不降精度）；Dice 用 float32 概率。

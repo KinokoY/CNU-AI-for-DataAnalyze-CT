@@ -128,6 +128,18 @@ CT 肝脏肿瘤分割 · 基础版（2D 闭环）后续编码计划
     - 整卷推理 `prob/pred (512,512,135)` 与 GT 同形，GT 前景 434721 = splits.json 的 430k mm³ 口径吻合；
     - `selfcheck_data` 通过、指纹 7b4c48b4dc7ef880 不变；采样器 617/617 阳性层、覆盖 4469/4469 切片。
   仍在等待：首折前几轮的 train loss 与 val macro Dice 曲线、单 epoch 墙钟、早停轮数、5 折汇总。
+  【首次正式训练（3 epoch 后 Ctrl-C）暴露的问题：损失坍缩 —— 已修】
+  - 现象：`epoch 2: dice 0.4996 + ce 0.0078 = 0.507`、`epoch 3: 0.5046`，**验证整卷 Dice 4 例恒 0.0000**；
+    训练"看着正常"（loss 在降、无 NaN、65 s/epoch、显存 10920 MB）但模型什么都没学到。
+  - 根因：`loss.include_background=true` 使损失存在「全预测背景」的平凡最优解
+    （dice 项 = 1-(1+0)/2 = 0.5，CE 可压到 ≈0），一个 batch 里肿瘤只占 0.2%~0.4%，
+    背景项完全主导 → 2 个 epoch 就掉进去且出不来。
+  - 修法：`loss.include_background: false`（dice 项 = 1 - 肿瘤 soft Dice，与上报指标同向）。
+    配套把「dice 项贴 0.5 + ce < 0.01 = 已坍缩」写进 baseline 4.2 判读与 preprocess_notes 7.2。
+  - 另修：全新开始（非 --resume）时把同目录上一轮的 best/last/metrics.csv/tensorboard 挪成 `.prev`
+    （metrics.csv 是追加写的，否则重跑会出现同一个 epoch 两次）。
+  - 新增长期约定：下游开发用的权重走 `--out-dir runs/smoke_fold0 --set train.epochs=12` 短跑烟测
+    （见 baseline 4.2.1），不要污染 runs/fold<k>。
   【远程实测后追加的修复（第 3 轮 `--debug` 暴露）】
   - 症状：`predict_volume` 单例 76 s、训练 loader 纯取数 8.7 分钟/epoch，而 GPU 前向只要 0.019 s。
   - 根因：缓存是 `.nii.gz`，nibabel 无法 mmap，**每读一层都整卷解压**（probe 实测 557 ms/层）。
