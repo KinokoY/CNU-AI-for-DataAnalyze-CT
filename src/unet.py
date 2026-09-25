@@ -343,7 +343,8 @@ def load_encoder_pretrained(model: nn.Module, name: str | None = None,
         f"（通道 {list(getattr(model, 'encoder_channels', DEFAULT_ENCODER_CHANNELS))}），"
         f"与 resnet18/34 的 64/128/256/512 残差块参数形状不匹配，无法直接加载。"
         f"请把 model.encoder_pretrained 设回 null（基础版口径），"
-        f"或按 src/unet.py::load_encoder_pretrained 的 docstring 在进阶版里实现移植。")
+        f"或按 src/unet.py::load_encoder_pretrained 的 docstring 在进阶版里实现移植"
+        f"（实施要点与一条数据泄漏禁忌见 docs/todo.md「进阶版」一节）。")
 
 
 def count_parameters(model: nn.Module, trainable_only: bool = True) -> int:
