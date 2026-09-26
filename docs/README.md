@@ -37,12 +37,11 @@ conda 环境 `unet`（已激活），Python 3.11.16，解释器 `/home/phdauser0
 这里只列最常用的几条：
 
 ```bash
-python -m src.selfcheck_data                                    # 数据回归自检（改过 dataset/配置后必跑）
 python -m src.train --fold 0 --debug --set train.batch_size=16   # 冒烟自检（不落盘）
-python -m src.train --fold 0 --out-dir runs/smoke_fold0 --set train.epochs=12   # 12 轮短跑
-python -m src.train --fold 0                                    # 正式训练（--resume 续跑）
-python -m src.evaluate --fold 0 --run-dir runs/smoke_fold0_fixed # 整卷评估（报告见 reports/）
-python scripts/probe_axis.py --case 31                          # 只在改动写盘逻辑后需要重跑
+python -m src.train --fold 0                                     # 单折正式训练（--resume 续跑）
+for f in 0 1 2 3 4; do python -m src.train --fold $f; done        # 5 折
+python -m src.evaluate --all                                     # 5 折整卷评估（报告见 reports/）
+python -m src.selfcheck_data                                     # 数据回归自检（改过 dataset/配置后必跑）
 ```
 
 `src/selfcheck_data.py` 是**长期保留的回归自检**：核对「cache 与配置、代码三者是否自洽」，
@@ -64,7 +63,6 @@ python scripts/probe_axis.py --case 31                          # 只在改动�
 
 ## 其他约定
 
-- 显存 40 GiB 单卡：优先 patch-based（如 96³–128³）训练，注意 `num_workers` 与 52 核的匹配。
 - 代码风格与运行说明随改动一起更新，但**保持精简**（文档是给下一次开发看的，不是归档）。
 - **病人级隔离是硬约束**：划分、采样、增强、2.5D 窗口都只能在本病例内部取数据，
-  任何改动都要过 `src/selfcheck_data.py` 里那几条断言（口径见 `docs/preprocess_notes.md` 第四节）。
+  任何改动都要过 `src/selfcheck_data.py` 里那几条断言（口径见 `docs/preprocess_notes.md` 第五节）。

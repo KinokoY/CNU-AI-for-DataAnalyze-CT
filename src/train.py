@@ -28,11 +28,21 @@
     * ``set_seed(train.seed)`` 固定 random/numpy/torch/cuda，DataLoader 的 worker 种子由
       ``src.dataset._loader_kwargs`` 的 ``worker_init_fn`` 派生。
 
+日志（第 5 轮末按用户口径收紧，改动见 ``PROGRESS_PER_EPOCH`` / ``format_epoch_line``）：
+    * 一个 epoch 打 ``train.log_every_epoch_lines``（默认 **5**）条训练进度：
+      ``epoch k | iter N | loss ... | pos ... | 耗时``，间隔 = ``ceil(一轮 batch 数 / 条数)``；
+    * 进度打完之后是**一行**收尾摘要，**验证指标与 loss 同一行**（TensorBoard 风格的键值对）：
+      ``epoch 12/200 | lr ... | loss 0.4613 (dice ... + ce ...) | ... | eval dice 0.1984 [33:0.763 ...]
+      | lesion 19/19 | cover>=0.2 6/19 | best 0.1984@12 | patience 0/20 | mem 10969MB``；
+    * ``--resume`` 会把 ``last.pt`` 里存的上一个 epoch 收尾行重放一行（前缀 ``[上一次运行]``），
+      让"从第 N 轮接着跑"在日志里自证；
+    * 启动横幅、模型/损失描述、采样器描述各占固定几行；``--debug`` 仍然逐 iteration 详列。
+
 退出码：``0`` 正常；``2`` 前置校验失败；``3`` 训练出现 NaN/Inf 损失；``4`` ``--resume`` 的
     checkpoint 与当前配置不一致（或缺文件）；``130`` 被 Ctrl-C 中断（``last.pt`` 可用于续跑）。
 
 前后接口：上游是 ``scripts/preprocess.py`` / ``scripts/make_splits.py`` 的产物；
-    下游是第 4 轮的 ``python -m src.evaluate --fold <k>``（读 ``best.pt``）。
+    下游是 ``python -m src.evaluate --fold <k>``（读 ``best.pt``）。
 用法：
     ```bash
     python -m src.train --fold 0 --debug                          # 冒烟：形状/显存/耗时
@@ -150,9 +160,63 @@ CSV_COLUMNS = [
     "val_detected_lesions", "val_gt_lesions", "val_detection_rate",
 ]
 
+#: 一个 epoch 打几条**训练进度**（``train.log_every_epoch_lines`` 的默认值）。
+#: 用户口径：一轮 5 条，既能看到进度又不刷屏。实际间隔 = ceil(一轮 batch 数 / 该值)。
+PROGRESS_PER_EPOCH = 5
+
+#: 内存里保留最近几个 epoch 的摘要行（epoch 收尾行 + 进度行）。用途：``--resume`` 启动时
+#: 把上一个 epoch 的收尾行**重放**出来（否则从一半接上去时会缺 ``epoch N`` 那一行，
+#: 让人不确定接的是哪一轮）。**不落盘**，纯内存环形缓冲。
+KEEP_LAST_EPOCHS = 3
+
 
 class NonFiniteLoss(RuntimeError):
     """训练中出现了 NaN/Inf 损失（AMP 溢出或数据异常），直接停而不是把 NaN 权重存进 checkpoint。"""
+
+
+def progress_every(n_batches: int, per_epoch: int = PROGRESS_PER_EPOCH) -> int:
+    """算「每几个 batch 打一条进度」，让一个 epoch 大致打 ``per_epoch`` 条。
+
+    口径（用户拍板）：完整训练的日志要简洁，**一轮 5 条**进度即可。返回 0 表示不打进度行
+    （``per_epoch <= 0`` 时）。``train.log_every_epoch_lines`` 改的就是这里的 ``per_epoch``。
+    """
+    total = int(n_batches)
+    if total <= 0 or int(per_epoch) <= 0:
+        return 0
+    return max(1, int(math.ceil(total / float(int(per_epoch)))))
+
+
+class EpochLogBuffer:
+    """只保留最近 ``KEEP_LAST_EPOCHS`` 行日志的内存环形缓冲（**不落盘**）。
+
+    用途：``--resume`` 时把上一个 epoch 收尾的几行**重放**出来，让「从第 N 轮接着跑」在日志里自证
+    （从一半接上去时，前面那些 ``epoch k | iter ...`` 行本来已经滚出终端了）。
+    """
+
+    def __init__(self, keep: int = KEEP_LAST_EPOCHS) -> None:
+        self.keep = max(1, int(keep))
+        self.cursor = 0
+        self._lines: list = []
+
+    @property
+    def lines(self) -> list:
+        """当前缓冲里的日志行（副本，只读）。"""
+        return list(self._lines)
+
+    def prime(self, line: str) -> int:
+        """在开跑前预置一行（``--resume`` 时用 checkpoint 里的摘要行衔接日志），返回其行号。"""
+        self._lines = [str(line)]
+        return len(self._lines)
+
+    def add(self, line: str) -> None:
+        self._lines.append(str(line))
+        if len(self._lines) > self.keep:
+            self._lines.pop(0)
+
+    def replay(self) -> None:
+        """把缓冲里的行重打一遍（供 ``--resume`` 衔接日志）。"""
+        for line in self._lines:
+            LOGGER.info("%s", line)
 
 
 # --------------------------------------------------------------------------------------
@@ -445,11 +509,18 @@ def make_amp_state(cfg: dict, device: torch.device) -> dict:
 
 def train_one_epoch(model: nn.Module, loader, criterion, optimizer, scaler, device: torch.device,
                     amp: dict, cfg: dict, epoch: int, log_every: int = 0,
-                    max_iters: int = 0) -> dict:
+                    max_iters: int = 0, cursor: int | None = None,
+                    log_buffer: "EpochLogBuffer | None" = None) -> dict:
     """训练一个 epoch；返回统计（损失、dice/ce 两项、实测阳性比例、耗时、峰值显存、首个 batch 形态）。
 
     梯度路径只写一条：``scaler`` 在 bf16/fp32 下是直通替身（``is_enabled() == False``），
     只有 fp16 时才真的缩放。
+
+    进度日志：``log_every`` 是**每几个 batch 打一条**（调用方用 ``progress_every()`` 按"一轮 5 条"
+    算出来）；每条给**累计平均**的 loss/dice/ce + 已跑时间，且**每条都打印 batch 号**，
+    这样从中间接上也能看出进度（``--resume`` 时第一条不会从 batch 1 开始）。
+    ``cursor`` / ``log_buffer``：``--resume`` 且 ``cursor > 0``（该 epoch 之前已有日志行）时，
+    先把缓冲里那几行重放出来再继续打，日志读起来才是连续的。
 
     耗时分成两段分别累计（``data_seconds`` = 等 DataLoader 出 batch，``compute_seconds`` = 前向+反向+优化器）：
     缓存是 ``.nii.gz`` 时取数会成为瓶颈（远程实测 557 ms/层），这两段能一眼看出是「数据等 GPU」
@@ -463,6 +534,10 @@ def train_one_epoch(model: nn.Module, loader, criterion, optimizer, scaler, devi
     data_seconds = compute_seconds = 0.0
     first_batch: dict = {}
     started = time.perf_counter()
+    if cursor and log_buffer is not None:
+        LOGGER.info("（重放上一个 epoch 收尾的 %d 行；本行之后从第 %d 个 batch 继续）",
+                    len(log_buffer.lines), int(cursor))
+        log_buffer.replay()
     iterator = iter(loader)
     while True:
         data_started = time.perf_counter()
@@ -520,10 +595,12 @@ def train_one_epoch(model: nn.Module, loader, criterion, optimizer, scaler, devi
         compute_seconds += time.perf_counter() - compute_started
 
         if log_every and n_batches % int(log_every) == 0:
-            LOGGER.info("  epoch %d | batch %d | loss %.4f（dice %.4f + ce %.4f）| "
-                        "已跑 %.1f s（取数 %.1f s / 计算 %.1f s）", epoch, n_batches,
-                        loss_sum / n_batches, dice_sum / n_batches, ce_sum / n_batches,
-                        time.perf_counter() - started, data_seconds, compute_seconds)
+            line = (f"epoch {epoch} | iter {n_batches} | loss {loss_sum / n_batches:.4f} "
+                    f"(dice {dice_sum / n_batches:.4f} + ce {ce_sum / n_batches:.4f}) | "
+                    f"pos {n_pos / max(1, n_slices):.3f} | {time.perf_counter() - started:.1f}s")
+            LOGGER.info("%s", line)
+            if log_buffer is not None:
+                log_buffer.add(line)
         if max_iters and n_batches >= int(max_iters):
             break
 
@@ -543,6 +620,54 @@ def train_one_epoch(model: nn.Module, loader, criterion, optimizer, scaler, devi
         "peak_memory_mb": peak_memory_mb(device),
         "first_batch": first_batch,
     }
+
+
+def format_epoch_line(epoch: int, epochs: int, lr: float, train_stats: dict, val_stats: dict,
+                      best: dict, patience: int, early_stop: int, val_every: int = 1,
+                      lesion: dict | None = None) -> str:
+    """把一轮的「训练 + 验证」压成**一行**（TensorBoard 风格的键值对，便于终端横向扫读）。
+
+    用户口径（第 5 轮末）：验证集指标与 loss 打在一起、不另起一行。所以这一行同时含：
+        ``epoch`` → ``lr`` → 训练 ``loss`` 与两项分解、batch 数、耗时分解 →
+        验证 ``Dice/IoU/Prec/Rec`` → 逐例 Dice → 病灶检出/覆盖 → ``best`` / ``patience`` / 显存。
+
+    只在这一轮的**训练进度打完之后**输出（见主循环），因此日志顺序是：
+    5 行 ``epoch k | iter ...`` 接着 1 行本行的收尾摘要，一轮 6 行。
+    """
+    parts = [
+        f"epoch {int(epoch)}/{int(epochs)}",
+        f"lr {float(lr):.2e}",
+        f"loss {train_stats['loss']:.4f} (dice {train_stats['dice_loss']:.4f} "
+        f"+ ce {train_stats['ce_loss']:.4f})",
+        f"pos {train_stats['pos_ratio']:.3f}",
+        f"{int(train_stats['batches'])} iters {train_stats['seconds']:.1f}s "
+        f"[data {train_stats['data_seconds']:.1f}s + compute {train_stats['compute_seconds']:.1f}s]",
+    ]
+    if val_stats:
+        per_case = " ".join(f"{int(c)}:{float(v['dice']):.3f}"
+                            for c, v in sorted(val_stats["cases"].items()))
+        parts.append(f"eval dice {val_stats['dice_mean']:.4f} [{per_case}] "
+                     f"iou {val_stats['iou_mean']:.4f} prec {val_stats['precision_mean']:.4f} "
+                     f"rec {val_stats['recall_mean']:.4f}")
+        parts.append(f"pred {int(val_stats['pred_voxels_total'])} (gt {int(val_stats['gt_voxels_total'])}) "
+                     f"peak {float(val_stats['prob_peak_max']):.4f}")
+        if lesion is not None:
+            # 恒真判据下 ``lesion n/n`` 一定是满值（见 validate 的说明），真正有区分度的是
+            # ``cover>=x k/n``（逐 GT 病灶被覆盖住的比例）；两个都给，读的人自己选。
+            parts.append(f"lesion {int(lesion.get('n_detected', 0))}/{int(lesion.get('n_gt', 0))}")
+            parts.append(f"cover>={float(lesion.get('cover_frac', 0.2)):.1f} "
+                         f"{int(lesion.get('n_covered', 0))}/{int(lesion.get('n_gt', 0))}")
+        parts.append(f"{float(val_stats['seconds']):.1f}s")
+    else:
+        parts.append(f"eval - (val_every={int(val_every)})")
+    best_dice = float(best.get("dice", float("-inf")))
+    parts.append(f"best {best_dice:.4f}@{int(best.get('epoch', 0))}"
+                 if math.isfinite(best_dice) else "best -")
+    if val_stats:
+        parts.append(f"patience {int(patience)}/{int(early_stop)}")
+    if train_stats.get("peak_memory_mb"):
+        parts.append(f"mem {float(train_stats['peak_memory_mb']):.0f}MB")
+    return " | ".join(parts)
 
 
 def volume_dice(pred_bin, gt_bin, eps: float = 1e-6) -> float:
@@ -653,12 +778,16 @@ def validate(model: nn.Module, cases, cache_dir, cfg: dict, device: torch.device
 
 def checkpoint_payload(*, model, cfg: dict, fold: int, epoch: int, metrics: dict, best: dict,
                        patience: int, info: dict, amp_name: str, optimizer=None,
-                       scheduler=None, scaler=None, include_optimizer: bool = False) -> dict:
+                       scheduler=None, scaler=None, include_optimizer: bool = False,
+                       log_line: str = "") -> dict:
     """组装 checkpoint。
 
     ``best.pt``（``include_optimizer=False``）只含模型权重与元信息，供第 4 轮评估加载；
     ``last.pt``（``include_optimizer=True``）额外含 optimizer/scheduler/scaler 状态供 ``--resume``。
     ``epoch`` 是**已完成的轮数**：``--resume`` 从这个数之后继续。
+
+    ``log_line``：该 epoch 收尾那一行日志的**结构化摘要**（JSON 字符串），``--resume`` 时读回来
+    重放一行，让人一眼看到"接的是哪一轮、当时的指标是多少"（见 ``format_epoch_line`` 的调用处）。
     """
     payload = {
         "format": "ct-liver-tumor-2d-unet/1",
@@ -678,6 +807,7 @@ def checkpoint_payload(*, model, cfg: dict, fold: int, epoch: int, metrics: dict
         "amp": str(amp_name),
         "torch": torch.__version__,
         "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "log_line": str(log_line or ""),
     }
     if include_optimizer:
         payload["optimizer_state"] = optimizer.state_dict() if optimizer is not None else None
@@ -977,7 +1107,10 @@ def main(argv=None) -> int:
     epochs = int(train_cfg.get("epochs", 200))
     val_every = max(1, int(train_cfg.get("val_every", 1) or 1))
     early_stop = int(train_cfg.get("early_stop_patience", 20) or 0)
-    log_every = int(train_cfg.get("log_every", 50) or 0)
+    # 进度日志间隔先记为 0，等 loader 建好、知道一轮有多少 batch 之后再按「一轮 N 条」算
+    # （见 progress_every）；配置里给了 train.log_every_epoch_lines 就用它，默认 5 条。
+    progress_lines = int(train_cfg.get("log_every_epoch_lines", PROGRESS_PER_EPOCH) or 0)
+    log_every = 0
     out_dir = (resolve_path(args.out_dir) if args.out_dir
                else resolve_path(paths.get("runs", "runs")) / f"fold{fold}")
 
@@ -996,18 +1129,6 @@ def main(argv=None) -> int:
                 fold, "**--debug 冒烟自检**" if args.debug else "正式训练",
                 rel_to_root(resolve_path(args.config)))
     LOGGER.info("=" * 78)
-    LOGGER.info("设备：%s%s；随机种子：%d；目标面内尺寸：%s（pad_align=%s）；输入：%s",
-                device,
-                f"（{torch.cuda.get_device_name(device)}）" if device.type == "cuda" else "",
-                seed, format_hw(data_cfg["target_hw"]), data_cfg.get("pad_align"),
-                "单层 2D（1 通道，z_context=0）" if int(data_cfg.get("z_context", 0)) <= 0
-                else f"2.5D 三层窗 z±{int(data_cfg['z_context'])}（{window_channels(int(data_cfg['z_context']))} 通道）")
-    LOGGER.info("训练配置：epochs=%d，batch_size=%d，lr=%g，val_every=%d，早停 patience=%d，"
-                "grad_clip_norm=%g，num_workers=%d",
-                epochs, int(train_cfg.get("batch_size", 8)), float(train_cfg.get("lr", 1e-3)),
-                val_every, early_stop, float(train_cfg.get("grad_clip_norm", 0.0) or 0.0),
-                int(data_cfg.get("num_workers", 8)))
-    LOGGER.info("产物目录：%s", "（--debug 不落盘）" if args.debug else rel_to_root(out_dir))
 
     info, problems = check_prerequisites(cfg, fold)
     if problems:
@@ -1051,6 +1172,9 @@ def main(argv=None) -> int:
                     len(train_loader.dataset.case_ids), len(train_loader.dataset),
                     len(train_loader), int(train_loader.batch_sampler.batch_size),
                     len(val_cases))
+    # 进度日志间隔：一轮打 progress_lines 条（默认 5）⇒ 间隔 = ceil(一轮 batch 数 / 条数)。
+    # 在 if/else 之后算，两条分支（正式/--debug）都能拿到；--debug 由 run_debug 自己控制输出。
+    log_every = progress_every(len(train_loader), progress_lines)
 
     # ---- 模型 / 损失 / 优化器 / AMP ----
     model = build_model(run_cfg)
@@ -1063,7 +1187,24 @@ def main(argv=None) -> int:
                        criterion.include_background, criterion.positive_only)
     optimizer, scheduler = build_optimizer_scheduler(model, run_cfg, epochs)
     amp = make_amp_state(run_cfg, device)
-    LOGGER.info("可训练参数：%.3f M", count_parameters(model) / 1e6)
+    # 启动横幅（第 5 轮末收紧）：把"跑什么、在哪跑、产出在哪、日志长什么样"压成 3 行，
+    # 配置细节进 run.json，不在终端重复。
+    LOGGER.info("device=%s seed=%d target_hw=%s pad_align=%s z_context=%d pos_ratio=%.2f "
+                "params=%.3fM amp=%s",
+                f"{device}" + (f"({torch.cuda.get_device_name(device)})" if device.type == "cuda" else ""),
+                seed, format_hw(data_cfg["target_hw"]), data_cfg.get("pad_align"),
+                int(data_cfg.get("z_context", 0) or 0),
+                float(data_cfg.get("pos_ratio_train", 0.5) or 0.0),
+                count_parameters(model) / 1e6, amp["name"])
+    LOGGER.info("train epochs=%d batch_size=%d lr=%g val_every=%d patience=%d grad_clip=%g "
+                "num_workers=%d",
+                epochs, int(train_cfg.get("batch_size", 8)), float(train_cfg.get("lr", 1e-3)),
+                val_every, early_stop, float(train_cfg.get("grad_clip_norm", 0.0) or 0.0),
+                int(data_cfg.get("num_workers", 8)))
+    LOGGER.info("out_dir=%s log_every=%d iters/轮(≈%d 行/epoch)%s",
+                "（--debug 不落盘）" if args.debug else rel_to_root(out_dir),
+                int(log_every or 0), int(progress_lines) + 1,
+                "" if args.debug else "（含 1 行收尾摘要，验证指标与该行同行）")
 
     if args.debug:
         try:
@@ -1079,6 +1220,9 @@ def main(argv=None) -> int:
     start_epoch = 0
     best = {"dice": float("-inf"), "epoch": 0}
     patience = 0
+    # 日志行缓冲：只保留最近几行；全新开始时为空，--resume 时用 last.pt 里的摘要行预置一行
+    log_buffer = EpochLogBuffer()
+    log_cursor = 0
     if args.resume:
         try:
             checkpoint = load_checkpoint(out_dir / "last.pt", device)
@@ -1118,10 +1262,25 @@ def main(argv=None) -> int:
         sampler = getattr(train_loader, "batch_sampler", None)
         if sampler is not None and hasattr(sampler, "set_epoch"):
             sampler.set_epoch(start_epoch)
-        LOGGER.info("续跑：已完成 %d 轮 → 从第 %d 轮继续；当前 best 整卷 Dice=%.4f@ep%d；"
-                    "patience=%d/%d；采样顺序已接到 epoch %d",
-                    start_epoch, start_epoch + 1, best["dice"], best["epoch"], patience,
-                    early_stop, start_epoch + 1)
+        metric_now = float((checkpoint.get("metric") or {}).get("value", float("nan")))
+        LOGGER.info("续跑自检：last.pt 里记的是 epoch %d（%s = %s）；"
+                    "模型/优化器/调度器状态已恢复；best %s@ep%d；patience %d/%d",
+                    start_epoch, (checkpoint.get("metric") or {}).get("name") or "metric",
+                    f"{metric_now:.6f}" if math.isfinite(metric_now) else "NA",
+                    f"{float(best['dice']):.4f}" if math.isfinite(float(best["dice"])) else "NA",
+                    int(best["epoch"]), patience, early_stop)
+        LOGGER.info("续跑：从第 %d 轮继续（共 %d 轮）；采样顺序已接到 epoch %d"
+                    "（与一口气跑完严格一致）；lr 已按调度器状态恢复为 %.3e",
+                    start_epoch + 1, epochs, start_epoch + 1,
+                    float(optimizer.param_groups[0]["lr"]))
+        # 让"接着跑"在日志里自证：把上一个 epoch 的收尾行重放出来（用 checkpoint 里存的那一行）
+        saved_line = str(checkpoint.get("log_line") or "").strip()
+        if not saved_line and math.isfinite(metric_now):
+            saved_line = (f"epoch {start_epoch}/{epochs} |（来自 last.pt 的上一轮摘要）"
+                          f" | eval dice {metric_now:.4f} | best {float(best['dice']):.4f}"
+                          f"@{int(best['epoch'])} | patience {patience}/{early_stop}")
+        if saved_line:
+            log_cursor = log_buffer.prime(f"[上一次运行] {saved_line}")
 
     if start_epoch >= epochs:
         LOGGER.warning("checkpoint 已经跑满 epochs=%d（已完成 %d 轮），没有可继续的轮次："
@@ -1163,14 +1322,17 @@ def main(argv=None) -> int:
         "splits_digest": info.get("splits_digest", ""),
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "resume_from_epoch": start_epoch,
+        "log_every_epoch_lines": int(progress_lines),
+        "log_every_iterations": int(log_every or 0),
     }
     save_json(run_info, out_dir / "run.json")
     writer = make_summary_writer(out_dir / "tensorboard",
                                  enabled=bool(train_cfg.get("tensorboard", True)))
 
-    LOGGER.info("开始训练：epoch %d → %d（%d 个 epoch；每 %d 轮验证一次，"
-                "按验证集整卷肿瘤 Dice 的 macro 均值选最优/早停）",
-                start_epoch + 1, epochs, max(0, epochs - start_epoch), val_every)
+    LOGGER.info("开始训练：epoch %d → %d（%d 个 epoch；每 %d 轮验证一次，按验证集整卷肿瘤 Dice 的 "
+                "macro 均值选最优/早停）；进度每 %d 个 batch 一行、一轮共 %d 行 + 1 行收尾摘要",
+                start_epoch + 1, epochs, max(0, epochs - start_epoch), val_every,
+                int(log_every or 0), len(train_loader))
     last_epoch = start_epoch
     total_started = time.perf_counter()
     try:
@@ -1178,15 +1340,9 @@ def main(argv=None) -> int:
             epoch_started = time.perf_counter()
             train_stats = train_one_epoch(model, train_loader, criterion, optimizer,
                                           amp["scaler"], device, amp, run_cfg, epoch,
-                                          log_every=log_every)
-            if epoch == start_epoch + 1 and train_stats.get("first_batch"):
-                first = train_stats["first_batch"]
-                LOGGER.info("首个 batch 形态：image %s / label %s；病例 %s；z=%s；2.5D 窗口 %s；"
-                            "值域 [%.4f, %.4f]；orig_hw %s；补边偏移 %s",
-                            tuple(first["image"]), tuple(first["label"]), first["cases"],
-                            first["z"][:8], first.get("window", [])[:8],
-                            first["image_range"][0], first["image_range"][1],
-                            first["orig_hw"][:3], first["pad_offset"][:3])
+                                          log_every=log_every, cursor=log_cursor,
+                                          log_buffer=log_buffer)
+            log_cursor = 0
             if epoch == start_epoch + 1 and train_stats["data_seconds"] > train_stats["compute_seconds"]:
                 LOGGER.warning("取数耗时 %.1f s 超过计算耗时 %.1f s：**数据加载是瓶颈**。"
                                "缓存若是 .nii.gz，先跑 python scripts/inflate_cache.py 生成未压缩 .nii"
@@ -1274,41 +1430,18 @@ def main(argv=None) -> int:
                         writer.add_scalar(f"val/dice_case_{int(case_id)}", rec["dice"], epoch)
                 writer.flush()
 
-            if val_stats:
-                per_case = " ".join(f"{int(c)}:{float(v['dice']):.3f}"
-                                    for c, v in sorted(val_stats["cases"].items()))
-                LOGGER.info("epoch %d/%d | lr %.2e | 训练 loss %.4f（dice %.4f + ce %.4f）| "
-                            "%d 个 batch / %.1f s［取数 %.1f s + 计算 %.1f s］| "
-                            "验证整卷 Dice %.4f［%s；min %.3f max %.3f］/ %.1f s | "
-                            "IoU %.4f 精确率 %.4f 召回率 %.4f | 预测体素 %d（GT %d）峰值概率 %.4f | "
-                            "病灶检出 %d/%d = %.2f | best %.4f@ep%d | patience %d/%d | 峰值显存 %.0f MB",
-                            epoch, epochs, epoch_lr, train_stats["loss"], train_stats["dice_loss"],
-                            train_stats["ce_loss"], train_stats["batches"], train_stats["seconds"],
-                            train_stats["data_seconds"], train_stats["compute_seconds"],
-                            val_stats["dice_mean"], per_case, val_stats["dice_min"],
-                            val_stats["dice_max"], val_stats["seconds"],
-                            val_stats["iou_mean"], val_stats["precision_mean"],
-                            val_stats["recall_mean"],
-                            int(val_stats["pred_voxels_total"]), int(val_stats["gt_voxels_total"]),
-                            float(val_stats["prob_peak_max"]),
-                            int(lesion_now.get("n_detected", 0)), int(lesion_now.get("n_gt", 0)),
-                            float(lesion_now.get("detection_rate", 0.0)),
-                            float(best["dice"]),
-                            int(best["epoch"]), patience, early_stop, train_stats["peak_memory_mb"])
-                if int(val_stats["pred_voxels_total"]) == 0:
-                    LOGGER.warning("本轮验证一个前景体素都没预测（pred_voxels=0，峰值概率 %.4f）。"
-                                   "请核对损失配置、训练 dice/ce 曲线及整卷 GT 对齐自检；"
-                                   "连续多轮为 0 时不宜直接开始完整训练。",
-                                   float(val_stats["prob_peak_max"]))
-            else:
-                LOGGER.info("epoch %d/%d | lr %.2e | 训练 loss %.4f（dice %.4f + ce %.4f）| "
-                            "%d 个 batch / %.1f s［取数 %.1f s + 计算 %.1f s］| "
-                            "本轮不验证（val_every=%d）| best %.4f@ep%d | 峰值显存 %.0f MB",
-                            epoch, epochs, epoch_lr, train_stats["loss"], train_stats["dice_loss"],
-                            train_stats["ce_loss"], train_stats["batches"], train_stats["seconds"],
-                            train_stats["data_seconds"], train_stats["compute_seconds"],
-                            val_every, float(best["dice"]), int(best["epoch"]),
-                            train_stats["peak_memory_mb"])
+            # 一轮的日志在这里收尾：训练进度行已经由 train_one_epoch 打过（默认 5 条），
+            # **验证指标与 loss 打在同一行**（TensorBoard 风格的键值对），不再另起一行。
+            epoch_line = format_epoch_line(epoch, epochs, epoch_lr, train_stats, val_stats,
+                                           best, patience, early_stop, val_every=val_every,
+                                           lesion=lesion_now)
+            LOGGER.info("%s", epoch_line)
+            log_buffer.add(epoch_line)
+            if val_stats and int(val_stats["pred_voxels_total"]) == 0:
+                LOGGER.warning("本轮验证一个前景体素都没预测（pred_voxels=0，峰值概率 %.4f）。"
+                               "请核对损失配置、训练 dice/ce 曲线及整卷 GT 对齐自检；"
+                               "连续多轮为 0 时不宜直接开始完整训练。",
+                               float(val_stats["prob_peak_max"]))
 
             last_epoch = epoch
             save_checkpoint(out_dir / "last.pt", checkpoint_payload(
@@ -1316,7 +1449,7 @@ def main(argv=None) -> int:
                 metrics=val_stats or {"dice_mean": float("nan")},
                 best=best, patience=patience, info=info, amp_name=amp["name"],
                 optimizer=optimizer, scheduler=scheduler, scaler=amp["scaler"],
-                include_optimizer=True))
+                include_optimizer=True, log_line=epoch_line))
             if is_best:
                 save_checkpoint(out_dir / "best.pt", checkpoint_payload(
                     model=model, cfg=cfg, fold=fold, epoch=epoch, metrics=val_stats, best=best,

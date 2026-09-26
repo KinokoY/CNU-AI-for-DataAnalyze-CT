@@ -130,12 +130,15 @@ train:
   amp: bf16                       # A100 支持 bf16；bf16 只用 autocast、**不启用 GradScaler**
                                   #   （bf16 与 fp32 同指数范围，不需要 loss scaling；fp16 才会开）
                                   #   off = 纯 fp32（排查 NaN 时可用）
+  val_every: 1                    # 每多少轮做一次整卷验证（早停与 best.pt 只看验证轮）
+  grad_clip_norm: 0.0             # >0 时对梯度做裁剪
+  log_every_epoch_lines: 5        # **一个 epoch 打几条训练进度**（第 5 轮末拍板：5 条）。
+                                  #   实际间隔 = ceil(一轮 batch 数 / 该值)（280 个 batch → 每 56 个一行）。
+                                  #   每轮日志总量 = 该值 + 1 行收尾摘要（验证指标与该行合并，不另起一行）；
+                                  #   0 = 不打进度行，只留每轮一行摘要。
   pos_ratio_target: 0.30          # **第 4 轮起此键不再生效**（保留只为兼容旧命令与旧 checkpoint 指纹）。
                                   #   实际每批阳性数改由 data.pos_ratio_train / data.min_pos_per_batch /
                                   #   data.max_pos_repeat 决定；采样器构造时会打印一行「忽略」提示。
-  val_every: 1                    # 每多少轮做一次整卷验证（早停与 best.pt 只看验证轮）
-  grad_clip_norm: 0.0             # >0 时对梯度做裁剪
-  log_every: 50                   # 每多少个 batch 打一行进度（0 = 只在 epoch 结束时打）
   tensorboard: true               # 写 runs/fold<k>/tensorboard/（metrics.csv 不受它影响）
   seed: 42
 

@@ -9,165 +9,138 @@
 # 环境确认（秒级）
 python -c "import sys, torch, monai, SimpleITK, nibabel, numpy, scipy; print(sys.version.split()[0], torch.__version__, torch.cuda.get_device_name(0), monai.__version__, SimpleITK.Version_VersionString(), nibabel.__version__)"
 
-# 正式流程
-python scripts/preprocess.py           # → cache/（已跑过；默认写未压缩 .nii）
-python scripts/inflate_cache.py --remove-gz   # 旧 .nii.gz 缓存就地转 .nii（已跑过，可省）
-python scripts/check_cache.py          # 缓存体检（已跑过）
-python scripts/make_splits.py          # → data/splits.json（已跑过）
-python -m src.selfcheck_data           # 数据回归自检（2.5D / 平衡采样器 / 病人级隔离）
-python -m src.train --fold 0 --debug --set train.batch_size=16   # 冒烟自检（不落盘）
-python -m src.train --fold 0 --out-dir runs/smoke_fold0 --set train.epochs=12   # 12 轮短跑（判读用）
-python -m src.train --fold 0            # 正式训练
-python -m src.train --fold 0 --resume   # 续跑（读 runs/fold0/last.pt）
-for f in 0 1 2 3 4; do python -m src.train --fold $f; done      # 5 折
-python -m src.evaluate --fold 0 --run-dir runs/smoke_fold0_fixed # 整卷评估（开发期用短跑权重）
-python -m src.evaluate --fold 0 --save-pred                      # 附带预测卷（叠图核对）
-python -m src.evaluate --all            # 5 折汇总（需要每折都有 best.pt；缺的折只打印「跳过」）
-python -m src.evaluate --fold 0 --dry-run   # 只打印将要评估的折/病例/权重路径，不推理、不写报告
+# 正式训练（单折 / 5 折 / 续跑）
+python -m src.train --fold 0 --debug --set train.batch_size=16   # 冒烟自检（不落盘，约 1 分钟）
+python -m src.train --fold 0                                     # 单折正式训练
+python -m src.train --fold 0 --resume                            # 中断后续跑（Ctrl-C 退出码 130）
+for f in 0 1 2 3 4; do python -m src.train --fold $f; done        # 5 折
+
+# 评估（读 runs/<run>/best.pt；--all 缺 checkpoint 的折只打印「跳过」）
+python -m src.evaluate --fold 0                                  # 单折 + 5 例仅肝脏假阳性
+python -m src.evaluate --all                                     # 5 折汇总
+python -m src.evaluate --fold 0 --profile 57,59                  # 逐层剖面诊断（不写报告）
+python -m src.evaluate --fold 0 --save-pred --save-raw           # 另存预测卷/概率图（保留 affine）
+python -m src.evaluate --fold 0 --dry-run                        # 只打印计划，不推理不写报告
+
+# 数据侧自检 / 探测（改过预处理或 dataset 之后才需要）
+python -m src.selfcheck_data                                     # 只读 cache 的回归自检（十几秒）
+python scripts/preprocess.py                                     # → cache/（已跑过）
+python scripts/make_splits.py                                    # → data/splits.json（已跑过）
+python scripts/fetch_manifest.py                                 # 只读重建 cache 清单（秒级）
+python scripts/probe_axis.py --case 31                           # 只在改动写盘逻辑后需要重跑
 ```
 
-常用开关：`--set k.v=...`（可多次）、`--device`、`--out-dir`、`--config`、
-`--debug-cases / --debug-val-cases / --debug-iters`。
-评估专用开关：`--run-dir`（checkpoint 目录）、`--ckpt`（直接指文件）、`--folds 0,2`、
-`--fp-ckpt`（仅肝脏假阳性用哪个权重）、`--skip-fp`、`--limit-cases N`、
-`--skip-config-check`（允许权重与当前配置不一致，默认拒绝）。
-自检脚本可选：`--fold`、`--batches`、`--probe-case`、`--skip-sampler`、`--aug-samples`。
-退出码：**0** 正常 / **2** 前置校验失败（训练与评估共用）/ **3** NaN 损失 / **4** 续跑配置不一致 / **130** Ctrl-C；
-评估另加 **1** = 运行期异常（配置/权重/轴序对不上，报告不可信）。
+常用开关：`--set k.v=...`（可多次）、`--device`、`--out-dir`、`--config`；
+训练专属 `--debug / --debug-cases / --debug-val-cases / --debug-iters / --resume`；
+评估专属 `--run-dir`（checkpoint 目录）、`--ckpt`（直接指文件）、`--folds 0,2`、`--fp-ckpt`、
+`--skip-fp`、`--limit-cases N`、`--skip-config-check`、`--profile / --profile-all / --profile-bars`。
 
-## 2. 各步期望输出与判读
+退出码：训练 **0** 正常 / **2** 前置校验失败 / **3** NaN 损失 / **4** 续跑配置不一致 / **130** Ctrl-C；
+评估 **0** 正常 / **2** 前置校验或权重不匹配 / **1** 运行期异常（这类报告不要进结论）。
 
-### 2.1 预处理（2–5 分钟）
+## 2. 训练
 
-尾部应为 `cache 中 image=25，label=25`、`完整性自检通过：25 例全部成功`。
-判读：**含肿瘤必须 20 例**（0 例说明标签口径错了）、**spacing 全为 (1,1,1)**、image 是 `uint16` 且值域 ⊂ [0,1]、
-每例 `tumor_slices <= n_slices`。出现 `与 docs/data.md 的 25 例预期不一致` 这类行 → 贴回。
-清单过期但缓存有效时不必重跑：`python scripts/fetch_manifest.py` 只读重建（秒级）。
+### 2.1 日志长什么样
 
-### 2.2 数据自检（十几秒，只读 cache、不需要 GPU）
-
-必须**全绿**（打印 `自检通过`），否则不要进训练。重点看这四组：
-
-| 输出 | 应有值 |
-| --- | --- |
-| `split=train fold=0` | 21 例 / 4470 层 / 含肿瘤 617（0.1380）；val 4 例 / 1513 层 / 149（0.0985） |
-| `BalancedBatchSampler` | `bs=16 → 每批 8 正 + 8 阴`；一轮 `280` 个 batch；阳性层重复 ≈3.63；病人级隔离行的病例集合 = 本折 train |
-| `batch 1：image (16, 3, 512, 512)` | 中心通道值域 `[0,1]`、label 取值 `{0,1}`、三层窗 `[[0,0,1],[0,1,2],…]`、含肿瘤 8/16 |
-| `2.5D 窗口自检` | `中心通道与单层读取不一致 0 处`、`上下文通道与邻居层不一致 0 处`、`3/3 例` |
-
-采样器自检里的 `每批阳性数 [8]`、`全阴性 batch=0`、`抽到的病例 …（越界 0 个）` 也是硬指标。
-出现 `自检发现 N 个问题` → **把带 `-` 的行整段贴回**，别带着问题训练。
-
-### 2.3 冒烟自检 `--debug`（约 1 分钟，**不落盘**）
-
-只跑 3 个 iteration 打印形状/耗时/显存，再用当前（随机）权重对 1 例做整卷推理。核对：
-
-- `image (16, 3, 512, 512)` / `label (16, 512, 512)` / `logits (16, 2, 512, 512)` —— 形状必须逐字对上；
-- `2.5D 窗口` 连续三层、中心等于该样本的 `z`；`含肿瘤切片 8/16`；
-- **GT 前景体素数 = 434721**（fold 0 的 case 33）—— 整条链路（切片轴 → 拼卷 → transpose → 裁回）正确的硬证据；
-- 峰值显存与单步耗时（bs=16 实测 10969 MB / ≈0.19 s）；`--debug` 默认 `batch_size=2`，
-  要按正式口径测就显式给 `--set train.batch_size=16`。
-
-注意：`--debug` 只用该折 train 的**前 2 例**（fold 0 = 31/32，其中 32 无肿瘤），
-采样器可能打印"阳性层少 → 退化为每批 M 个阳性"，**这是小子集的正常现象**，不是 bug。
-随机权重下 `loss ≈1.1–1.3` 正常；第 1 个 iteration 明显慢是 cuDNN autotune，看第 2、3 个。
-
-### 2.4 训练（每轮一行）
-
-12 轮短跑实测（`batch_size=16`、fold 0，`runs/smoke_fold0_fixed`）：**280 个 batch / ≈54 s / 轮**、
-验证 4 例整卷 ≈16 s、峰值显存 10969 MB、12 轮共 14.3 分钟、best 整卷 Dice **0.1983**。每轮日志形如：
+一个 epoch 打 **6 行**：5 行进度（`train.log_every_epoch_lines=5`，间隔 = `ceil(一轮 batch 数 / 5)`）
+加 1 行收尾摘要。**验证指标与 loss 在同一行**：
 
 ```
-epoch 12/12 | lr 1.70e-05 | 训练 loss 0.4613（dice 0.4426 + ce 0.0187）| 280 个 batch / 53.9 s［取数 1.1 s + 计算 52.7 s］| 验证整卷 Dice 0.1983［33:0.763 57:0.000 59:0.000 60:0.030；min 0.000 max 0.763］/ 15.8 s | IoU 0.1581 精确率 0.2207 召回率 0.1858 | 预测体素 431694（GT 453977）峰值概率 0.9999 | 病灶检出 1/8 = 0.12 | best 0.1983@ep12 | patience 0/20 | 峰值显存 10969 MB
+epoch 1 | iter 56 | loss 0.6321 (dice 0.6152 + ce 0.0169) | pos 0.501 | 10.8s
+...
+epoch 1 | iter 280 | loss 0.5988 (dice 0.5817 + ce 0.0171) | pos 0.500 | 53.6s
+epoch 1/200 | lr 9.99e-04 | loss 0.5988 (dice 0.5817 + ce 0.0171) | pos 0.500 | 280 iters 53.9s [data 1.1s + compute 52.7s] | eval dice 0.0412 [33:0.150 57:0.000 59:0.000 60:0.000] iou 0.0301 prec 0.0512 rec 0.0489 | pred 210345 (gt 453977) peak 0.9987 | lesion 19/19 | cover>=0.2 1/19 | 16.2s | best 0.0412@1 | patience 0/20 | mem 10969MB
 ```
 
-判读（先看这五行）：
+第 12 轮（fold 0 短跑实测，`runs/smoke_fold0_fixed`）的收尾行长这样：
 
-| 看什么 | 健康 | 出问题的样子与处置 |
+```
+epoch 12/12 | lr 1.70e-05 | loss 0.4613 (dice 0.4426 + ce 0.0187) | pos 0.500 | 280 iters 53.9s [data 1.1s + compute 52.7s] | eval dice 0.1983 [33:0.763 57:0.000 59:0.000 60:0.030] iou 0.1582 prec 0.2210 rec 0.1858 | pred 430364 (gt 453977) peak 0.9999 | lesion 19/19 | cover>=0.2 6/19 | 15.8s | best 0.1983@12 | patience 0/20 | mem 10969MB
+```
+
+`--resume` 时会先重放一行 `[上一次运行] epoch N/200 | ...`，让人一眼看到接的是哪一轮。
+
+### 2.2 判读（先看这几项）
+
+| 看什么 | 健康 | 出问题时 |
 | --- | --- | --- |
-| `预测体素` vs `GT` | 同量级（0.5×–1.5× GT） | `0` → 塌缩（日志会额外告警）；`>3×GT` → 撒一片不定位，接着看下两行 |
-| `峰值概率` | 0.9+，且**位置在肿瘤层** | 停在 0.0x → 模型没学会输出前景 |
-| `dice` 项（= `1 − 肿瘤 soft Dice`） | 从 1.0 附近往下走 | **贴在 0.9 以上横盘 + `ce` < 0.01 = 塌缩**；`dice` 降而 `验证 Dice` 不涨 = 只拟合训练集 |
-| `验证整卷 Dice` | 逐例看，别只看均值 | fold 0 实测：case 33（大病灶 434k 体素）能到 0.76，**57/59（4k/652 体素）长期 0** |
-| `病灶检出` | 与 Dice 分开看 | 分母是**该折 val 的 GT 病灶总数**（fold 0 = 19 个）。⚠️ 本数据集上这条判据恒真（见 2.6 节）⇒ 实测会一直是 `n/n`，**判读改看逐例 Dice 与评估报告的覆盖分档** |
-| `［取数 + 计算］` | 计算 ≫ 取数 | 取数 > 计算 → 先查缓存是不是 `.nii.gz`，再调大 `data.num_workers` |
+| `loss` 的 `dice` 项（= `1 − 肿瘤 soft Dice`） | 从 1.0 附近往下走 | 贴在 0.9 以上横盘 + `ce` < 0.01 = **塌缩**；`dice` 降而 `eval dice` 不涨 = 只拟合训练集 |
+| `eval dice` | 逐例看，别只看均值 | 只有大病灶涨、小病灶长期 0 是**预期**；`pred` 远大于 `gt` = 过预测 |
+| `pred` vs `gt` | 同量级（0.5×–1.5×） | `0` → 塌缩（另打 WARNING）；`>3×gt` → 撒一片不定位 |
+| `peak`（峰值概率） | 0.9+ 且位置在肿瘤层 | 停在 0.0x → 模型没学会输出前景 |
+| `cover>=0.2 k/n` | 逐轮上升 | 长期 0 = 预测没盖住病灶（**这才是有区分度的病灶级口径**，见 2.4） |
+| `[data + compute]` | compute ≫ data | data > compute → 先查缓存是不是 `.nii.gz`，再调大 `data.num_workers` |
+| `mem` | 稳定不涨 | 逐轮上涨 = 显存泄漏，贴回整段日志 |
 
-`best` / `patience` 只在验证轮更新；`best.pt` 只在刷新时写，`last.pt` 每轮覆盖。
-⚠️ **验证数值依赖轴序正确**：`predict_volume` 画布与 `load_label_volume` 必须是同一轴序
-（第 4 轮曾多转置一次，方形病例形状相同、Dice 静默 ≈0，修好后同一配置从 0.0048 → 0.1983）。
-改动读盘/拼卷/裁回后，先用 `--debug` 的「GT 434721 体素」+ 逐例 Dice 复核。
+⚠️ **验证数值依赖轴序正确**：`predict_volume` 画布与 `load_label_volume` 必须是同一轴序。
+改动读盘/拼卷/裁回后，先用 `--debug` 的「GT 434721 体素」（fold 0 的 case 33）+ 逐例 Dice 复核。
 
-### 2.5 5 折与续跑
+### 2.3 续跑（`--resume`）
 
-```bash
-for f in 0 1 2 3 4; do python -m src.train --fold $f; done
-python -m src.train --fold 0 --resume        # Ctrl-C（退出码 130）后可直接续
-```
-
-`paths` 与 `train.epochs` 不参与 checkpoint 指纹（允许"先跑 5 轮试水再续到 200"）；
-**其它配置项改了会拒绝续跑（退出码 4）并列出差异**。换了训练口径（采样/损失/通道数）后旧权重不能续跑，
-直接重跑即可（全新启动会把上一轮的 `best.pt`/`last.pt`/`metrics.csv`/`tensorboard` 改名成 `*.prev`，
-避免 `metrics.csv` 里同一个 epoch 出现两次）。
-
-### 2.6 整卷评估（fold 0 约 4 例 × 5 s ≈ 1 分钟；`--all` 约 5 倍）
+- 每轮结束都覆盖 `runs/fold<k>/last.pt`（含模型 / 优化器 / 调度器 / AMP scaler / best / patience /
+  该轮收尾日志行）。**Ctrl-C（130）、NaN 中断（3）、断电都只损失当前未完成的那一轮**。
+- 续跑时校验：`fold` 必须一致、`cfg_hash` 必须一致（**`paths` 与 `train.epochs` 不参与指纹**，
+  允许"先跑 50 轮再续到 200"）。不一致直接退出码 4 并列出差异。
+- 继续的口径：epoch 从 `已完成 + 1` 接着数、lr 从调度器状态恢复（与一口气跑完严格一致）、
+  采样顺序用 `sampler.set_epoch(已完成轮数)` 接上（**同一条序列，不会打乱**）。
+- 想改训练口径（采样/损失/通道数/`target_hw`）⇒ 旧权重不能续跑，删掉 `runs/fold<k>/` 重跑即可
+  （全新启动会把上一轮的 `best.pt`/`last.pt`/`metrics.csv`/`tensorboard` 改名成 `*.prev`，
+  避免 `metrics.csv` 里同一个 epoch 出现两次）。
+- 续跑前想只看状态不训练：
 
 ```bash
-python -m src.evaluate --fold 0 --run-dir runs/smoke_fold0_fixed   # 开发期：12 轮烟测权重
-python -m src.evaluate --fold 0 --save-pred --save-raw             # 额外落盘预测卷 / 概率图
-python -m src.evaluate --all                                       # 5 折汇总（缺 best.pt 的折只跳过）
-python -m src.evaluate --fold 0 --dry-run                          # 只打印计划，不推理不写报告
-python -m src.evaluate --fold 0 --run-dir runs/smoke_fold0_fixed --profile 57,59   # 逐层剖面（诊断）
-python -m src.evaluate --fold 0 --run-dir runs/smoke_fold0_fixed --profile-all     # 该折全部病例
+python - <<'PY'
+import torch
+ck = torch.load("runs/fold0/last.pt", map_location="cpu", weights_only=False)
+print("epoch(已完成):", ck["epoch"], "| fold:", ck["fold"], "| cfg_hash:", ck["cfg_hash"])
+print("metric:", ck.get("metric"), "| best:", ck.get("best"), "| patience:", ck.get("patience"))
+print("有 optimizer/scheduler:", bool(ck.get("optimizer_state")), bool(ck.get("scheduler_state")))
+print("上一轮收尾行:", ck.get("log_line") or "（旧版本 checkpoint，无此字段）")
+PY
 ```
 
-`--profile` 是**定性诊断**：不写报告，只打印每例的逐层剖面（`#` = GT 在哪几层、`*` = 预测在哪几层、
-逐区间体素数与差值、GT/预测的 z 覆盖范围、重叠体素数）。远程没有图像查看器，这一步代替叠图：
-柱子位置对不上 = 撒错位置；预测柱子远高于 GT = 撒太大；预测的 z 范围盖不到 GT 的 z 范围 = 轴向漏掉。
+## 3. 评估
 
-**已实测跑通（`runs/smoke_fold0_fixed`，epoch 12）**：整轮约 **1.5 分钟**（4 例推理 3.4–5.2 s/例 +
-5 例仅肝脏 ≈6 s/例）；`macro Dice 0.1984 ± 0.3770` 与训练日志 best 的 `0.19827725` 一致（硬核对通过）；
-`池化 Dice 0.6747`（全由 case 33 主导）；后处理删 81 块 / 1 375 mm³、逐例 Dice 平均变化 +0.00016；
-仅肝脏 5 例 FP 命中 5/5、FP 体积中位 21 912 mm³、最大 260 514 mm³。
-⚠️ 那一轮的 `病灶检出 19/19` 属于**判据恒真**（见上），不要当结论用。
-
-流程：`best.pt` → 该折 4 例**整卷推理**（与训练期同一套 `predict_volume`）→ 后处理
-（删 <50 mm³ 孤立块）→ 体素级 + 病灶级指标 → 报告。**前置校验与训练同源**
-（cache 清单 / 预处理指纹 / 病例集合 / cache 文件），另加两条 checkpoint 校验：
-`fold` 必须一致、`cfg_hash` 必须与当前配置一致（不一致会列出差异并以码 2 退出；
-确要强行跑就加 `--skip-config-check`，报告里会记下这次跳过了校验）。
-
-产物（`reports/` 不入库）：
+### 3.1 产物
 
 | 文件 | 内容 |
 | --- | --- |
-| `eval_fold<k>.json` | 该折的 checkpoint 元信息、口径、折级结论 `assessment`、逐例 `cases`（raw + clean 两套） |
-| `eval_summary.json` | 汇总：折表、macro/池化、分层检出、假阳性队列、全部逐例记录 |
-| `eval_summary.md` | 人读版：逐折表 / 汇总表 / 分档检出 / 逐例表 / 仅肝脏 FP / 后处理前后对比 / 生成命令 |
-| `runs/<run>/pred/*.nii.gz` | 仅 `--save-pred` 时：`<case>_gt` / `<case>_pred`（+ `_pred_raw` / `_prob_u16`），**保留 cache 的 affine**，可直接叠图 |
+| `reports/eval_fold<k>.json` | 该折的 checkpoint 元信息、口径、折级结论 `assessment`、逐例 `cases`（raw + clean 两套） |
+| `reports/eval_summary.json` | 汇总：折表、macro/池化、分层检出、假阳性队列、全部逐例记录 |
+| `reports/eval_summary.md` | 人读版：逐折表 / 汇总表 / 体积分档 / **覆盖比例分档** / 逐例表 / 仅肝脏 FP / 后处理前后 / 生成命令 |
+| `runs/<run>/pred/*.nii.gz` | 仅 `--save-pred` 时：`<case>_gt` / `<case>_pred`（+ `--save-raw` 再落 `_pred_raw` / `_prob_u16`），**保留 cache 的 affine** |
 
-判读（四条线，缺一条就会被误导）：
+流程：`best.pt` → 整卷推理（与训练期同一套 `predict_volume`）→ 后处理（删 <50 mm³ 孤立块）→ 指标 → 报告。
+评估会重跑训练期那套前置校验，另加两条权重校验：`fold` 一致、`cfg_hash` 一致
+（确要强行评估加 `--skip-config-check`，报告会记下这次跳过了校验）。
 
-| 看什么 | 健康 | 出问题的样子与处置 |
+### 3.2 判读
+
+| 看什么 | 健康 | 出问题时 |
 | --- | --- | --- |
-| `macro Dice`（主口径，逐例等权） | 与训练日志 best 的 `val_dice_mean` 逐位一致 | 对不上 → 权重/配置不是同一次训练（先看 `checkpoint.epoch` 与 `cfg_hash`） |
-| `池化 Dice` | 通常 ≫ macro（大病灶主导） | 池化高、macro 低 = 只有大病灶学会了，属预期；反过来几乎不可能 |
-| **覆盖分档表（2.2 节）** | 大病灶落在 ≥0.5 档 | 全部挤在 `[0.00,0.10)` ⇒ 模型只是"撒的大片正好压到一点"，等于没找到；这是第 6 轮的首要矛盾 |
-| 逐例 `best_cover` + `dice` 并排 | 两者同向 | `best_cover` 高、`dice` 低 ⇒ 位置对但**撒得太大**（看该例 `pred_mm3`/`fp_mm3`）；两者都低 ⇒ **根本没找到** |
-| **仅肝脏 5 例的 FP 率** | 越低越好（约束假阳性） | `命中例数/5` 高、或 FP 体积达 10⁵ mm³ 量级 → 过预测，见 `docs/todo.md` 第 6 轮 |
-| `后处理前后` 对比 | 删掉小块后 Dice 略升、覆盖不掉 | 覆盖明显下降 = **删掉了真病灶** → 调小 `eval.min_lesion_mm3` |
+| `macro Dice`（主口径，逐例等权） | 与训练日志 best 的 `eval dice` 一致 | 对不上 → 权重/配置不是同一次训练（看 `checkpoint.epoch` 与 `cfg_hash`） |
+| `池化 Dice` | 通常 ≫ macro（大病灶主导） | 池化高、macro 低 = 只有大病灶学会了，属预期 |
+| **覆盖比例分档（2.2 节）** | 大病灶落在 ≥0.5 档 | 全挤在 `[0.00,0.10)` ⇒ 只是"撒的大片压到了一点"，等于没找到 |
+| 逐例 `best_cover` + `dice` | 两者同向 | `best_cover` 高、`dice` 低 ⇒ 位置对但**撒太大**（看 `pred_mm3`/`fp_mm3`）；两者都低 ⇒ **没找到** |
+| **仅肝脏 5 例的 FP** | 越低越好 | 命中例数高或 FP 体积到 10⁵ mm³ ⇒ 过预测 |
+| 后处理前后 | Dice 略升、覆盖不掉 | 覆盖明显下降 = 删掉了真病灶 → 调小 `eval.min_lesion_mm3` |
 
-⚠️ **`病灶级检出` / `detection_rate` 这一列在本数据集上恒为 1.000**：判据里的「该 GT 病灶
-≥ `eval.detect_min_mm3`（10 mm³）即算检出」被数据尺度撑满（20 例含肿瘤病人的肿瘤最小 652 mm³）。
-报告与日志会显式打 `criterion_b_is_trivial` 警告 —— **看到它就别再读那个数**，改看覆盖分档。
-（第 5 轮用 `runs/smoke_fold0_fixed` 实测：fold 0 报 19/19，同一批里 57/59 的 Dice 是 0.0000。）
+⚠️ **`detection_rate` 这一列在本数据集上恒为 1.000**：判据「该 GT 病灶 ≥ `eval.detect_min_mm3`（10 mm³）
+即算检出」被数据尺度撑满（20 例含肿瘤病人的肿瘤最小 652 mm³）。日志与 `eval_summary.md` 会显式打
+`criterion_b_is_trivial` 警告 —— **看到它就别再读那个数**，改看覆盖比例分档与逐例 `best_cover`。
 
-口径细节（`src/metrics.py` 是唯一定义处）：
-`dice = (2TP+eps)/(2TP+FP+FN+eps)`、`eps=1e-6`、两边都空记 1.0、预测为空时精确率记 0.0；
-病灶**覆盖比例** = `交集体素 / 该 GT 病灶体素`（主口径，≥0.20 记 `n_covered`、≥0.50 记 `n_covered_strict`）；
-连通域一律 6 邻域 `scipy.ndimage.label`（与预处理统计同源，**不要**换成 SimpleITK）。
-`--limit-cases N` 与「被跳过的折」会把报告标成 `incomplete: true` —— 那种报告只能验证链路，不能当基线。
+### 3.3 `--profile`：逐层剖面（没有查看器时的替代）
 
-## 3. 报错 → 贴回什么
+```
+case 57：z 共 135 层｜GT 前景层 12 层（(58, 69)）｜预测前景层 91 层（(3, 93)）｜GT 4046 体素 / 预测 20261 体素｜重叠 0 体素
+   z 区间   | GT 体素 | 预测体素 |   差   | GT                      预测
+     56-60   |     180 |     1840 |  +1660 | ##                      ****
+     ...
+  读法：# = GT 在哪几层，* = 预测在哪几层。柱子位置对不上 = 撒错位置；预测柱子远高于 GT = 撒太大；
+       预测的 z 范围盖不到 GT 的 z 范围 = 该病灶在轴向上被漏掉。
+```
+
+## 4. 报错 → 贴回什么
 
 | 输出 | 含义 / 处置 |
 | --- | --- |
@@ -177,23 +150,22 @@ python -m src.evaluate --fold 0 --run-dir runs/smoke_fold0_fixed --profile-all  
 | `验证集里出现不含肿瘤的病例` | 划分被改坏（5 例仅肝脏只应进训练集）→ 检查 `data/splits.json` |
 | `model.in_channels=… 与 data.z_context=… 不自洽` | 2.5D 配置改了一边忘另一边 → 配对（0↔1、1↔3、2↔5） |
 | `预测卷 (H,W,Z) 与 GT 卷 (H,W,Z) 形状不一致` | 轴序或 `pad_offset` 裁回出错 → **贴整段 traceback**（最优先修的一类） |
-| `本轮验证一个前景体素都没预测（pred_voxels=0…）` | 塌缩 → 贴回该行 + 本轮训练那行 |
+| `本轮验证一个前景体素都没预测（pred_voxels=0…）` | 塌缩 → 贴回该行 + 本轮收尾摘要行 |
 | `epoch N 第 M 个 batch 的损失是 nan` | AMP 溢出/数据异常 → `--set train.amp=off` 复现，贴回该行 + 前后 20 行 |
+| `取数耗时 … 超过计算耗时 …` | 数据加载瓶颈 → 查缓存是否 `.nii.gz`，再调 `data.num_workers` |
 | `TensorBoard 不可用（…）` | 只是告警，`metrics.csv` 照常写 |
-| `找不到 checkpoint runs/fold<k>/best.pt` | 该折还没训练过（或不在默认 run 目录）→ 先训练，或 `--run-dir runs/smoke_fold0_fixed` |
-| `checkpoint 与当前配置不一致（cfg_hash … vs …）` | 权重不是用当前配置训的 → 改回训练时的配置；确要强行评估加 `--skip-config-check` |
-| `属于 fold X，与本次要评估的 fold Y 不一致` | `--run-dir/--ckpt` 指到了别的折的权重 → 改 `--fold` 或换权重 |
-| `预测卷 (H,W,Z) 与 GT 卷 (H,W,Z) 形状不一致` | 轴序或 `pad_offset` 裁回出错 → **贴整段 traceback**（最优先修的一类） |
-| `TypeError: … unexpected keyword argument` | 库版本/参数名不匹配 → **贴整段 traceback** |
+| `找不到 checkpoint runs/fold<k>/best.pt` | 该折还没训练过（或不在默认 run 目录）→ 先训练，或 `--run-dir` 指向实际产物 |
+| `checkpoint 与当前配置不一致（cfg_hash … vs …）` | 权重不是用当前配置训的 → 改回训练时的配置，或加 `--skip-config-check` |
+| `属于 fold X，与本次要评估的 fold Y 不一致` | 权重指到了别的折 → 改 `--fold` 或换权重 |
 | 退出码 2 + 一串 `-` 行 | 前置校验失败 → **把带 `-` 的行整段贴回** |
+| `TypeError: … unexpected keyword argument` | 库版本/参数名不匹配 → **贴整段 traceback** |
 
-## 4. 产物与 git 边界
+## 5. 产物与 git 边界
 
-- `runs/<run>/`：`best.pt`（评估用，含 `model_state`/`epoch`/`metric`/`cfg_hash`/病例/种子）、
-  `last.pt`（每轮覆盖，额外含 optimizer/scheduler/best/patience，续跑用）、
-  `metrics.csv`（列见 `src/train.py` 的 `CSV_COLUMNS`）、`run.json`（配置快照 + 环境 + 指纹）、
-  `train.log`、`tensorboard/`；`pred/`（仅 `--save-pred` 时：`<case>_gt` / `<case>_pred`，加 `--save-raw` 再落 `_pred_raw` / `_prob_u16`）。
-- `reports/`：`eval_fold<k>.json`、`eval_summary.{json,md}`（评估）、`selfcheck_data.json`（数据自检）。
+- `runs/<run>/`：`best.pt`（评估用）、`last.pt`（续跑用，每轮覆盖）、`metrics.csv`（列见
+  `src/train.py` 的 `CSV_COLUMNS`）、`run.json`（配置快照 + 环境 + 指纹 + 日志间隔）、
+  `train.log`、`tensorboard/`、`pred/`（仅 `--save-pred`）。
+- `reports/`：`eval_fold<k>.json`、`eval_summary.{json,md}`、`selfcheck_data.json`。
 - **不入库且只在远程**：`cache/`、`reports/`、`runs/`、所有 `*.pt` / `*.nii*`。
 - **入库**：`data/splits.json`、`data/exclude_cases.json`、`configs/*.yaml`、`src/*.py`、`scripts/*.py`、`docs/*.md`。
 - 随机种子固定 `train.seed=42`；预处理/划分/训练/评估四处的口径见各自脚本头部注释。
