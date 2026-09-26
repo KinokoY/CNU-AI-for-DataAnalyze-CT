@@ -586,7 +586,7 @@ class RandAffineSlice2D:
                 continue
             arr = np.asarray(out[key])
             mode = "nearest" if key == "label" else "bilinear"
-            height, width = int(arr.shape[0]), int(arr.shape[1])
+            height, width = int(arr.shape[-2]), int(arr.shape[-1])
             # 比例 → 像素（×边长）；image 与 label 尺寸相同，因此两者拿到同一套几何
             frac_x, frac_y = self.affine.shift_frac
             warped = GridAffine2D(self.affine.rotate_deg, self.affine.scale,
@@ -615,7 +615,9 @@ class FlipSlice2D:
         out = dict(data)
         for key in self.keys:
             if key in out:
-                out[key] = np.flip(np.asarray(out[key]), axis=self.axis).copy()
+                arr = np.asarray(out[key])
+                axis = self.axis + 1 if arr.ndim == 3 else self.axis
+                out[key] = np.flip(arr, axis=axis).copy()
         return out
 
 
@@ -642,7 +644,7 @@ class Rotate90Slice2D:
         out = dict(data)
         for key in self.keys:
             if key in out:
-                out[key] = np.rot90(np.asarray(out[key]), k).copy()
+                out[key] = np.rot90(np.asarray(out[key]), k, axes=(-2, -1)).copy()
         return out
 
 
@@ -652,8 +654,7 @@ class GammaSlice2D:
     这是「随机直方图/对比度扰动」的最简形式（MONAI 的 ``RandHistogramShift`` 用控制点做分段线性
     映射，本质也是单调的强度重排）。要求输入已经是 ``[0,1]``，否则幂运算会发散——预处理后的
     cache 正好是 ``[0,1]``，所以这里直接乘幂即可，且**保序**（不会把亮暗关系翻转）。
-    只作用于 image；**输入恒为 2D 的 ``(H,W)``**（2.5D 的上下文通道不在本步骤里，
-    见 ``CTSliceDataset.__getitem__`` 的口径说明）。
+    只作用于 image；2.5D 输入为 ``(C,H,W)`` 时只改变中心通道。
     """
 
     def __init__(self, prob: float = 0.2, gamma_range: Sequence[float] = (0.75, 1.33),
@@ -676,7 +677,13 @@ class GammaSlice2D:
         for key in self.keys:
             if key in out:
                 img = np.clip(np.asarray(out[key], dtype=np.float32), 0.0, 1.0)
-                out[key] = np.power(img, gamma, dtype=np.float32)
+                if img.ndim == 3:
+                    img = img.copy()
+                    center = img.shape[0] // 2
+                    img[center] = np.power(img[center], gamma, dtype=np.float32)
+                    out[key] = img
+                else:
+                    out[key] = np.power(img, gamma, dtype=np.float32)
         return out
 
 
@@ -686,7 +693,7 @@ class GaussianNoiseSlice2D:
     ``std`` 是噪声强度的**上界**：每次从 ``U(0, std)`` 抽一个 ``sigma``（与 MONAI 的
     ``sample_std=True`` 默认行为一致），这样噪声强度本身也随机。为了可复现，用的是
     ``random.Random`` 抽 sigma、``np.random.default_rng(seed)`` 抽噪声（种子由同一个 rng 派生）。
-    只作用于 image，最后夹回 ``[0,1]``；**输入恒为 2D 的 ``(H,W)``**（同 ``GammaSlice2D``）。
+    只作用于 image，最后夹回 ``[0,1]``；2.5D 时只给中心通道加噪声。
     """
 
     def __init__(self, prob: float = 0.2, std: float = 0.01, keys: Sequence[str] = ("image",),
@@ -709,8 +716,15 @@ class GaussianNoiseSlice2D:
         for key in self.keys:
             if key in out:
                 img = np.asarray(out[key], dtype=np.float32)
-                noise = noise_rng.normal(0.0, sigma, size=img.shape).astype(np.float32)
-                out[key] = np.clip(img + noise, 0.0, 1.0)
+                if img.ndim == 3:
+                    img = img.copy()
+                    center = img.shape[0] // 2
+                    noise = noise_rng.normal(0.0, sigma, size=img[center].shape).astype(np.float32)
+                    img[center] = np.clip(img[center] + noise, 0.0, 1.0)
+                    out[key] = img
+                else:
+                    noise = noise_rng.normal(0.0, sigma, size=img.shape).astype(np.float32)
+                    out[key] = np.clip(img + noise, 0.0, 1.0)
         return out
 
 
@@ -759,11 +773,10 @@ def make_augment_steps(cfg: dict, seed: int | None = None) -> list:
     只做面内变换、不做弹性形变：逐层独立施加形变会破坏 z 方向一致性（同一病人的相邻层被施以
     不同形变，病灶边界会抖），而逐层形变本身对 2D 基线没有收益。
 
-    **谁负责 2.5D 的通道一致性**：增强流水线本身**只吃 2D 的 ``(H,W)``**（``CTSliceDataset.__getitem__``
-    先对中心层做增强、再叠上未增强的邻居层）。因此这里没有"多通道分支"：
-      * 几何增强天然对所有通道同步（它们共享同一个增强后的中心层 + 真实邻居层）；
-      * 强度增强（4）只作用于被监督的中心层，相邻层保持真实灰度，不会被 gamma/噪声改成
-        「与中心层不一致的伪影」；
+    **2.5D 通道一致性**：``CTSliceDataset.__getitem__`` 先叠真实的相邻层，再把整块
+    ``(C,H,W)`` 交给增强流水线：
+      * 几何增强对所有通道和 label 使用同一组参数；
+      * 强度增强（4）只作用于被监督的中心通道；
       * label 始终是 ``(H,W)`` 的中心层掩膜，**不带通道维**——``BinarizeLabel`` 只碰 label。
 
     ``seed`` 为 None 时用 ``train.seed``；同一个 seed 得到同一串增强参数（但每个样本的随机数
@@ -1129,21 +1142,9 @@ class CTSliceDataset(Dataset):
 
         ``C = 2×data.z_context+1``（默认 3 = ``[z-1, z, z+1]``；``z_context=0`` 时 C=1 = 旧口径）。
 
-        **执行顺序（这个顺序是有讲究的，别调换）**：
-          1. 读中心层 z 的影像与标签 → ``/65535`` 还原 [0,1] / 二值化 → **居中补边**到 target_hw；
-          2. 增强流水线只吃**中心层的 2D 平面**（``(H,W)`` image + ``(H,W)`` label）：几何增强
-             （翻转/旋转/仿射）与强度增强（gamma/噪声）都按原口径作用在这一层上；
-          3. 把增强后的中心层与**未增强的** ``z±r`` 邻居层叠成 ``(C,H,W)`` 通道维，邻居层在本病例
-             内索引（越界用端点复制，见 ``window_index``）。
-
-        为什么先把增强做完再叠层（而不是把 ``(C,H,W)`` 整块交给增强）：
-          * 强度增强（gamma / 高斯噪声）从定义上只该改**被监督的那一层** —— 相邻层是真实的解剖
-            上下文，跟中心层一起提亮/加噪等于手工制造「上下文与中心层不一致」的伪影；
-          * 几何增强天然只作用在中心层上，再由步骤 3 的叠层保证**所有通道共享同一套几何**
-            （把增强后的中心层铺到每个通道是 2.5D 最简、最不容易写歪的做法：不存在"三通道被
-            不同角度旋转"的可能，也不必给每个增强步骤加通道维分支）；
-          * 单层 2D（``z_context=0``）时步骤 3 就是加一个长度为 1 的通道维，与旧口径逐位一致
-            （``(1,H,W)``），所以切换 ``z_context`` 不需要两套增强代码。
+        先读本病例 ``z±r`` 的真实层并统一补边，再将 ``(C,H,W)`` 整块送进增强。
+        几何变换对所有通道与中心层 label 同步；gamma/噪声只作用于中心通道。
+        ``z_context=0`` 时仍先以 2D 平面增强，再补一个通道维。
         """
         case, z = self.index[i]
         image_path, label_path = self.case_paths[case]
@@ -1159,28 +1160,28 @@ class CTSliceDataset(Dataset):
             raise RuntimeError(f"case {case} z={z}：image 与 label 的补边偏移不一致 "
                                f"{tuple(offset)} vs {tuple(label_offset)}")
 
-        # 2) 只对中心层做增强（输入恒为 2D，与旧口径一致）
-        if self.transforms is not None:
-            out = self.transforms({"image": np.asarray(plane, dtype=np.float32), "label": label})
-            plane = np.ascontiguousarray(np.asarray(out["image"], dtype=np.float32))
-            label = np.ascontiguousarray(np.asarray(out["label"]).astype(np.uint8))
-            if label.ndim == 3 and label.shape[0] == 1:   # 兜底：万一某步给 label 加了通道维
-                label = label[0]
-            if plane.ndim != 2 or tuple(plane.shape) != tuple(label.shape):
-                raise RuntimeError(f"增强后 image {tuple(plane.shape)} 与 label "
-                                   f"{tuple(label.shape)} 形状不一致（应都是 2D (H,W)）")
-
-        # 3) 叠 2.5D 窗口：中心层用增强后的，邻居层用未增强的真实切片（同一病例内索引）
+        # 2) 先叠真实相邻层，再对所有通道同步做几何增强
         nz = int(self.case_n_slices[case])
         window = window_index(z, nz, self.z_context)
         if self.in_channels == 1:
-            image = plane[None]                                     # (1, H, W)
+            image = plane  # 单层模式保持 2D 增强口径
         else:
-            planes = []
-            for zz in window:
-                planes.append(plane if int(zz) == int(z) else self.window_planes(case, int(zz)))
-            image = np.stack(planes, axis=0)                        # (C, H, W)
-            image = np.clip(image, 0.0, 1.0)                        # 邻居是 [0,1]；中心层可能被增强推到界外
+            image = np.stack([plane if int(zz) == int(z) else self.window_planes(case, int(zz))
+                              for zz in window], axis=0)
+
+        if self.transforms is not None:
+            out = self.transforms({"image": np.asarray(image, dtype=np.float32), "label": label})
+            image = np.ascontiguousarray(np.asarray(out["image"], dtype=np.float32))
+            label = np.ascontiguousarray(np.asarray(out["label"]).astype(np.uint8))
+            if label.ndim == 3 and label.shape[0] == 1:   # 兜底：万一某步给 label 加了通道维
+                label = label[0]
+            if tuple(image.shape[-2:]) != tuple(label.shape):
+                raise RuntimeError(f"增强后 image {tuple(image.shape)} 与 label "
+                                   f"{tuple(label.shape)} 的空间维不一致")
+
+        if self.in_channels == 1:
+            image = image[None]
+        image = np.clip(image, 0.0, 1.0)
 
         height, width = (int(image.shape[1]), int(image.shape[2]))
         if (height, width) != tuple(self.target_hw):

@@ -159,9 +159,9 @@ class SoftDiceLoss(nn.Module):
     ``per_class_dice(logits, target)`` 返回逐类 Dice（日志/自检用）。
     """
 
-    def __init__(self, include_background: bool = True, batch: bool = True,
+    def __init__(self, include_background: bool = False, batch: bool = True,
                  smooth: float = DEFAULT_SMOOTH, softmax: bool = True,
-                 to_onehot_y: bool = False, positive_only: bool = False) -> None:
+                 to_onehot_y: bool = False, positive_only: bool = True) -> None:
         super().__init__()
         if float(smooth) <= 0:
             raise ValueError(f"smooth 必须为正数（加在分母上防 0/0），收到 {smooth}")
@@ -251,7 +251,7 @@ class DiceCELoss(nn.Module):
     额外参数：
         include_background=False：Dice 是否包含背景类（**必须 False**，见 ``SoftDiceLoss``）；
         smooth=1e-5：Dice 的平滑项；
-        positive_only=False：**Dice 只在含前景的样本上算**（第 4 轮；CE 仍然对整批算）；
+        positive_only=True：**Dice 只在含前景的样本上算**（第 4 轮；CE 仍然对整批算）；
         ce_class_weights=None：CE 的类别权重（如 ``[0.2, 1.0]`` 给肿瘤类加权），``None`` = 不加权，
             这是本版留的**下一级杠杆**（默认关闭，先看平衡采样的曲线再决定是否启用）。
 
@@ -264,9 +264,9 @@ class DiceCELoss(nn.Module):
 
     def __init__(self, softmax: bool = True, to_onehot_y: bool = False, batch: bool = True,
                  lambda_dice: float = 1.0, lambda_ce: float = 1.0,
-                 include_background: bool = True, smooth: float = DEFAULT_SMOOTH,
+                 include_background: bool = False, smooth: float = DEFAULT_SMOOTH,
                  ce_class_weights: Sequence[float] | None = None,
-                 positive_only: bool = False) -> None:
+                 positive_only: bool = True) -> None:
         super().__init__()
         if float(lambda_dice) == 0.0 and float(lambda_ce) == 0.0:
             raise ValueError("lambda_dice 与 lambda_ce 不能同时为 0（损失恒为 0，训练无意义）")
@@ -381,10 +381,10 @@ def build_loss(cfg: dict) -> DiceCELoss:
         batch=bool(loss_cfg.get("batch", True)),
         lambda_dice=float(loss_cfg.get("lambda_dice", 1.0)),
         lambda_ce=float(loss_cfg.get("lambda_ce", 1.0)),
-        include_background=bool(loss_cfg.get("include_background", True)),
+        include_background=bool(loss_cfg.get("include_background", False)),
         smooth=float(loss_cfg.get("smooth", DEFAULT_SMOOTH)),
         ce_class_weights=loss_cfg.get("ce_class_weights"),
-        positive_only=bool(loss_cfg.get("dice_positive_only", False)),
+        positive_only=bool(loss_cfg.get("dice_positive_only", True)),
     )
     LOGGER.info("%s", criterion.describe())
     return criterion

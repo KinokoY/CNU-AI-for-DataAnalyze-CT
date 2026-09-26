@@ -5,7 +5,7 @@
 # ---------- 路径 ----------
 paths:
   data: data                      # 原始 volume-<id>.nii / segmentation-<id>.nii 所在目录
-  cache: cache                    # 预处理产物：cache/image/<case>.nii.gz + cache/label/<case>.nii.gz
+  cache: cache                    # 预处理产物：cache/image/<case>.nii + cache/label/<case>.nii（兼容旧 .nii.gz）
   cache_manifest: cache/cache_manifest.json
   splits: data/splits.json        # 5 折归属，纳入 git
   exclude: data/exclude_cases.json

@@ -74,6 +74,7 @@ try:
         window_channels,
         window_index,
     )
+    from src.infer import load_label_volume
     from src.utils import (
         cache_cases,
         cache_file,
@@ -115,6 +116,7 @@ except ModuleNotFoundError:  # pragma: no cover - 兜底：把仓库根塞进 sy
         window_channels,
         window_index,
     )
+    from src.infer import load_label_volume  # type: ignore
     from src.utils import (  # type: ignore
         cache_cases,
         cache_file,
@@ -574,6 +576,32 @@ def check_slice_axis(ds: CTSliceDataset, case: int, manifest: dict, problems: li
 # 增强与采样器自检
 # --------------------------------------------------------------------------------------
 
+def check_infer_label_alignment(ds: CTSliceDataset, problems: list) -> dict:
+    """核对整卷 GT 与 dataset 中心层标签的逐像素坐标，抓方形切片上的静默转置。"""
+    if not ds.case_ids:
+        return {"checked": False}
+    case = int(ds.case_ids[0])
+    positive = next((i for i, (c, _) in enumerate(ds.index)
+                     if int(c) == case and bool(ds.pos_flags[i])), None)
+    if positive is None:
+        problems.append(f"case {case} 没有含肿瘤切片，无法核对整卷 GT 与 dataset 的空间坐标")
+        return {"checked": False, "case": case}
+    sample = ds[int(positive)]
+    z = int(sample["z"])
+    height, width = (int(v) for v in sample["orig_hw"])
+    top, left = (int(v) for v in sample["pad_offset"])
+    from_dataset = np.asarray(sample["label"])[top:top + height, left:left + width]
+    volume = load_label_volume(case, ds.cache_dir)
+    same = (tuple(volume.shape) == (height, width, int(ds.case_n_slices[case]))
+            and np.array_equal(from_dataset, volume[:, :, z]))
+    if not same:
+        problems.append(f"case {case} z={z}：整卷 GT 与 dataset 标签逐像素不一致；"
+                        "检查 load_label_volume 是否错误转置了前两维")
+    LOGGER.info("整卷 GT/训练标签对齐：case %d z=%d，形状 %s，逐像素一致=%s",
+                case, z, tuple(volume.shape), same)
+    return {"checked": True, "case": case, "z": z, "same": bool(same)}
+
+
 def check_augment(cfg: dict, ds: CTSliceDataset, n_samples: int, problems: list) -> dict:
     """对若干样本比较「无增强 / 有增强」的输出：形状、值域、标签取值、被改动的比例。
 
@@ -616,20 +644,16 @@ def check_augment(cfg: dict, ds: CTSliceDataset, n_samples: int, problems: list)
 
     for i in indices:
         sample = ds[i]
-        # 增强只吃**中心层的 2D 平面**（与 __getitem__ 里的调用完全一致）；
-        # 2.5D 的三个通道由 dataset 在增强**之后**叠出来，所以这里看的是中心通道。
-        #
+        # 与 __getitem__ 一样，把真实的 2.5D 窗口整块交给增强。
         # 取值一律走 ``np.asarray(tensor)``（torch 张量支持 __array__）：**不要写
         # ``.numpy()`` 之后再切下标，也不要依赖本地假 torch 的 ``.array`` 私有属性**
         # —— 后者只有在本地 _stubs 里存在，远程真 torch 上会 AttributeError（已真实发生）。
-        image_arr = np.asarray(sample["image"], dtype=np.float32)          # (C,H,W)，C=1 时也要取 [0]
-        raw_image = image_arr[int(image_arr.shape[0]) // 2]                # 中心通道 = 被监督的那层
+        image_arr = np.asarray(sample["image"], dtype=np.float32)
+        raw_image = image_arr if int(ds.in_channels) > 1 else image_arr[0]
         raw_label = np.asarray(sample["label"], dtype=np.uint8)
         out = transforms({"image": raw_image, "label": raw_label})
         aug_image = np.asarray(out["image"], dtype=np.float32)
         aug_label = np.asarray(out["label"]).astype(np.uint8)
-        if aug_image.ndim == 3 and aug_image.shape[0] == 1:
-            aug_image = aug_image[0]
         if aug_label.ndim == 3 and aug_label.shape[0] == 1:
             aug_label = aug_label[0]
         if aug_image.shape != raw_image.shape or aug_label.shape != raw_label.shape:
@@ -801,6 +825,32 @@ def check_custom_transforms(problems: list) -> dict:
     noise_in_range = bool(float(np.asarray(noisy["image"]).min()) >= -1e-6
                           and float(np.asarray(noisy["image"]).max()) <= 1.0 + 1e-6)
 
+    multi = np.stack([canvas * 0.25, canvas, canvas * 0.5])
+    multi_flip = FlipSlice2D(prob=1.0, axis=0, rng=_random.Random(0))(
+        {"image": multi, "label": label})
+    multi_rot = Rotate90Slice2D(prob=1.0, max_k=1, rng=_random.Random(0))(
+        {"image": multi, "label": label})
+    multi_affine = RandAffineSlice2D(prob=1.0, aug={"rotation_deg": 10.0,
+                                                    "scale_range": [1.0, 1.0],
+                                                    "shift_frac": 0.02},
+                                      rng=_random.Random(0))({"image": multi, "label": label})
+    multi_gamma = GammaSlice2D(prob=1.0, gamma_range=(0.5, 0.5),
+                                rng=_random.Random(0))({"image": multi})["image"]
+    multi_noise = GaussianNoiseSlice2D(prob=1.0, std=0.02,
+                                       rng=_random.Random(0))({"image": multi})["image"]
+    multi_geometry_ok = bool(
+        np.array_equal(multi_flip["image"], np.flip(multi, axis=1))
+        and np.array_equal(multi_flip["label"], np.flip(label, axis=0))
+        and np.array_equal(multi_rot["image"], np.rot90(multi, axes=(-2, -1)))
+        and np.array_equal(multi_rot["label"], np.rot90(label))
+        and np.asarray(multi_affine["image"]).shape == multi.shape
+        and np.allclose(multi_affine["image"][0] * 4, multi_affine["image"][1], atol=1e-5)
+        and np.allclose(multi_affine["image"][2] * 2, multi_affine["image"][1], atol=1e-5))
+    multi_intensity_ok = bool(
+        np.array_equal(multi_gamma[0], multi[0]) and np.array_equal(multi_gamma[2], multi[2])
+        and np.array_equal(multi_noise[0], multi[0]) and np.array_equal(multi_noise[2], multi[2])
+        and not np.array_equal(multi_gamma[1], multi[1]))
+
     clamp_out = ClampImageToUnit()({"image": np.asarray([-0.5, 0.5, 1.5], dtype=np.float32)})
     bin_out = BinarizeLabel()({"label": np.asarray([0, 1, 2, 3], dtype=np.uint8)})
 
@@ -822,6 +872,8 @@ def check_custom_transforms(problems: list) -> dict:
         "gamma_half_brightens": gamma_brighter,
         "noise_sigma": round(float(noise_step.last_sigma or 0.0), 6),
         "noise_in_range": noise_in_range,
+        "multi_geometry_synced": multi_geometry_ok,
+        "multi_intensity_center_only": multi_intensity_ok,
         "clamp_values": [round(float(v), 4) for v in np.asarray(clamp_out["image"]).tolist()],
         "clamp_ok": bool(np.allclose(np.asarray(clamp_out["image"]), [0.0, 0.5, 1.0], atol=1e-6)),
         "binarize_values": [int(v) for v in np.asarray(bin_out["label"]).tolist()],
@@ -841,6 +893,8 @@ def check_custom_transforms(problems: list) -> dict:
         (gamma_monotonic, "GammaSlice2D 不是单调映射（会破坏亮暗关系）"),
         (gamma_brighter, "GammaSlice2D(gamma=0.5) 应该提亮"),
         (noise_in_range, "GaussianNoiseSlice2D 输出超出 [0,1]"),
+        (multi_geometry_ok, "2.5D 三通道的几何增强没有同步作用于空间维"),
+        (multi_intensity_ok, "2.5D 强度增强改动了非中心通道"),
         (info["clamp_ok"], f"ClampImageToUnit 结果 {info['clamp_values']}，期望 [0, 0.5, 1]"),
         (info["binarize_ok"], f"BinarizeLabel 结果 {info['binarize_values']}，期望 [0, 1, 1, 1]"),
     ]:
@@ -1238,6 +1292,7 @@ def main(argv=None) -> int:
                 "train" if probe_case in train_ds.case_ids else
                 ("val" if probe_case in val_ds.case_ids else "其它折"))
     axis_info = check_slice_axis(probe_ds, probe_case, manifest, problems)
+    alignment_info = check_infer_label_alignment(val_ds, problems)
 
     # ---- 增强 ----
     LOGGER.info("-" * 78)
@@ -1295,6 +1350,7 @@ def main(argv=None) -> int:
         "batches_train": batch_infos,
         "batches_val": val_infos,
         "slice_axis": axis_info,
+        "infer_label_alignment": alignment_info,
         "slice_window": window_info,
         "augment": augment_info,
         "augment_pipeline": pipeline_info,

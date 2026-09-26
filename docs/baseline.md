@@ -475,6 +475,13 @@ epoch 1/200 | lr 1.00e-03 | 训练 loss …（dice … + ce …）| 280 个 batc
 
 ### 4.2.1 短跑烟测：先拿一份「能预测出东西」的权重给下游开发用
 
+本次 12 轮日志显示，运行时显式覆盖了损失为 `include_background=true`、
+`dice_positive_only=false`，与本配置默认的 `false/true` 相反；当时整卷 GT 还被额外
+转置，所报最佳 Dice 0.0066 不能作为真实模型表现。现已修正 GT 轴序与 2.5D 几何增强。
+拉取本次代码后先运行 `python -m src.selfcheck_data --fold 0`，确认
+`整卷 GT/训练标签对齐 ... 逐像素一致=True`。随后用下面命令从头短跑，
+不要加旧的 `--set loss.*` 参数，也不要从旧 `last.pt` 续跑。
+
 ```bash
 python -m src.train --fold 0 --out-dir runs/smoke_fold0 --set train.epochs=12
 ```

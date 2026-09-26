@@ -9,10 +9,9 @@
 
 两条必须记住的口径（前两轮都在同类型的地方踩过坑）：
 
-1. **轴序**：cache 是 nibabel 的 ``(nx, ny, nz)``，切片轴在最后一维，``a[:, :, k]`` 是
-   ``(ny, nx) = (H, W)``。因此「逐层拼起来的卷」形状是 ``(H, W, Z) = (ny, nx, nz)``，
-   与直接读出来的 label 体素数组**差前两维的一次转置**。``load_label_volume`` 统一做
-   ``transpose(1, 0, 2)``，这样预测卷与 GT 卷可以逐元素比较（写死同一个索引顺序会静默错位）。
+1. **轴序**：训练样本的 image 与 label 都直接取 nibabel 数组的 ``[:, :, z]``；整卷推理
+   也是把这些切片按原顺序写回 ``[:, :, z]``。因此 GT 必须保持 nibabel 原始轴序。
+   方形切片在错误转置后形状不变，Dice 会静默接近零，不能靠 shape 检查发现。
 
 2. **补边偏移**：dataset 把每个样本**居中补边**到 ``data.target_hw``（342→512 的偏移是 (85,85)），
    内容在画布里的左上角是 ``pad_offset=(top, left)``。裁回必须用 ``[top:top+H, left:left+W]``；
@@ -102,10 +101,11 @@ def resolve_infer_amp(cfg: dict, amp: str | None = None) -> tuple:
 
 def load_label_volume(case, cache_dir, cfg: dict | None = None, binary: bool = True,
                       as_bool: bool = False) -> np.ndarray:
-    """读一例的 GT 掩膜，返回 **``(H, W, Z)``** 数组（与 ``predict_volume`` 的输出同轴序）。
+    """读一例的 GT 掩膜，返回与 ``predict_volume`` 同轴序的 ``(H, W, Z)`` 数组。
 
-    cache 里的 label 是 nibabel ``(nx, ny, nz)``（uint8，只含 {0,1}），切片轴在最后一维；
-    逐层拼出来的卷是 ``(ny, nx, nz)``，所以这里做 ``transpose(1, 0, 2)``。
+    dataset 的 image/label 都直接使用 nibabel ``[:, :, z]``，推理画布也逐层写入
+    ``[:, :, z]``，所以这里不能再转置前两维。旧版额外转置使方形病例的
+    预测和 GT 在形状相同的情况下错位。
     ``binary=True`` 时按 ``>0`` 取前景（口径与 ``src.dataset`` 一致：**不要**写成 ``==2``，
     预处理后的掩膜已经二值化，只有 {0,1}）。
 
@@ -123,7 +123,7 @@ def load_label_volume(case, cache_dir, cfg: dict | None = None, binary: bool = T
     array = np.asanyarray(image.dataobj)
     if array.ndim != 3:
         raise ValueError(f"case {case} 的 label 不是 3D：shape={array.shape}")
-    volume = np.ascontiguousarray(array.transpose(1, 0, 2))     # (nx,ny,nz) → (ny,nx,nz) = (H,W,Z)
+    volume = np.ascontiguousarray(array)  # 与 dataset[:, :, z] 和推理画布保持同一轴序
     if not binary:
         return volume
     if as_bool:

@@ -1040,6 +1040,11 @@ def main(argv=None) -> int:
     model = build_model(run_cfg)
     model.to(device)
     criterion = build_loss(run_cfg).to(device)
+    if criterion.include_background or not criterion.positive_only:
+        LOGGER.warning("本次损失配置 include_background=%s、dice_positive_only=%s："
+                       "当前默认短跑应使用 false/true；旧日志覆盖成 true/false 后，"
+                       "训练 loss 下降但前景检出很差。请核对 --set 参数。",
+                       criterion.include_background, criterion.positive_only)
     optimizer, scheduler = build_optimizer_scheduler(model, run_cfg, epochs)
     amp = make_amp_state(run_cfg, device)
     LOGGER.info("可训练参数：%.3f M", count_parameters(model) / 1e6)
@@ -1263,9 +1268,9 @@ def main(argv=None) -> int:
                             float(best["dice"]),
                             int(best["epoch"]), patience, early_stop, train_stats["peak_memory_mb"])
                 if int(val_stats["pred_voxels_total"]) == 0:
-                    LOGGER.warning("本轮验证**一个前景体素都没预测**（pred_voxels=0，峰值概率 %.4f）："
-                                   "这就是第 3 轮首折的塌缩形态。先看训练那行的 dice 项是否贴在 0.9 附近"
-                                   "横盘、ce 是否 <0.01；处置见 docs/preprocess_notes.md 8.1。",
+                    LOGGER.warning("本轮验证一个前景体素都没预测（pred_voxels=0，峰值概率 %.4f）。"
+                                   "请核对损失配置、训练 dice/ce 曲线及整卷 GT 对齐自检；"
+                                   "连续多轮为 0 时不宜直接开始完整训练。",
                                    float(val_stats["prob_peak_max"]))
             else:
                 LOGGER.info("epoch %d/%d | lr %.2e | 训练 loss %.4f（dice %.4f + ce %.4f）| "
