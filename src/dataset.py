@@ -316,6 +316,9 @@ def window_index(z: int, n_slices: int, z_context: int) -> list:
         raise ValueError(f"z={z} 超出 [0, {n_slices - 1}]（样本索引必须落在本病例内）")
     if radius <= 0:
         return [z]
+    # 逐槽位夹取到有效下标（等价于对**下标**做 edge padding：越界的邻居取最近的有效层）。
+    # 本数据集的 nz 是 74–488，远大于 r，所以实际只会在 z<r 与 z≥nz-r 两端各产生 r 个重复层号；
+    # 写成这个等价形式是为了「nz 小于窗口」的退化输入下也自洽（不会出现重复层号分布不均）。
     return [min(max(z + delta, 0), n_slices - 1) for delta in range(-radius, radius + 1)]
 
 

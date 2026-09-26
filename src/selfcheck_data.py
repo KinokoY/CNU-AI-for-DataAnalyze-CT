@@ -322,6 +322,41 @@ def describe_batch(batch: dict) -> dict:
     }
 
 
+def window_structure_problem(window, z: int, z_context: int) -> str | None:
+    """校验一个 2.5D 窗口的**结构**，返回问题描述；没问题返回 ``None``。
+
+    做成纯函数是为了能在本地离线自检里直接测（``_selftest.py``）——第 4 轮在这里吃过两次亏：
+    最初写成"相邻层号必须都 +1"，把**正确的端点复制**窗口 ``[0,0,1]`` 误判成缺陷、远程
+    `selfcheck_data` 直接以退出码 1 停下；第二版又试图从窗口反推 ``nz`` 来判断"重复是否只发生在
+    端点"（在端点处**不可能**：``[0,0,1]`` 在 nz=2 与 nz≥3 下都是合法窗口），于是再次误报。
+
+    这里只判**纯结构**（不需要 ``nz``，因而不会误报）：
+      * ``window[r] == z``（``r = z_context``，中心通道就是被监督的那一层）；
+      * 长度 = ``2r+1``；
+      * 层号**非降、步长 ≤ 1**（既不能往回走，也不能跳层）。
+    端点复制的重复层号天然满足这三条，所以不会再被误判；而"跳层/乱序/中心错位"这些真缺陷
+    仍然会被拒。
+
+    **``nz`` 级的校验不在本函数**（本函数只拿到 batch 里的窗口与 z）：完整核对
+    「窗口 == ``window_index(z, nz, r)``、且所有层号落在 ``[0, nz-1]``」由
+    ``check_slice_window`` 在数据集级完成（它能拿到每例的 ``nz``）。
+    """
+    window = [int(v) for v in window]
+    z = int(z)
+    r = int(z_context)
+    if r <= 0:
+        return None if window == [z] else f"z_context=0 时窗口应当是 [{z}]，收到 {window}"
+    if len(window) != 2 * r + 1:
+        return f"窗口 {window} 长度不是 {2 * r + 1}（应等于 2×z_context+1）"
+    if window[r] != z:
+        return f"窗口 {window} 的中心是 {window[r]}，与 z={z} 不一致"
+    steps = [b - a for a, b in zip(window, window[1:])]
+    if any(s not in (0, 1) for s in steps):
+        return (f"窗口 {window} 的相邻步长 {steps} 不合法（层号必须非降、每步 0 或 1："
+                f"端点复制处为 0，其余为 1）")
+    return None
+
+
 def check_batch(idx: int, batch: dict, problems: list, tolerance: dict, tag: str = "train",
                 sampler: "BalancedBatchSampler | None" = None) -> dict:
     """校验一个 batch：形状/通道契约、值域、label 取值，以及（**仅训练侧**）每批阳性数。
@@ -365,22 +400,15 @@ def check_batch(idx: int, batch: dict, problems: list, tolerance: dict, tag: str
                             f"{pad_offset_of(orig, expect_hw)} 不一致")
             break
 
-    # 1b) 2.5D 窗口的结构检查（只查结构，三层内容是否同属一个病人在 check_slice_window 里单独查）
+    # 1b) 2.5D 窗口的结构检查（结构判据抽到纯函数 window_structure_problem，本地可单测；
+    #     三层内容是否同属一个病人在 check_slice_window 里单独查）。
+    #     **注意这里一次报完所有样本的问题**（不 break）：数据侧自检的往返成本很高，
+    #     一次只报第一个问题会让用户来回跑好几遍。
     if expect_channels > 1:
         for sample_z, window in zip(info["z"], info["window"]):
-            if len(window) != expect_channels:
-                problems.append(f"batch {idx}：样本 z={sample_z} 的 2.5D 窗口 {window} 长度不是 "
-                                f"{expect_channels}（应等于 2×z_context+1）")
-                break
-            if window[int(expect_channels) // 2] != int(sample_z):
-                problems.append(f"batch {idx}：样本 z={sample_z} 的窗口中心是 "
-                                f"{window[int(expect_channels) // 2]}，与 z 不一致（中心通道必须是被"
-                                f"监督的那一层）")
-                break
-            if any(b - a != 1 for a, b in zip(window, window[1:])):
-                problems.append(f"batch {idx}：样本 z={sample_z} 的窗口 {window} 层号不连续"
-                                f"（越界应当用**端点复制**，不是跳过该层）")
-                break
+            problem = window_structure_problem(window, int(sample_z), int(tolerance["z_context"]))
+            if problem:
+                problems.append(f"batch {idx}：样本 z={sample_z} 的 {problem}")
 
     # 2) 值域与标签取值
     if info["image_min"] < -1e-6 or info["image_max"] > 1.0 + 1e-6:
