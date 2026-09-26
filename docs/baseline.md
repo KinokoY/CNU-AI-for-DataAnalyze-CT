@@ -116,7 +116,13 @@ python -m src.evaluate --fold 0 --run-dir runs/smoke_fold0_fixed   # 开发期�
 python -m src.evaluate --fold 0 --save-pred --save-raw             # 额外落盘预测卷 / 概率图
 python -m src.evaluate --all                                       # 5 折汇总（缺 best.pt 的折只跳过）
 python -m src.evaluate --fold 0 --dry-run                          # 只打印计划，不推理不写报告
+python -m src.evaluate --fold 0 --run-dir runs/smoke_fold0_fixed --profile 57,59   # 逐层剖面（诊断）
+python -m src.evaluate --fold 0 --run-dir runs/smoke_fold0_fixed --profile-all     # 该折全部病例
 ```
+
+`--profile` 是**定性诊断**：不写报告，只打印每例的逐层剖面（`#` = GT 在哪几层、`*` = 预测在哪几层、
+逐区间体素数与差值、GT/预测的 z 覆盖范围、重叠体素数）。远程没有图像查看器，这一步代替叠图：
+柱子位置对不上 = 撒错位置；预测柱子远高于 GT = 撒太大；预测的 z 范围盖不到 GT 的 z 范围 = 轴向漏掉。
 
 **已实测跑通（`runs/smoke_fold0_fixed`，epoch 12）**：整轮约 **1.5 分钟**（4 例推理 3.4–5.2 s/例 +
 5 例仅肝脏 ≈6 s/例）；`macro Dice 0.1984 ± 0.3770` 与训练日志 best 的 `0.19827725` 一致（硬核对通过）；

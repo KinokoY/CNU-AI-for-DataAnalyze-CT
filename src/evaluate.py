@@ -182,6 +182,12 @@ def parse_args(argv=None):
     parser.add_argument("--skip-config-check", action="store_true",
                         help="允许 checkpoint 的 cfg_hash 与当前配置不一致（默认拒绝，返回码 2）")
     parser.add_argument("--dry-run", action="store_true", help="只打印将要评估的折/病例/权重路径，不推理")
+    parser.add_argument("--profile", default=None,
+                        help="诊断模式：只对指定病例跑整卷推理并打印**逐层剖面**（层号 × GT/预测体素数 + "
+                             "ASCII 柱状图 + IoU），如 --profile 57,59；不写报告")
+    parser.add_argument("--profile-all", action="store_true",
+                        help="诊断模式：对该折全部验证病例逐个打印逐层剖面（比 --save-pred 更省事）")
+    parser.add_argument("--profile-bars", type=int, default=24, help="--profile 的柱状图最多打几行")
     parser.add_argument("--set", dest="overrides", action="append", default=None,
                         help="覆盖配置项，可多次：--set eval.threshold=0.4")
     return parser.parse_args(argv)
@@ -1104,6 +1110,117 @@ def evaluate_command(summary: dict) -> str:
 
 
 # --------------------------------------------------------------------------------------
+# 逐层剖面（诊断用：一眼看出模型"撒在哪几层"，这是纯数字看不出来的）
+# --------------------------------------------------------------------------------------
+
+def per_slice_counts(volume) -> list:
+    """把 ``(H,W,Z)`` 的二值卷压成逐层前景体素数（长度 = Z）。"""
+    array = np.asarray(volume) > 0
+    if array.ndim != 3:
+        raise ValueError(f"per_slice_counts 需要 3D 卷，收到 shape={array.shape}")
+    return [int(v) for v in array.astype(np.int64).sum(axis=(0, 1)).tolist()]
+
+
+def z_margin(counts) -> tuple:
+    """返回前景层的 ``(首层, 末层)``；全空返回 ``None``（用于比较"撒在 z 轴的哪一段"）。"""
+    indices = [i for i, v in enumerate(counts) if int(v) > 0]
+    return (int(indices[0]), int(indices[-1])) if indices else None
+
+
+def slice_profile_rows(gt_counts, pred_counts, max_rows: int = 24, per_row: int = 1) -> list:
+    """把逐层体素数压成若干行：每行取 ``per_row`` 层，给出该区间的 GT/预测体素合计与差值。"""
+    total = max(len(gt_counts), len(pred_counts))
+    if total == 0:
+        return []
+    per_row = max(1, int(per_row))
+    rows: list = []
+    for start in range(0, total, per_row):
+        stop = min(start + per_row, total)
+        gt_sum = int(sum(gt_counts[start:stop]))
+        pred_sum = int(sum(pred_counts[start:stop]))
+        rows.append({"z0": int(start), "z1": int(stop - 1), "gt": gt_sum, "pred": pred_sum,
+                     "diff": int(pred_sum - gt_sum)})
+    if len(rows) <= int(max_rows):
+        return rows
+    # 超过上限时按区间合并（保持覆盖整个 z 范围，而不是只显示前 N 层）
+    step = int(np.ceil(len(rows) / float(max_rows)))
+    merged: list = []
+    for start in range(0, len(rows), step):
+        chunk = rows[start:start + step]
+        merged.append({"z0": chunk[0]["z0"], "z1": chunk[-1]["z1"],
+                       "gt": int(sum(r["gt"] for r in chunk)),
+                       "pred": int(sum(r["pred"] for r in chunk)),
+                       "diff": int(sum(r["diff"] for r in chunk))})
+    return merged
+
+
+def render_slice_profile(case: int, gt, pred, max_rows: int = 24, bar_width: int = 24) -> list:
+    """渲染一例的逐层剖面对比表（返回若干行文本，供终端直接打印）。
+
+    刻意只依赖 numpy + 文本：远程没有图像查看器，`--save-pred` 存出来的卷没法直接看，
+    而「预测撒在 z 轴的哪一段」恰恰是判断"没找到 vs 找歪了"最快的证据。
+    """
+    gt_bool = np.asarray(gt) > 0
+    pred_bool = np.asarray(pred) > 0
+    gt_counts = per_slice_counts(gt_bool)
+    pred_counts = per_slice_counts(pred_bool)
+    rows = slice_profile_rows(gt_counts, pred_counts, max_rows=max_rows)
+    scale = max(1, max([r["gt"] for r in rows] + [r["pred"] for r in rows] + [0]))
+    gt_margin = z_margin(gt_counts)
+    pred_margin = z_margin(pred_counts)
+    tp = int(np.count_nonzero(pred_bool & gt_bool))
+    lines = [
+        f"case {case}：z 共 {len(gt_counts)} 层｜GT 前景层 "
+        f"{(gt_margin[1] - gt_margin[0] + 1) if gt_margin else 0} 层（{gt_margin}）｜预测前景层 "
+        f"{(pred_margin[1] - pred_margin[0] + 1) if pred_margin else 0} 层（{pred_margin}）"
+        f"｜GT {int(sum(gt_counts))} 体素 / 预测 {int(sum(pred_counts))} 体素｜重叠 {tp} 体素",
+        "   z 区间   | GT 体素 | 预测体素 |   差   | GT" + " " * (bar_width - 1) + "预测",
+    ]
+    for row in rows:
+        gt_bar = "#" * int(round(row["gt"] / scale * bar_width))
+        pred_bar = "*" * int(round(row["pred"] / scale * bar_width))
+        lines.append(f"  {row['z0']:4d}-{row['z1']:<4d} | {row['gt']:7d} | {row['pred']:8d} "
+                     f"| {row['diff']:+7d} | {gt_bar:<{bar_width}} {pred_bar}")
+    lines.append("  读法：# = GT 在哪几层，* = 预测在哪几层。柱子位置对不上 = 撒错位置；"
+                 "预测柱子远高于 GT = 撒太大；预测的 z 范围盖不到 GT 的 z 范围 = 该病灶在轴向上被漏掉。")
+    return lines
+
+
+def run_profile(*, cfg: dict, ckpt_path, cache_dir, cases, device, args) -> int:
+    """诊断模式：对若干病例跑整卷推理，打印逐层剖面（不写报告、不落盘）。"""
+    threshold = resolve_threshold(cfg, None)
+    loaded = load_checkpoint_model(ckpt_path, cfg, device,
+                                   skip_config_check=bool(args.skip_config_check))
+    model, ckpt_info = loaded["model"], loaded["info"]
+    LOGGER.info("=" * 78)
+    LOGGER.info("逐层剖面诊断：权重 %s（epoch %s，fold %s）；阈值 %.2f；病例 %s",
+                ckpt_info["path"], ckpt_info.get("epoch"), ckpt_info.get("fold"),
+                threshold, cases)
+    LOGGER.info("说明：整卷推理只做二值化，不做后处理（剖面要看原始预测落在哪几层）")
+    for case in cases:
+        prob, pred, meta = predict_volume(model, case, cache_dir, cfg, device,
+                                          pad_to_multiple=int(((cfg.get("model") or {})
+                                                               .get("pad_to_multiple", 16) or 16)),
+                                          batch_slices=int(((cfg.get("eval") or {})
+                                                            .get("infer_batch_slices", 8) or 8)),
+                                          threshold=threshold,
+                                          amp=((cfg.get("eval") or {}).get("amp")
+                                               or (cfg.get("train") or {}).get("amp")))
+        gt = load_label_volume(case, cache_dir, cfg)
+        if tuple(pred.shape) != tuple(gt.shape):
+            raise RuntimeError(f"case {case}：预测卷 {tuple(pred.shape)} 与 GT 卷 {tuple(gt.shape)} "
+                               f"形状不一致（轴序或 pad_offset 裁回出错）")
+        LOGGER.info("-" * 78)
+        for line in render_slice_profile(int(case), gt, pred, max_rows=int(args.profile_bars)):
+            LOGGER.info("%s", line)
+        del prob
+    reset_open_cache()
+    LOGGER.info("=" * 78)
+    LOGGER.info("剖面诊断结束：**没有写任何报告**（要看指标请去掉 --profile 再跑一次）。")
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------------------
 # 主流程
 # --------------------------------------------------------------------------------------
 
@@ -1204,6 +1321,21 @@ def main(argv=None) -> int:
                     "跳过（--skip-fp）" if args.skip_fp else "用 fold %d 的权重" % plan[0]["fold"])
         LOGGER.info("--dry-run 结束：没有做任何推理，也没有写报告。")
         return EXIT_OK
+
+    # ---- 诊断模式：只打逐层剖面（不写报告） ----
+    if args.profile or args.profile_all:
+        profile_cases = ([int(part) for part in str(args.profile or "").replace(" ", "").split(",") if part]
+                         if args.profile else sorted(int(c) for c in plan[0]["record"].get("val", [])))
+        if not profile_cases:
+            LOGGER.error("--profile 没给出病例号（示例：--profile 57,59）")
+            return EXIT_PREREQ
+        try:
+            return run_profile(cfg=cfg, ckpt_path=plan[0]["ckpt"], cache_dir=cache_dir,
+                               cases=profile_cases, device=device, args=args)
+        except (ValueError, FileNotFoundError, RuntimeError, KeyError) as exc:
+            LOGGER.error("剖面诊断失败（%s）：%s", type(exc).__name__, exc)
+            LOGGER.error("%s", error_hint(exc))
+            return EXIT_ERROR
 
     # ---- 逐折评估 ----
     try:

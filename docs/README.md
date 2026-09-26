@@ -59,7 +59,7 @@ python scripts/probe_axis.py --case 31                          # 只在改动�
 | `src/train.py` | 训练入口：前置校验 → 训练 → 每轮整卷验证（Dice/IoU/精确率/召回率/塌缩/病灶检出）→ 早停 → checkpoint / metrics.csv / TensorBoard；`--debug` / `--resume` |
 | `src/postprocess.py` | 3D 后处理：6 邻域连通域标记、删 <50 mm³ 孤立块、病灶体积分档（口径见下） |
 | `src/metrics.py` | 指标定义**唯一处**：体素级 Dice/IoU/精确率/召回率、病灶级检出、假阳性统计、macro/池化汇总 |
-| `src/evaluate.py` | 整卷评估入口：载入 `best.pt` → 该折验证集推理 → 后处理 → 指标 → `reports/eval_*`；`--all` / `--save-pred` |
+| `src/evaluate.py` | 整卷评估入口：载入 `best.pt` → 该折验证集推理 → 后处理 → 指标 → `reports/eval_*`；`--all` / `--save-pred` / `--profile`（逐层剖面诊断） |
 | `src/selfcheck_data.py` | 数据侧回归自检（只读 cache）：补边 / 2.5D 三层窗 / 增强 / 平衡采样器 / 病人级隔离 |
 
 ## 其他约定
