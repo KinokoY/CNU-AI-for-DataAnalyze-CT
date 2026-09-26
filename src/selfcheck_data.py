@@ -834,8 +834,10 @@ def check_custom_transforms(problems: list) -> dict:
                                                     "scale_range": [1.0, 1.0],
                                                     "shift_frac": 0.02},
                                       rng=_random.Random(0))({"image": multi, "label": label})
+    # 几何测试用的 canvas 只有 0/1；gamma 对这两个端点恒等，不能拿它证明中心通道被改动。
+    multi_gray = np.stack([ramp * 0.25, ramp, ramp * 0.5])
     multi_gamma = GammaSlice2D(prob=1.0, gamma_range=(0.5, 0.5),
-                                rng=_random.Random(0))({"image": multi})["image"]
+                                rng=_random.Random(0))({"image": multi_gray})["image"]
     multi_noise = GaussianNoiseSlice2D(prob=1.0, std=0.02,
                                        rng=_random.Random(0))({"image": multi})["image"]
     multi_geometry_ok = bool(
@@ -847,9 +849,10 @@ def check_custom_transforms(problems: list) -> dict:
         and np.allclose(multi_affine["image"][0] * 4, multi_affine["image"][1], atol=1e-5)
         and np.allclose(multi_affine["image"][2] * 2, multi_affine["image"][1], atol=1e-5))
     multi_intensity_ok = bool(
-        np.array_equal(multi_gamma[0], multi[0]) and np.array_equal(multi_gamma[2], multi[2])
+        np.array_equal(multi_gamma[0], multi_gray[0])
+        and np.array_equal(multi_gamma[2], multi_gray[2])
         and np.array_equal(multi_noise[0], multi[0]) and np.array_equal(multi_noise[2], multi[2])
-        and not np.array_equal(multi_gamma[1], multi[1]))
+        and not np.array_equal(multi_gamma[1], multi_gray[1]))
 
     clamp_out = ClampImageToUnit()({"image": np.asarray([-0.5, 0.5, 1.5], dtype=np.float32)})
     bin_out = BinarizeLabel()({"label": np.asarray([0, 1, 2, 3], dtype=np.uint8)})
