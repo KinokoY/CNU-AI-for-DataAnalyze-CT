@@ -244,12 +244,27 @@ def round_floats(value, digits: int = ROUND):
 
 
 def slim_lesion(record: dict) -> dict:
-    """把 ``lesion_detection`` 的返回压成报告用的精简版（去掉逐病灶的 bbox，保留判定细节）。"""
-    slim = {k: v for k, v in (record or {}).items() if k not in ("per_lesion", "detected")}
-    slim["lesions"] = [
-        {k: v for k, v in lesion.items() if k != "bbox"}
-        for lesion in (record or {}).get("per_lesion", [])
-    ]
+    """把 ``lesion_detection`` 的返回压成**报告用**的精简版（只用于落盘，别拿去再算指标）。
+
+    逐病灶的 ``bbox`` 换成分列列表（``volumes_mm3`` / ``overlap_fracs`` / ``hit_overlap`` /
+    ``covered``），比原来的对象数组省一半体积且更好读；``detected``（逐病灶布尔）从
+    ``overlap_fracs`` 与体积阈值可以直接推出来，不再重复存。
+
+    ⚠️ **不要把这个精简版喂给 ``detection_stats``**：它找的是 ``per_lesion``，被改名成
+    ``lesions`` 后分档表会静默变空（第 5 轮实测撞到：体积分档打出「无 GT 病灶」、
+    逐例 ``best_cover`` 全是 NA，而同一行明明写着 19/19）。指标汇总一律用 ``lesion_detection``
+    的**原始返回**，精简只发生在写 JSON 的那一刻。
+    """
+    source = record or {}
+    per_lesion = list(source.get("per_lesion") or [])
+    slim = {k: v for k, v in source.items() if k not in ("per_lesion", "detected")}
+    slim["n_per_lesion"] = len(per_lesion)
+    slim["volumes_mm3"] = [lesion.get("volume_mm3") for lesion in per_lesion]
+    slim["overlap_fracs"] = [lesion.get("overlap_frac") for lesion in per_lesion]
+    slim["hit_overlap"] = [bool(lesion.get("hit_overlap")) for lesion in per_lesion]
+    slim["hit_big"] = [bool(lesion.get("hit_big")) for lesion in per_lesion]
+    slim["covered"] = [bool(lesion.get("covered")) for lesion in per_lesion]
+    slim["covered_strict"] = [bool(lesion.get("covered_strict")) for lesion in per_lesion]
     return slim
 
 
@@ -468,10 +483,11 @@ def run_fold(*, cfg: dict, fold: int, ckpt_path, cache_dir, split_record: dict, 
             "infer_seconds": round(float(meta.get("seconds", 0.0) or 0.0), 3),
             "voxel_raw": metrics["voxel_raw"],
             "voxel_clean": metrics["voxel_clean"],
-            "lesion_raw": {**slim_lesion(metrics["lesion_raw"]),
-                           "detected": metrics["lesion_raw"]["detected"]},
-            "lesion_clean": {**slim_lesion(metrics["lesion_clean"]),
-                             "detected": metrics["lesion_clean"]["detected"]},
+            # **这里必须放 lesion_detection 的原始返回**（含 per_lesion / detected）：
+            # 折级汇总 assess_fold 与报告都从这份记录里算分档表，精简只发生在 save_report 之前
+            # （写 JSON 时再 slim_lesion）。第 5 轮把精简版塞进来，导致分档表与 best_cover 全空。
+            "lesion_raw": metrics["lesion_raw"],
+            "lesion_clean": metrics["lesion_clean"],
             "fp_raw": slim_fp(metrics["fp_raw"]),
             "fp_clean": slim_fp(metrics["fp_clean"]),
             "gt_lesions": {
@@ -530,7 +546,11 @@ def run_fold(*, cfg: dict, fold: int, ckpt_path, cache_dir, split_record: dict, 
         "val_cases": [int(c) for c in val_cases],
         "incomplete": bool(args.limit_cases),
         "assessment": assessment,
-        "cases": records,
+        # 落盘时把逐病灶明细压成分列形式（内存里那份原始的已经用完，不再留着整卷级对象）
+        "cases": [{**rec,
+                   "lesion_raw": slim_lesion(rec["lesion_raw"]),
+                   "lesion_clean": slim_lesion(rec["lesion_clean"])}
+                  for rec in records],
     }
     reset_open_cache()
     return fold_report
@@ -619,10 +639,10 @@ def assess_fold(records, *, fold: int, ckpt_info: dict, threshold: float, min_le
         # 「与 GT 有重叠」「病灶 >= detect_min_mm3」这两条判据在当前数据尺度下可能恒真：
         # 恒真时 detection_rate 一定是 1.000，必须把重叠比例分档一起打出来，否则这一列是噪声。
         if lesion_now.get("criterion_b_is_trivial"):
-            LOGGER.warning("注意：%d/%d 个 GT 病灶都 >= detect_min_mm3=%.1f mm³ ⇒ 上面那个检出率"
+            LOGGER.warning("注意：%s 个 GT 病灶都 >= detect_min_mm3=%.1f mm³ ⇒ 上面那个检出率"
                            "**恒为 1.000、没有区分度**（模型一个体素都不预测也会是这个数）。"
                            "请看下面的重叠比例分档与 n_covered。",
-                           lesion_now["n_gt_trivially_detected"], lesion_now["n_gt"],
+                           f"{lesion_now['n_gt_trivially_detected']}/{lesion_now['n_gt']}",
                            float(lesion_now.get("detect_min_mm3", 0.0)))
         LOGGER.info("病灶覆盖质量（每病灶 交集/GT 体素；这才是有区分度的口径）：均值 %.3f 中位 %.3f；"
                     "有重叠 %d/%d、覆盖 >=%.2f 的 %d/%d、>=%.2f 的 %d/%d",

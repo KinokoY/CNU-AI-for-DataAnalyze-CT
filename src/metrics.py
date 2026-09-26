@@ -432,6 +432,7 @@ def detection_stats(records: Sequence[dict], bins: Sequence = DEFAULT_SIZE_BINS)
         "n_hit_overlap": int(n_hit_overlap),
         "n_covered": int(n_covered),
         "n_covered_strict": int(n_covered_strict),
+        "detect_min_mm3": float(usable[0].get("detect_min_mm3", DEFAULT_DETECT_MIN_MM3)),
         "cover_frac": float(usable[0].get("cover_frac", COVER_FRAC)),
         "cover_frac_strict": float(usable[0].get("cover_frac_strict", COVER_FRAC_STRICT)),
         "mean_overlap_frac": float(np.mean(overlap_fracs)) if overlap_fracs else 0.0,
