@@ -406,6 +406,20 @@ Dice 项**只在 `Y.sum()>0` 的样本上聚合**（`batch=true` 时先按样本
 **注意**：本地自检用的是假 torch / 假 nibabel / 自造的小假数据，只验证**逻辑与形状口径**；
 真实数据上的行为一律以远程 `python -m src.selfcheck_data` → `--debug` → 短跑 为准。
 
+**【第 4 轮真实踩到的坑：本地假 torch 的私有属性掩盖了远程报错】**
+第一次远程跑 `python -m src.selfcheck_data` 时在增强自检处 `AttributeError: 'Tensor' object has no
+attribute 'array'` —— `_stubs/torch.py` 的假 `Tensor` 有个私有字段 ``.array``（内部就是 ndarray），
+而**真 torch 的 `Tensor` 没有这个属性**（只有 `.numpy()` 与 `__array__`）。这类"本地能跑、远程报
+AttributeError/TypeError"的问题，根因是本地 stub 比真库更宽松。已做的处理与约定：
+
+- `src/selfcheck_data.py` 里所有"张量 → numpy"一律写 ``np.asarray(张量)``（等价于真 torch 的
+  ``__array__``，假 torch 也实现了），**不再出现 ``.array``**；需要切下标时先转 numpy 再切。
+- 本地自检里不要用**只有 stub 才有**的 API。当前 stub 提供的私有/宽松接口有：
+  ``Tensor.array``、``Tensor.astype()``、``Tensor.ascontiguousarray()``、``Tensor.sum()/mean()/min()/max()``
+  （真 torch 这些要带 ``dim=`` 或用 ``torch.*`` 函数）。写代码时按**真 torch** 的接口写。
+- 每次改完 `src/` 后，本地除了 `_selftest.py`，还应跑一遍"只读静态扫描"：
+  `Select-String -Path src/*.py -Pattern '\.array\b|\.numpy\(\)'`，确认没有依赖 stub 私有属性。
+
 其余待回填（第 4 轮远程跑完后）：平衡采样后的每批阳性数实测、2.5D 的显存/单步耗时、
 新口径下首折前几轮的 dice 项与 val macro Dice、`pred_voxels` / `prob_peak` 是否脱离 0、
 早停轮数、5 折汇总。

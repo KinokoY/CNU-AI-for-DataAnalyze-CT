@@ -280,12 +280,16 @@ def describe_batch(batch: dict) -> dict:
     （``orig_hw`` / ``pad_offset`` 是 tuple 列表，**不是**被转置的两行列表——默认 collate 会踩这个坑）。
 
     ``image`` 是 ``(B, C, H, W)``（2.5D：C=3 = [z-1,z,z+1]），所以**逐像素统计取中心通道**、
-    通道数单独报；``label`` 是 ``(B, H, W)``。统计一律先 ``.numpy()`` 再算：张量的逐元素比较/归约
-    在本地 stubs 里没有实现，而 numpy 侧本来就够用（形状、值域、取值集合）。
+    通道数单独报；``label`` 是 ``(B, H, W)``。统计一律先 ``np.asarray(张量)`` 再算：真 torch 的
+    ``Tensor`` 支持 ``__array__``，而 ``.array`` 只是本地假 torch 的私有属性、远程真 torch 上不存在
+    （远程已因此炸过一次 AttributeError）；张量的逐元素比较/归约在 numpy 侧本来就够用。
     """
     image, label = batch["image"], batch["label"]
-    img = np.asarray(image.numpy(), dtype=np.float32)
-    lab = np.asarray(label.numpy())
+    # 一律先 ``np.asarray`` 再算（**不要用 ``.array``**，那是本地假 torch 的私有属性，
+    # 真 torch 的 Tensor 只有 ``.numpy()`` / ``__array__``）。``.cpu()`` 是防御性的：
+    # 本脚本拿到的必然是 DataLoader 出来的 CPU 张量，但别把 device 假设埋在这儿。
+    img = np.asarray(image.detach().cpu() if hasattr(image, "detach") else image, dtype=np.float32)
+    lab = np.asarray(label.detach().cpu() if hasattr(label, "detach") else label)
     channels = int(img.shape[1])
     center = int(channels) // 2                    # 2.5D 的中心通道 = 标签所在的层
     target_h, target_w = (int(img.shape[-2]), int(img.shape[-1]))
@@ -586,8 +590,13 @@ def check_augment(cfg: dict, ds: CTSliceDataset, n_samples: int, problems: list)
         sample = ds[i]
         # 增强只吃**中心层的 2D 平面**（与 __getitem__ 里的调用完全一致）；
         # 2.5D 的三个通道由 dataset 在增强**之后**叠出来，所以这里看的是中心通道。
-        raw_image = sample["image"].array[int(sample["image"].array.shape[0]) // 2]
-        raw_label = sample["label"].numpy().astype(np.uint8)
+        #
+        # 取值一律走 ``np.asarray(tensor)``（torch 张量支持 __array__）：**不要写
+        # ``.numpy()`` 之后再切下标，也不要依赖本地假 torch 的 ``.array`` 私有属性**
+        # —— 后者只有在本地 _stubs 里存在，远程真 torch 上会 AttributeError（已真实发生）。
+        image_arr = np.asarray(sample["image"], dtype=np.float32)          # (C,H,W)，C=1 时也要取 [0]
+        raw_image = image_arr[int(image_arr.shape[0]) // 2]                # 中心通道 = 被监督的那层
+        raw_label = np.asarray(sample["label"], dtype=np.uint8)
         out = transforms({"image": raw_image, "label": raw_label})
         aug_image = np.asarray(out["image"], dtype=np.float32)
         aug_label = np.asarray(out["label"]).astype(np.uint8)
@@ -1042,7 +1051,7 @@ def check_slice_window(raw_ds: CTSliceDataset, enhanced_ds: CTSliceDataset, prob
             if not all(0 <= v < nz for v in got):
                 problems.append(f"case {case} z={z}：三层窗 {got} 越过本病例范围 [0,{nz - 1}]"
                                 f"——**跨病人取层**（端点复制失效）")
-            image = np.asarray(sample["image"].numpy(), dtype=np.float32)
+            image = np.asarray(sample["image"], dtype=np.float32)
             # 3) 中心通道 vs「独立重读该层」（不复用窗口逻辑，避免用自己的错误证明自己）
             raw_center = raw_ds.window_planes(case, int(z))
             if not np.array_equal(image[center], raw_center):
@@ -1070,8 +1079,8 @@ def check_slice_window(raw_ds: CTSliceDataset, enhanced_ds: CTSliceDataset, prob
             record["positions"][name] = {"z": int(z), "window": got, "want": want}
             checked += 1
         # 增强数据集：只确认「中心通道确实被增强改动过」（否则增强没接上）
-        a = np.asarray(enhanced_ds[start]["image"].numpy(), dtype=np.float32)
-        r = np.asarray(raw_ds[start]["image"].numpy(), dtype=np.float32)
+        a = np.asarray(enhanced_ds[start]["image"], dtype=np.float32)
+        r = np.asarray(raw_ds[start]["image"], dtype=np.float32)
         record["center_augmented"] = bool(not np.array_equal(a[center], r[center]))
         if record["center_augmented"]:
             augmented_cases += 1
