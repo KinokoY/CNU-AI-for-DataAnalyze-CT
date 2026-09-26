@@ -150,8 +150,55 @@ CT 肝脏肿瘤分割 · 基础版（2D 闭环）后续编码计划
     fetch_manifest/probe_axis 七处的路径与「按文件清点病例」统一走 `cache_file` / `cache_cases`。
   - 另：`train.py` 每轮日志新增 `［取数 x s + 计算 y s］`，首轮数据成为瓶颈时会显式告警。
 
-■ 第 4 轮：整卷推理 + 3D 后处理 + 指标 + 评估
-  交付：src/infer.py、src/postprocess.py、src/metrics.py、src/evaluate.py
+■ 第 4 轮：修「塌缩到全预测背景」—— 平衡采样 + Dice 只算前景 + 2.5D 三层输入（**已编码，待远程实测**）
+  【为什么有这一轮】第 3 轮首折正式训练（12 轮短跑）暴露：`dice` 项 12 轮只从 0.93 降到 0.90、
+  `ce` 掉到 0.009、**验证整卷 Dice 4 例恒 ≈0.000**（`33:0.001` 是偶然重叠），`prob 峰值` 只有 0.005
+  —— 模型塌缩到全预测背景。根因不是管道（GT 434721 体素那条硬证据早已钉死），而是**训练分布**：
+  老采样器每批只有 1~2 个含肿瘤切片、肿瘤像素占 0.2%~0.4%，CE 被背景彻底支配。
+  完整复盘见 `docs/preprocess_notes.md` 8.1。
+  交付：`src/dataset.py`（采样器重写 + 2.5D）、`src/losses.py`、`src/unet.py`、`src/train.py`、
+  `src/selfcheck_data.py`、`configs/default.yaml`、`docs/*`（`src/infer.py` 只加了 meta 字段）
+  1. **平衡采样 `BalancedBatchSampler`**（取代 `ProportionalBatchSampler`）：
+     每批恒定 `n_pos = clamp(round(bs×data.pos_ratio_train), min_pos_per_batch, bs−1)` 个阳性 +
+     `n_neg` 个阴性（默认 0.5 ⇒ bs=16 时 **8 正 + 8 阴**，旧口径是 1~2 正）；
+     一轮规模由**槽位预算**决定（`data.epoch_samples=null` → 用数据集切片数，**epoch 墙钟与旧口径
+     基本不变**）；阳性层用轮转池**重复**采样、上限 `data.max_pos_repeat`（默认 8）；
+     阴性层不再要求一轮覆盖（覆盖率落到 ~36%，日志打印）。
+     保留的两条：**每个 batch 都含阳性**（全阴性 batch 归零）、采样顺序仍由
+     `(train.seed, epoch, 病例集合)` 派生（同 epoch 可复现、相邻 epoch 不同、`--resume` 可接上）。
+     `train.pos_ratio_target` 自本轮起**不再生效**（保留键只为兼容旧命令/旧指纹，会打印提示）。
+  2. **损失加 `loss.dice_positive_only: true`**：Dice 项只在 `Y.sum()>0` 的样本上聚合，
+     全背景样本不参与 Dice；**CE 仍对整批所有样本算**（背景那一半继续压假阳性）。
+     一个前景样本都没有时 dice 项记 0（不是 NaN）。
+  3. **2.5D 三层输入**：`data.z_context=1` → `model.in_channels=3`，样本 = `[z−1, z, z+1]`，
+     标签只监督中心层；越界用**端点复制**（`[0,0,1]` / `[nz−2,nz−1,nz−1]`），**绝不跨病人取层**。
+     **执行顺序**：中心层先补边 → 只对中心层做增强 → 再与**未增强的**邻居层叠成 `(3,H,W)`，
+     于是几何增强天然三通道同步、强度增强（gamma/噪声）只动被监督的那一层。
+     `z_context=0` 时退化成 `(1,H,W)`，与旧口径逐位一致。
+     `predict_volume` **一行没改**（dataset 给几个通道就喂几个）。
+     两处自洽校验：`unet.UNet2D.__init__` 与 `train.check_prerequisites`；collate 再兜一层。
+  4. **验证侧补指标**：每轮整卷验证新增 IoU / 精确率 / 召回率（同一 `eval.threshold`）+
+     `pred_voxels_total` + `prob_peak_max`；`metrics.csv` **末尾追加** 5 列（不改旧列）。
+     预测为空时精确率记 0.0 并标 `precision_defined=False`（记 1.0 会骗人）。
+     验证侧**分布不变**（顺序读、原始 ~10% 阳性，不做任何平衡采样）。
+  5. 顺带修：`train.py` 原来**先 `scheduler.step()` 再打印 lr**，日志里的 lr 是"下一轮的值"，
+     现在先取本轮 lr 再 step（`metrics.csv` 与 TensorBoard 同步修正）。
+  6. 本地回归：`src/selfcheck_data.py` 新增「平衡采样器」与「2.5D 三层窗」两组断言，
+     外加**病人级隔离**硬断言（一轮抽到的病例必须 ⊆ 本折 train）；`_selftest.py` 扩到 168 项断言
+     （本地全通过，但只是逻辑/形状口径，真实数据以远程为准）。
+  7. **不改** `lr` / 调度器、不启用 `ce_class_weights`、不做补边区域 ignore mask
+     （前两个是下一级杠杆：若平衡采样后 `dice` 项仍长期横盘，先试
+     `--set loss.ce_class_weights=[0.2,1.0]`）。
+  远程验收顺序（详见 `docs/baseline.md` 第 3、4 节）：
+    `python -m src.selfcheck_data` → `python -m src.train --fold 0 --debug`
+    → `python -m src.train --fold 0 --out-dir runs/smoke_fold0 --set train.epochs=12`（短跑判读）
+    → 达标后再 `--fold 0` 正式训练。
+  短跑达标线：`dice` 项跌破 0.7、`预测体素 > 0`、`峰值概率` 明显抬起来、至少一例 val Dice > 0.05。
+  仍在等待：平衡采样后的实测每批阳性数、2.5D 的显存/单步耗时、新口径下的曲线与早停轮数、5 折汇总。
+
+■ 第 5 轮：整卷推理 + 3D 后处理 + 指标 + 评估
+  交付：src/infer.py（第 3 轮已落地，本轮只加 meta 字段说明）、src/postprocess.py、
+    src/metrics.py、src/evaluate.py
   src/infer.py：
     @torch.no_grad()
     def predict_volume(model, case, cache_dir, cfg, device, pad_to_multiple=16, batch_slices=8)
@@ -176,20 +223,20 @@ CT 肝脏肿瘤分割 · 基础版（2D 闭环）后续编码计划
       5 折 肿瘤 Dice / IoU / 病灶检出率 的 mean±std，以及 5 例仅肝脏的 FP 率；
     - --save-pred 时把预测卷存 runs/fold<k>/pred/<case>.nii.gz（保留 affine，便于叠图核对）。
 
-■ 第 5 轮：文档与运行手册
-  交付：更新 docs/baseline.md（补第 2–4 轮的真实命令与期望输出）、按需补 README
+■ 第 6 轮：文档与运行手册
+  交付：更新 docs/baseline.md（补第 2–5 轮的真实命令与期望输出）、按需补 README
     - 每步写清"期望输出"与"出错时该贴回哪几行"；
-    - 标注本版不含：2.5D 三层输入、肝脏通道/三分类、期相分层报告、ImageNet 预训练对照。
+    - 标注本版不含：肝脏通道/三分类、期相分层报告、ImageNet 预训练对照
+      （~~2.5D 三层输入~~ 已在第 4 轮落地）。
 
-■ 第 6 轮：按首次训练结果微调（预留）
+■ 第 7 轮：按首次训练结果微调（预留）
     - ~~依据 --debug 的实测显存定稿 batch_size~~ → **第 3 轮已定稿：`train.batch_size=16`**
-      （实测 bs=2/bs=8 显存两点外推 ≈ 376 MB/样本 + 4.7 GB → 16 约 10.7 GB；fold 0 上 351 个 batch、
-      每批 1~2 个阳性、全阴性 batch 0 个）。首折跑起来后再看是否需要按曲线回调；
-    - 现基线：`bs=8` 时每批实际只有 1 个阳性层、25 个全阴性 batch（第 2 轮远程实测；
-      阳性层一轮恰好各一次，`pos_ratio_target=0.30` 只是每批上限）。要真正提高每批阳性数、
-      消掉全阴性 batch，优先把 batch_size 提到 16（按 fold 0 数字：351 个 batch、每批 1~2 个阳性、
-      全阴性 0 个）；
-    - 依据首折曲线决定是否调 pos_ratio_target（主要是每批上限）、lr、早停耐心；
+      （单通道实测 bs=2/bs=8 两点外推 ≈ 376 MB/样本 + 4.7 GB → 16 约 10.7 GB；第 4 轮 2.5D 之后
+      以 `--debug` 实测为准，不做外推）；
+    - ~~提高每批阳性数 / 消掉全阴性 batch~~ → **第 4 轮已解决**（平衡采样：bs=16 → 每批 8 正 8 阴、
+      全阴性 batch 0 个）；老口径下"每批 1 个阳性"的成因见 `docs/preprocess_notes.md` 8.2；
+    - 依据首折曲线决定是否调 `data.pos_ratio_train`（0.5 → 0.3 更保守）、`data.max_pos_repeat`、
+      lr、早停耐心；欠检出仍存在时先试 `loss.ce_class_weights=[0.2,1.0]`；
     - 若 512×512 下 batch 上不去：退路是梯度累积（accumulate_grad）或按面内裁剪前景窗口，
       绝不改 spacing、绝不做 resize。
 
@@ -223,3 +270,6 @@ CT 肝脏肿瘤分割 · 基础版（2D 闭环）后续编码计划
    （补边偏移 pad_offset 要一路带到推理，裁回原始尺寸时用它）。
 4. 每折划分、随机种子、指标口径写入产物，保证跨轮可复现。
 5. 代码只写、不本地执行；需要远程执行时先提交再给命令；产物路径一律相对仓库根。
+6. 病人级隔离（第 4 轮强化）：划分按病人；采样器只在本折 train 的切片索引内重排/重复；
+   2.5D 三层窗只在本病例内索引（越界用端点复制）。任何一条被破坏都会让 Dice 虚高，
+   src/selfcheck_data.py 里有对应的硬断言（见 docs/preprocess_notes.md 8.3）。

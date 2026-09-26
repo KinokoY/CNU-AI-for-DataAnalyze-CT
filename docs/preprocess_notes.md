@@ -281,4 +281,132 @@ nibabel **每读一层都把整卷解压一遍**。probe 实测（远程）：
 - `src/train.py` 每轮日志新增 `［取数 x s + 计算 y s］`，第 1 轮若出现
   `数据加载是瓶颈` 的告警，先查缓存格式再调 `num_workers`。
 
-其余待回填：首折前几轮的 train loss 与 val macro Dice、单 epoch 耗时、早停轮数、5 折汇总。
+## 八、第 4 轮（平衡采样 + Dice 只算前景 + 2.5D 三层输入）：修「塌缩到全预测背景」
+
+> 本节是**第 3 轮首折正式训练失败后的复盘与本轮口径**。运行手册见 `docs/baseline.md` 第 4 节，
+> 远程实测数字待用户跑完 `selfcheck_data` / `--debug` / 短跑后回填。
+
+### 8.1 第 3 轮首折的真实曲线：不是「训得不好」，是**塌缩**
+
+用户贴回的 12 轮短跑（`runs/smoke_fold0`，`--set train.epochs=12`，bs=16，351 batch/轮）关键行：
+
+| 现象 | 数值 | 含义 |
+| --- | --- | --- |
+| 训练 `dice` 项 | epoch 10→12 是 0.9287 → 0.8993，12 轮只降 0.03 | dice 项 = `1 − 肿瘤 soft Dice`，也就是肿瘤 soft 概率只有 ~0.10 |
+| 训练 `ce` 项 | 0.0102 → 0.0087 | CE 从 0.0078 涨回 0.0102 又降回去，信噪比极低 |
+| 验证整卷 Dice | `33:0.001 57:0.000 59:0.000 60:0.000`，best 0.0013 | **基本上一个前景体素都没预测** |
+| `--debug` 的 `prob 峰值` | 0.005（第 3 轮） | 整卷最大肿瘤概率 0.5%，离 0.5 阈值差两个数量级 |
+
+**判据**（写进 `docs/baseline.md` 4.2 的判读）：dice 项贴在 0.9 以上横盘而 ce 掉到 0.01 量级
+= 已经在「背景盆地」里；`pred_voxels == 0`（第 4 轮新增的上报量）是它的直接证据。
+
+**根因（三层，按重要性）**：
+
+1. **每批的正向信号被稀释到接近 0（主因）**。老采样器保证「每个阳性层一轮恰好出现一次」，
+   于是一轮 351 个 batch 分 617 个阳性层 ⇒ **每批只有 1~2 个含肿瘤切片**（12%），
+   而这 1~2 层里肿瘤像素只占 0.2%~0.4%。CE 被背景像素彻底支配，dice 项虽然
+   `include_background=false`，但 `batch=True` 是在整批 16 层的并集上聚合的，被 14~15 个
+   全背景切片摊薄。老口径的「过采样倍数」实测只有 **0.87 倍**（`docs/preprocess_notes.md` 6.3
+   里那句"几乎没有重复采样"其实已经预告了今天的结果）。
+2. **阴性采样不给任何"少看背景"的余地**。老口径要求阴性层一轮尽量不重复 ⇒ 一轮必须把
+   3852 个阴性层全部过一遍，batch 数被它顶到 351，比例自然回到自然分布。
+3. **数值带宽**。2 通道 softmax 的判定等价于 `logit_1 − logit_0 ≥ 0`，塌缩时这个差是 −1.9
+   （对应概率 0.13），离判定边界很远，所以验证侧只会看到 0.000 与 0.001 这种数字。
+
+**结论**：管道、划分、轴序都没错（GT 434721 体素那条硬证据早已钉死），错的是**训练分布**
+与**损失对稀有类的有效权重**。
+
+### 8.2 本轮的四个改动
+
+#### (1) `BalancedBatchSampler`：固定预算、改比例（取代 `ProportionalBatchSampler`）
+
+- 每批**恒定** `n_pos` 个含肿瘤层 + `n_neg` 个不含肿瘤层，`n_pos = clamp(round(bs × pos_ratio_train),
+  min_pos_per_batch, bs−1)`；默认 `pos_ratio_train=0.5` ⇒ bs=16 时**每批 8 正 + 8 阴**（旧口径 1~2 正）。
+- 一轮的规模由**槽位预算**决定：`data.epoch_samples` 为 null 时预算 = 数据集切片数
+  ⇒ **epoch 墙钟与旧口径基本不变**，只是比例改了（这是用户拍板的"固定预算、改比例"）。
+- 阳性层用轮转池**重复采样**，重复次数上限 `data.max_pos_repeat`（默认 8）；阴性层不再要求
+  一轮覆盖（覆盖率会掉到 30%~40%，日志显式打印）。**阴性池也会被重复抽**是预期行为。
+- 比例被重复上限卡住、或阳性层太少撑不起下限时，实际值可能与目标不同 —— 这两种情况都会
+  在 `describe()` 与 `--debug`/训练日志里显式说明（`repeat_capped` / `pool_limited`）。
+- **不变的两条**：① 每个 batch 都含阳性（不再有"全阴性 batch 数为下界"这类讨论）；
+  ② 采样顺序仍只由 `(train.seed, epoch, 病例集合)` 派生，同 epoch 可复现、相邻 epoch 不同，
+  `--resume` 仍用 `set_epoch(已完成轮数)` 接上。
+
+#### (2) 损失：`loss.dice_positive_only: true`
+
+Dice 项**只在 `Y.sum()>0` 的样本上聚合**（`batch=true` 时先按样本掩码筛出含前景的切片再算
+交集/并集），全背景样本不参与 Dice；**CE 仍然对整批所有样本计算**（背景那一半负责压假阳性，
+不能一起丢掉）。一个 batch 里一个前景样本都没有时 dice 项记 0 而不是 NaN。
+这与用户方案的「BCE 全体 + Dice 只对有前景样本」是同一件事，只是我们的 CE 是 softmax 口径。
+
+#### (3) 2.5D 三层输入：`data.z_context=1` → `model.in_channels=3`
+
+- 一个样本 = `[z−1, z, z+1]` 三层叠成通道维，标签恒取**中心层 z**；默认 `in_channels=3`。
+- **端点复制**（`window_index`）：`z=0` 的窗口是 `[0,0,1]`、`z=nz−1` 是 `[nz−2,nz−1,nz−1]`，
+  **绝不跨病人取层**（相邻病人之间没有空间连续性）。
+- **执行顺序（关键，别调换）**：中心层先补边 → **只对中心层做增强** → 再把增强后的中心层与
+  **未增强的**邻居层叠成 `(3,H,W)`。所以：
+  * 几何增强天然对所有通道同步（它们共享同一个增强后的中心层 + 真实邻居层）；
+  * gamma / 高斯噪声从定义上只动**被监督的那一层**，上下文保持真实灰度（自检会逐像素
+    比对上下文通道与「相邻层单独读取」的结果）；
+  * `z_context=0` 时叠层退化成"加一个长度为 1 的通道维"，与旧口径逐位一致 ——
+    切换开关不需要两套增强代码。
+- 整卷推理 `predict_volume` **一行都没改**：它逐层调 `dataset[i]`，dataset 给几个通道就喂几个
+  通道（"读盘口径只有一份"的好处）。`meta` 里新增 `in_channels` / `z_context` 便于核对。
+- 配置自洽在**两处**校验：`unet.UNet2D.__init__`（`in_channels == 2×z_context+1`）与
+  `train.check_prerequisites`；`collate_samples(expect_channels=…)` 再兜一层。
+
+#### (4) 验证侧补齐 IoU / 精确率 / 召回率 / 塌缩指标
+
+- **验证侧完全不动分布**：val loader 仍顺序读、保持原始 ~10% 阳性（不做任何平衡采样）。
+- 每轮整卷验证新增：`IoU`、`Precision`、`Recall`（同一 `eval.threshold`）、
+  `pred_voxels_total`、`prob_peak_max`；`metrics.csv` **只在末尾追加列**
+  （`val_iou_mean / val_precision_mean / val_recall_mean / val_pred_voxels / val_prob_peak`），
+  第 4 轮的 `evaluate.py` 读旧 csv 也不会炸。
+- 预测为空时 `precision` 记 **0.0 并标 `precision_defined=False`**：数学上未定义时记 1.0 会让
+  日志看起来"完美"，而 recall 是 0 —— 第 3 轮首折就是这么骗过眼睛的。
+- 日志新增一句塌缩告警：`本轮验证**一个前景体素都没预测**`。
+
+#### (5) 顺带修掉的一处日志错位
+
+`train.py` 原来**先 `scheduler.step()` 再打印 lr**，日志里的 `lr` 是"下一轮将要用的值"而不是
+本轮实际用的值（`docs/baseline.md` 4.2 的示例日志一直有这个偏差）。现在改成**先取本轮 lr、
+再 step**，日志与 TensorBoard 记录的 `train/lr` 就是真正作用于本轮权重更新的那个值。
+
+### 8.3 病人级隔离（用户特别强调，本轮的所有改动都没有放松它）
+
+- 样本单位仍是 `(case, z)`，`case` 只能来自本折 `train` / `val` 列表（`splits.json` 的
+  `split_level: "patient"`）；平衡采样器只对切片索引做**重排与重复**，抽不到本折 train 以外的病例。
+- `src/selfcheck_data.py` 的采样器自检新增一条硬断言：**一轮抽到的病例集合必须 ⊆ 本折 train**。
+- 2.5D 窗口自检（`check_slice_window`）另外钉三件事：窗口层号全在 `[0, nz−1]` 内、
+  中心通道逐像素等于「该 (case,z) 单独读一层」、上下文通道逐像素等于「同一病人相邻层」。
+
+### 8.4 本轮**不做**的事（避免误读）
+
+- 不改 `lr` / 调度器：第 3 轮的塌缩不是 lr 造成的，先换采样与损失口径；`train.lr` 与
+  `train.min_lr_ratio` 留在配置里，等新口径的曲线出来再定（这是用户拍板的"暂不改值"）。
+- 不启用 `loss.ce_class_weights`（默认仍 `null`）：它是**下一级杠杆**，只在"平衡采样 +
+  `dice_positive_only` 之后 dice 项仍长期横盘"时才启用；临时试：`--set loss.ce_class_weights=[0.2,1.0]`。
+- 仍不做补边区域 ignore mask（`orig_hw` + `pad_offset` 那套留到需要时再说）。
+- `train.pos_ratio_target` 自本轮起**不再生效**（保留键只为兼容旧命令与旧 checkpoint 指纹；
+  采样器构造时会打印一行"不再生效"的提示）。
+
+### 8.5 本地离线自检（`_selftest.py`，168 项断言）
+
+第 4 轮新增/改写的断言（本地已全部通过，运行 `python _selftest.py`）：
+
+- 平衡采样器：每批阳性数 = 计划定值、batch 大小恒定、阳性重复 ≤ `max_pos_repeat`、
+  同 epoch 可复现 / 相邻 epoch 不同、抽到的病例 ⊆ 数据集病例；
+- `plan_balanced_slots` 纯函数：真实量级（P=617/bs=16 → 280 batch、8 正 8 阴、重复 3.63 次）、
+  重复上限卡住比例、阳性极少时 batch 数被压回、全阴性数据集退化、`pool_limited`；
+- 2.5D：`window_index` 的端点复制与越界报错、`z_context=1/2` 的通道数与窗口、
+  中心通道 = 单层读取、上下文通道 = 相邻层单独读取、增强后形状与"上下文未被强度增强改动"；
+- `collate_samples(expect_channels=…)` 的通道数校验；旧 `ProportionalBatchSampler` 已删除。
+
+**注意**：本地自检用的是假 torch / 假 nibabel / 自造的小假数据，只验证**逻辑与形状口径**；
+真实数据上的行为一律以远程 `python -m src.selfcheck_data` → `--debug` → 短跑 为准。
+
+其余待回填（第 4 轮远程跑完后）：平衡采样后的每批阳性数实测、2.5D 的显存/单步耗时、
+新口径下首折前几轮的 dice 项与 val macro Dice、`pred_voxels` / `prob_peak` 是否脱离 0、
+早停轮数、5 折汇总。
+

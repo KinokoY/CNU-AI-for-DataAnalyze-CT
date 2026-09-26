@@ -1,25 +1,38 @@
-"""数据集与采样：按病例切片读 cache、统一补边到固定尺寸、定向过采样肿瘤切片，并施加自实现的 2D 增强。
+"""数据集与采样：按病例切片读 cache、2.5D 三层窗、统一补边到固定尺寸、**平衡采样**，并施加自实现的 2D 增强。
 
 整体功能：
-    1. ``CTSliceDataset`` —— 一个样本 = 一个病人的一层切片。``__init__`` 只读 **label 体素**
+    1. ``CTSliceDataset`` —— 一个样本 = 一个病人的一层切片（标签）。``__init__`` 只读 **label 体素**
        （用于算 ``pos_flags`` 与索引），**不读 image 体素**；``__getitem__`` 用每 worker 一份的
-       ``lru_cache`` 持有 nibabel 代理对象（``memmap=True``），只取 ``[:, :, z]`` 这一层，
-       归一化后把 image/label **居中补边到 ``data.target_hw``（默认 512×512）**。
-    2. ``ProportionalBatchSampler`` —— 单一池 + 定向抽样的 ``BatchSampler``：先把含肿瘤切片
-       在整轮 batch 上均摊（每个阳性层一轮恰好出现一次，每批不超过 ``n_pos`` 上限），
-       再用不含肿瘤的切片把每个 batch 补满。因为所有样本补边后都是同一个形状，
-       ``torch.stack`` 恒成立，**不再需要按面内尺寸分桶**。
-    3. ``make_train_loader`` / ``make_val_loader`` —— 训练侧定向采样+增强；验证侧顺序、无增强。
+       ``lru_cache`` 持有 nibabel 代理对象（``memmap=True``），取 **``[z-1, z, z+1]`` 三层**叠成
+       通道维（``data.z_context``，默认 1 → 3 通道 2.5D 输入；标签仍取中心层 z），归一化后把
+       image 与 label **居中补边到 ``data.target_hw``（默认 512×512）**。
+    2. ``BalancedBatchSampler`` —— **正负定比的平衡采样器**：训练侧每批固定 ``n_pos`` 个含肿瘤层 +
+       ``n_neg`` 个不含肿瘤层（由 ``data.pos_ratio_train`` 决定，默认 0.5 即各半），阳性池与阴性池
+       各自轮转（``_CyclicPool``），因此阳性层会被重复采样、阴性层不再要求一轮覆盖。
+       因为所有样本补边后都是同一个形状，``torch.stack`` 恒成立，**不需要按面内尺寸分桶**。
+    3. ``make_train_loader`` / ``make_val_loader`` —— 训练侧平衡采样 + 增强；**验证侧顺序、无增强、
+       保持原始阳性分布**（天然的不平衡分布正是要评估的对象，不能对它做平衡采样）。
     4. ``build_transforms`` —— 仅训练用的 2D 增强：翻转 / 旋转 90° / 仿射 / 随机 gamma / 高斯噪声，
        **全部自己实现，不依赖 MONAI**（原因见 ``make_augment_steps`` 的说明）。
+       2.5D 下：几何增强对**所有通道施加同一套参数**（保持层间几何一致），强度增强只动**中心通道**。
 
 为什么改成「统一补边」而不是「按尺寸分桶」：
     分桶要求同一 batch 内所有人的精确面内尺寸逐像素相同，于是采样器得先选桶再在桶内配额，
     小桶会被摊薄、还会出现大量全阴性 batch。改成统一补边到 512×512（512 是 16 的倍数，
-    U-Net 4 级下采样不再需要内部 pad）之后，batch 形状恒为 ``(B,1,512,512)``，
+    U-Net 4 级下采样不再需要内部 pad）之后，batch 形状恒为 ``(B,C,512,512)``，
     ``pad_multiple`` / ``bucket_key`` 这些概念整条链路都不需要了。
     代价是补边区域的白像素被浪费，且非 512 病例的补边区在增强后不再严格为 0；
-    第 3 轮的 loss 可以考虑忽略补边区域，见 ``pad_to_target`` 的说明。
+    loss 是否忽略补边区域见 ``pad_to_target`` 的说明。
+
+**病人级隔离（不可协商的约束，第 4 轮的平衡采样没有放松它）**：
+    样本单位始终是 ``(case, z)``，而 ``case`` 只能来自本折 ``train`` / ``val`` 列表
+    （``data/splits.json`` 的 ``split_level: "patient"``，5 例仅肝脏只进训练集）。
+    平衡采样器**只对 ``pos_flags`` 的索引做重排与重复，绝不跨越病例边界**：
+      * 阳性池 / 阴性池都是「本折 train 病例的切片索引」的子集；
+      * ``[z-1, z, z+1]`` 三层窗在**本病例内部**索引，边界用端点复制（z=0 → 三层都是第 0 层），
+        不会读到上一个/下一个病人的切片；
+      * ``src/selfcheck_data.py`` 有一条「三层窗同属一个病人、且中心通道等于原单层读取」的
+        回归自检专门钉这件事。
 
 依赖：numpy / torch / nibabel（+ 可选 scipy 的连通域，不在本文件用）。
 前后接口：上游是 ``scripts/preprocess.py`` 产出的 ``cache/image/<case>.nii``（uint16 归一化；
@@ -32,6 +45,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import random
 import sys
 from contextlib import contextmanager
@@ -82,14 +96,22 @@ DEFAULT_TARGET_HW = (512, 512)
 #: 补边时原图放在目标画布里的位置：``center`` = 居中（数据侧默认），``bottom-right`` = 右下补 0。
 DEFAULT_PAD_ALIGN = "center"
 
+#: 2.5D 上下文半径的默认值：1 = 取 [z-1, z, z+1] 三层当 3 通道输入；0 = 退回单层 2D。
+DEFAULT_Z_CONTEXT = 1
+
 DEFAULT_DATA_CFG: dict = {
     "index_cache_size": 8,        # 每 worker 保留的 nibabel 句柄数（lru_cache maxsize）
     "target_hw": list(DEFAULT_TARGET_HW),   # 面内统一补边到的目标尺寸（H, W）
     "pad_align": DEFAULT_PAD_ALIGN,         # center = 居中补边；bottom-right = 右下补 0
+    "z_context": DEFAULT_Z_CONTEXT,         # 2.5D 上下文半径（见 window_index 的端点复制口径）
     "num_workers": 8,
     "pin_memory": True,
     "persistent_workers": False,
     "val_batch_size": None,       # None = 用 train.batch_size；验证是顺序读，只影响速度
+    "pos_ratio_train": 0.5,       # 训练侧平衡采样的一轮阳性槽位占比目标（0.5 = 正负各半）
+    "min_pos_per_batch": 2,       # 每批阳性层数下限（batch 很小时防止比例取整成 0）
+    "max_pos_repeat": 8,          # 单个阳性层一轮最多重复几次
+    "epoch_samples": None,        # 一轮总槽位数预算；None = 用数据集切片数
     "pos_ratio_tolerance": 0.20,  # 自检用：实测比例偏离目标的告警阈值
     "verify_batch": True,         # collate 时校验 batch 不变量（形状/值域/label 取值）
     "augment": {                  # 仅训练；验证侧不做任何几何变换
@@ -241,9 +263,60 @@ def data_config(cfg: dict) -> dict:
     if align not in ("center", "bottom-right", "right-bottom", "br"):
         raise ValueError(f"data.pad_align 只支持 'center' / 'bottom-right'，收到 {merged.get('pad_align')!r}")
     merged["pad_align"] = "bottom-right" if align in ("bottom-right", "right-bottom", "br") else "center"
-    merged["target_hw"] = list(resolve_target_hw({"data": {"target_hw": merged.get("target_hw")},
-                                                  "model": (cfg or {}).get("model") or {}}))
+    aligned = resolve_target_hw({"data": {"target_hw": merged.get("target_hw")},
+                                 "model": (cfg or {}).get("model") or {}})
+    merged["target_hw"] = list(aligned)
+    merged["z_context"] = resolve_z_context(merged)
+    ratio = float(merged.get("pos_ratio_train", 0.5))
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError(f"data.pos_ratio_train 必须落在 [0,1]，收到 {merged.get('pos_ratio_train')!r}")
+    if int(merged.get("min_pos_per_batch", 2)) < 1:
+        raise ValueError(f"data.min_pos_per_batch 必须 >= 1，收到 {merged.get('min_pos_per_batch')!r}")
+    if int(merged.get("max_pos_repeat", 8)) < 1:
+        raise ValueError(f"data.max_pos_repeat 必须 >= 1，收到 {merged.get('max_pos_repeat')!r}")
     return merged
+
+
+def resolve_z_context(data_cfg: dict | None = None) -> int:
+    """取 2.5D 上下文半径（``data.z_context``），负数直接报错。
+
+    半径 r 表示一个样本 = 中心层 z 加上左右各 r 层，叠成 ``2r+1`` 个通道；``r=0`` 就是旧的单层 2D。
+    这个值**同时决定 dataset 的输出通道数与 ``model.in_channels``**，两处必须一致——
+    ``window_channels`` / ``src.train.check_prerequisites`` 会分别校验。
+    """
+    value = int(((data_cfg or {}).get("z_context", DEFAULT_Z_CONTEXT)) or 0)
+    if value < 0:
+        raise ValueError(f"data.z_context 不能为负，收到 {value}")
+    return value
+
+
+def window_channels(z_context: int) -> int:
+    """2.5D 窗口的通道数 = ``2 × z_context + 1``（r=1 → 3 通道，r=0 → 1 通道）。"""
+    return 2 * int(z_context) + 1
+
+
+def window_index(z: int, n_slices: int, z_context: int) -> list:
+    """返回中心层 ``z`` 的 2.5D 窗口在**同一病例内**的层号列表，长度 ``2r+1``。
+
+    口径（**病人级隔离在这里落地**）：
+      * 只做**端点复制**：``z=0`` 时左邻取 0（三层都是第 0 层），``z=nz-1`` 时右邻取 ``nz-1``；
+      * **绝不跨病人**：越界时复制本病例的端点层，而不是去读上一个/下一个 case 的切片
+        （相邻病人之间没有任何空间连续性，跨过去就是把别的病人的解剖当上下文）；
+      * 不做 z 方向插值、不做整卷 padding 后索引：``nz`` 各例不同（74–488），端点复制是唯一
+        与病例边界无关的确定性口径。
+
+    例：``z=0, nz=135, r=1 → [0, 0, 1]``；``z=134 → [133, 134, 134]``；``z=5 → [4, 5, 6]``。
+    """
+    z = int(z)
+    n_slices = int(n_slices)
+    radius = int(z_context)
+    if n_slices < 1:
+        raise ValueError(f"n_slices 必须 >= 1，收到 {n_slices}")
+    if not 0 <= z < n_slices:
+        raise ValueError(f"z={z} 超出 [0, {n_slices - 1}]（样本索引必须落在本病例内）")
+    if radius <= 0:
+        return [z]
+    return [min(max(z + delta, 0), n_slices - 1) for delta in range(-radius, radius + 1)]
 
 
 def stable_seed(*parts: Any) -> int:
@@ -414,15 +487,46 @@ class GridAffine2D:
         return out
 
     def warp(self, array: np.ndarray, mode: str = "bilinear") -> np.ndarray:
-        """对 ``(H, W)`` 数组做一次仿射采样，返回同形状 float32 数组。"""
+        """对 ``(H, W)`` 或 ``(C, H, W)`` 数组做一次仿射采样，返回同形状 float32 数组。
+
+        ``C>1``（2.5D 三层窗）时所有通道共用**同一个**采样网格 ⇒ 层与层之间的几何关系不会被
+        各通道独立的随机变换破坏（这一点是 2.5D 的正确性前提：如果三个通道各转一个角度，
+        模型看到的就是「三张对不齐的切片」，学到的层间上下文是假的）。
+        """
         src = np.asarray(array, dtype=np.float32)
-        if src.ndim != 2:
-            raise ValueError(f"GridAffine2D 只接受 (H,W) 切片数组，收到 shape={src.shape}")
-        height, width = int(src.shape[0]), int(src.shape[1])
-        tensor = torch.from_numpy(np.ascontiguousarray(src))[None, None]  # (1, 1, H, W)
-        grid = self.grid(height, width)
+        if src.ndim == 2:
+            src = src[None]                       # (H,W) → (1,H,W)
+        if src.ndim != 3:
+            raise ValueError(f"GridAffine2D 只接受 (H,W) 或 (C,H,W) 数组，收到 shape={src.shape}")
+        height, width = int(src.shape[1]), int(src.shape[2])
+        tensor = torch.from_numpy(np.ascontiguousarray(src))[None]   # (1, C, H, W)
+        grid = self.grid(height, width)                              # (1, H, W, 2)
         out = F.grid_sample(tensor, grid, mode=mode, padding_mode="zeros", align_corners=True)
-        return out[0, 0].numpy().astype(np.float32, copy=False)
+        squeezed = out[0].numpy().astype(np.float32, copy=False)
+        return squeezed[0] if np.asarray(array).ndim == 2 else squeezed
+
+
+def _is_multi_channel(image: np.ndarray, z_context: int) -> bool:
+    """判断一块 image 是不是 2.5D 的 ``(C,H,W)``。
+
+    **必须同时看形状与 ``z_context``**：单层 2D 时 image 的形状恰好是 ``(1,H,W)``，
+    只按 ``ndim==3`` 判断会把它误当成「1 个通道的多通道块」，进而把整形操作写歪
+    （本地自检就抓到过一次：``z_context=0`` 时把 image 当成 3D 处理，label 被当成通道）。
+    """
+    array = np.asarray(image)
+    return bool(int(z_context) > 0 and array.ndim == 3 and int(array.shape[0]) == 2 * int(z_context) + 1)
+
+
+def _center_channel(image: np.ndarray) -> np.ndarray:
+    """取 ``(C,H,W)`` 的中心通道（``(H,W)``）；单通道输入原样返回。
+
+    ``C`` 一定是奇数（``2×z_context+1``），中心下标就是 ``C//2``：对 3 通道就是第 1 个通道
+    （即层 z），这正是标签所在的层。写死 ``[1]`` 会在 ``z_context≠1`` 时静默取错层。
+    """
+    array = np.asarray(image)
+    if array.ndim != 3:
+        return array
+    return array[int(array.shape[0]) // 2]
 
 
 def _rand_affine(rng: random.Random, aug: dict) -> GridAffine2D:
@@ -545,7 +649,8 @@ class GammaSlice2D:
     这是「随机直方图/对比度扰动」的最简形式（MONAI 的 ``RandHistogramShift`` 用控制点做分段线性
     映射，本质也是单调的强度重排）。要求输入已经是 ``[0,1]``，否则幂运算会发散——预处理后的
     cache 正好是 ``[0,1]``，所以这里直接乘幂即可，且**保序**（不会把亮暗关系翻转）。
-    只作用于 image。
+    只作用于 image；**输入恒为 2D 的 ``(H,W)``**（2.5D 的上下文通道不在本步骤里，
+    见 ``CTSliceDataset.__getitem__`` 的口径说明）。
     """
 
     def __init__(self, prob: float = 0.2, gamma_range: Sequence[float] = (0.75, 1.33),
@@ -578,7 +683,7 @@ class GaussianNoiseSlice2D:
     ``std`` 是噪声强度的**上界**：每次从 ``U(0, std)`` 抽一个 ``sigma``（与 MONAI 的
     ``sample_std=True`` 默认行为一致），这样噪声强度本身也随机。为了可复现，用的是
     ``random.Random`` 抽 sigma、``np.random.default_rng(seed)`` 抽噪声（种子由同一个 rng 派生）。
-    只作用于 image，最后夹回 ``[0,1]``。
+    只作用于 image，最后夹回 ``[0,1]``；**输入恒为 2D 的 ``(H,W)``**（同 ``GammaSlice2D``）。
     """
 
     def __init__(self, prob: float = 0.2, std: float = 0.01, keys: Sequence[str] = ("image",),
@@ -618,7 +723,11 @@ class ClampImageToUnit:
 
 
 class BinarizeLabel:
-    """把 label 重新二值化：最近邻插值在边界上可能取到非 0/1 的值。"""
+    """把 label 重新二值化：最近邻插值在边界上可能取到非 0/1 的值。
+
+    **只碰 label**：绝不能写成 ``out["image"] = (image > 0.5)`` —— 那会把 image 也二值化
+    （历史兜底写法在这一层很容易被复制粘贴进来，所以这里显式分开写）。
+    """
 
     def __call__(self, data: dict) -> dict:
         if "label" not in data:
@@ -647,6 +756,13 @@ def make_augment_steps(cfg: dict, seed: int | None = None) -> list:
     只做面内变换、不做弹性形变：逐层独立施加形变会破坏 z 方向一致性（同一病人的相邻层被施以
     不同形变，病灶边界会抖），而逐层形变本身对 2D 基线没有收益。
 
+    **谁负责 2.5D 的通道一致性**：增强流水线本身**只吃 2D 的 ``(H,W)``**（``CTSliceDataset.__getitem__``
+    先对中心层做增强、再叠上未增强的邻居层）。因此这里没有"多通道分支"：
+      * 几何增强天然对所有通道同步（它们共享同一个增强后的中心层 + 真实邻居层）；
+      * 强度增强（4）只作用于被监督的中心层，相邻层保持真实灰度，不会被 gamma/噪声改成
+        「与中心层不一致的伪影」；
+      * label 始终是 ``(H,W)`` 的中心层掩膜，**不带通道维**——``BinarizeLabel`` 只碰 label。
+
     ``seed`` 为 None 时用 ``train.seed``；同一个 seed 得到同一串增强参数（但每个样本的随机数
     仍按抽样顺序推进，因此各样本的增强互不相同）。
     """
@@ -654,7 +770,7 @@ def make_augment_steps(cfg: dict, seed: int | None = None) -> list:
     if seed is None:
         seed = int(((cfg or {}).get("train") or {}).get("seed", 42))
     rng = random.Random(int(seed) + 104729)   # 与采样器的种子错开一个素数
-    keys = ("image", "label")                 # 几何增强同步作用于两者
+    keys = ("image", "label")                 # 几何增强同步作用于两者（多通道时一次作用到整块）
     img_only = ("image",)
 
     return [
@@ -738,6 +854,9 @@ class CTSliceDataset(Dataset):
         self.target_hw = tuple(int(v) for v in self.data_cfg.get("target_hw", DEFAULT_TARGET_HW))
         self.pad_align = str(self.data_cfg.get("pad_align", DEFAULT_PAD_ALIGN))
         self.index_cache_size = int(self.data_cfg.get("index_cache_size", 8))
+        # 2.5D：z_context=1 → 每个样本取 [z-1, z, z+1] 三层，输出通道数 = 3
+        self.z_context = resolve_z_context(self.data_cfg)
+        self.in_channels = window_channels(self.z_context)
         # 注意：下面两个目录只用来「拼路径给人看」；真正取文件一律走 src.utils.cache_file
         # （.nii 优先、兼容 .nii.gz）或本类的 image_path()/label_path()，
         # 不要再写 f"{case}.nii.gz" 这种把扩展名写死的拼接。
@@ -964,46 +1083,118 @@ class CTSliceDataset(Dataset):
         out = (out - hu_lo) / max(1e-6, hu_hi - hu_lo)
         return np.clip(out, 0.0, 1.0)
 
+    def sliding_window(self, case: int, i: int) -> dict:
+        """返回样本 ``i`` 的 2.5D 窗口信息（层号、是否端点复制），**不读影像**。
+
+        供自检脚本核对「三层窗只在本病例内索引」这条病人级隔离约束：``z_first`` / ``z_last``
+        与 ``clamped`` 一起就能证明越界时是复制本病例端点、而不是去读邻居病例的切片。
+        """
+        case = int(case)
+        z = int(self.index[i][1])
+        nz = int(self.case_n_slices[case])
+        window = window_index(z, nz, self.z_context)
+        return {
+            "case": case,
+            "index": int(i),
+            "z": z,
+            "nz": nz,
+            "window": [int(v) for v in window],
+            "z_first": int(window[0]),
+            "z_last": int(window[-1]),
+            "clamped": bool(window[0] != z - self.z_context or window[-1] != z + self.z_context),
+        }
+
+    def window_planes(self, case: int, z: int) -> np.ndarray:
+        """读一层 → ``/65535`` 还原 [0,1] → 居中补边，返回 ``(H,W) float32``（未增强）。
+
+        自检脚本用它取「某个邻居层单独读出来的样子」，与 ``__getitem__`` 里窗口通道逐像素比对；
+        ``__getitem__`` 叠邻居层时也调用它（口径只有这一处，不会分叉）。
+        """
+        case = int(case)
+        z = int(z)
+        image_path = self.case_paths[case][0]
+        nz = int(self.case_n_slices[case])
+        if not 0 <= z < nz:
+            raise ValueError(f"case {case} 的第 {z} 层越界（nz={nz}）")
+        image_proxy = np.asanyarray(_open_nii(str(image_path)).dataobj)
+        plane = np.ascontiguousarray(self._to_unit_range(image_proxy[:, :, z]))
+        padded, _ = pad_to_target(plane, self.target_hw, self.pad_align)
+        return np.ascontiguousarray(padded, dtype=np.float32)
+
     def __getitem__(self, i: int) -> dict:
+        """取一个样本：``(C, target_h, target_w)`` 的 2.5D 窗口 + ``(target_h, target_w)`` 的中心层标签。
+
+        ``C = 2×data.z_context+1``（默认 3 = ``[z-1, z, z+1]``；``z_context=0`` 时 C=1 = 旧口径）。
+
+        **执行顺序（这个顺序是有讲究的，别调换）**：
+          1. 读中心层 z 的影像与标签 → ``/65535`` 还原 [0,1] / 二值化 → **居中补边**到 target_hw；
+          2. 增强流水线只吃**中心层的 2D 平面**（``(H,W)`` image + ``(H,W)`` label）：几何增强
+             （翻转/旋转/仿射）与强度增强（gamma/噪声）都按原口径作用在这一层上；
+          3. 把增强后的中心层与**未增强的** ``z±r`` 邻居层叠成 ``(C,H,W)`` 通道维，邻居层在本病例
+             内索引（越界用端点复制，见 ``window_index``）。
+
+        为什么先把增强做完再叠层（而不是把 ``(C,H,W)`` 整块交给增强）：
+          * 强度增强（gamma / 高斯噪声）从定义上只该改**被监督的那一层** —— 相邻层是真实的解剖
+            上下文，跟中心层一起提亮/加噪等于手工制造「上下文与中心层不一致」的伪影；
+          * 几何增强天然只作用在中心层上，再由步骤 3 的叠层保证**所有通道共享同一套几何**
+            （把增强后的中心层铺到每个通道是 2.5D 最简、最不容易写歪的做法：不存在"三通道被
+            不同角度旋转"的可能，也不必给每个增强步骤加通道维分支）；
+          * 单层 2D（``z_context=0``）时步骤 3 就是加一个长度为 1 的通道维，与旧口径逐位一致
+            （``(1,H,W)``），所以切换 ``z_context`` 不需要两套增强代码。
+        """
         case, z = self.index[i]
         image_path, label_path = self.case_paths[case]
-        # 只取第 z 层：a[:, :, z] 的形状是 (ny, nx) = (H, W)，与 case_hw 记录的一致。
-        # 未压缩 .nii 走 mmap，这一句是页缓存读；.nii.gz 会整卷解压（见 src.utils.cache_file 的说明）
-        image = np.asanyarray(_open_nii(str(image_path)).dataobj)[:, :, z]
-        label = np.asanyarray(_open_nii(str(label_path)).dataobj)[:, :, z]
+        image_proxy = np.asanyarray(_open_nii(str(image_path)).dataobj)
+        label_proxy = np.asanyarray(_open_nii(str(label_path)).dataobj)
 
-        # 先归一化，再补边（uint16 的 0 就是窗下界，补边补 0 与「背景」同值）
-        image = np.ascontiguousarray(self._to_unit_range(image))
-        label = np.ascontiguousarray((np.asarray(label) > 0).astype(np.uint8))
-
-        # 统一补边：所有样本出来都是 target_hw，torch.stack 永远合法（不再需要分桶）
-        image, offset = pad_to_target(image, self.target_hw, self.pad_align)
+        # 1) 中心层：a[:, :, z] 的形状是 (ny, nx) = (H, W)（未压缩 .nii 走 mmap，是页缓存读）
+        plane = np.ascontiguousarray(self._to_unit_range(image_proxy[:, :, z]))
+        label = np.ascontiguousarray((np.asarray(label_proxy[:, :, z]) > 0).astype(np.uint8))
+        plane, offset = pad_to_target(plane, self.target_hw, self.pad_align)
         label, label_offset = pad_to_target(label, self.target_hw, self.pad_align)
-        if offset != label_offset:
+        if tuple(offset) != tuple(label_offset):
             raise RuntimeError(f"case {case} z={z}：image 与 label 的补边偏移不一致 "
-                               f"{offset} vs {label_offset}")
+                               f"{tuple(offset)} vs {tuple(label_offset)}")
 
+        # 2) 只对中心层做增强（输入恒为 2D，与旧口径一致）
         if self.transforms is not None:
-            out = self.transforms({"image": image, "label": label})
-            image = np.ascontiguousarray(np.asarray(out["image"], dtype=np.float32))
+            out = self.transforms({"image": np.asarray(plane, dtype=np.float32), "label": label})
+            plane = np.ascontiguousarray(np.asarray(out["image"], dtype=np.float32))
             label = np.ascontiguousarray(np.asarray(out["label"]).astype(np.uint8))
-            if image.ndim == 3 and image.shape[0] == 1:   # 兜底：万一某步加了通道维
-                image = image[0]
-            if label.ndim == 3 and label.shape[0] == 1:
+            if label.ndim == 3 and label.shape[0] == 1:   # 兜底：万一某步给 label 加了通道维
                 label = label[0]
-            if image.shape != label.shape:
-                raise RuntimeError(f"增强后 image/label 形状不一致：{image.shape} vs {label.shape}")
+            if plane.ndim != 2 or tuple(plane.shape) != tuple(label.shape):
+                raise RuntimeError(f"增强后 image {tuple(plane.shape)} 与 label "
+                                   f"{tuple(label.shape)} 形状不一致（应都是 2D (H,W)）")
 
-        height, width = (int(s) for s in image.shape)
+        # 3) 叠 2.5D 窗口：中心层用增强后的，邻居层用未增强的真实切片（同一病例内索引）
+        nz = int(self.case_n_slices[case])
+        window = window_index(z, nz, self.z_context)
+        if self.in_channels == 1:
+            image = plane[None]                                     # (1, H, W)
+        else:
+            planes = []
+            for zz in window:
+                planes.append(plane if int(zz) == int(z) else self.window_planes(case, int(zz)))
+            image = np.stack(planes, axis=0)                        # (C, H, W)
+            image = np.clip(image, 0.0, 1.0)                        # 邻居是 [0,1]；中心层可能被增强推到界外
+
+        height, width = (int(image.shape[1]), int(image.shape[2]))
         if (height, width) != tuple(self.target_hw):
             raise RuntimeError(f"case {case} z={z}：补边/增强后切片形状 {(height, width)} 不是 "
                                f"data.target_hw {tuple(self.target_hw)}（补边或增强出了错）")
+        if int(image.shape[0]) != int(self.in_channels):
+            raise RuntimeError(f"case {case} z={z}：窗口通道数 {int(image.shape[0])} != "
+                               f"2×z_context+1 = {self.in_channels}")
         return {
-            "image": torch.from_numpy(image).unsqueeze(0),        # (1, target_h, target_w) float32 ∈ [0,1]
+            # (C, target_h, target_w) float32 ∈ [0,1]；C = 2×z_context+1（默认 3 = [z-1,z,z+1]）
+            "image": torch.from_numpy(np.ascontiguousarray(image, dtype=np.float32)),
             "label": torch.from_numpy(label.astype(np.int64)),    # (target_h, target_w) int64 ∈ {0,1}
             "case": str(case),
             "z": int(z),
+            "window": [int(v) for v in window],                   # 2.5D 三层窗的层号（自检用）
             "orig_hw": (int(self.case_hw[case][0]), int(self.case_hw[case][1])),
+            "pad_offset": (int(offset[0]), int(offset[1])),
         }
 
 
@@ -1011,13 +1202,15 @@ class CTSliceDataset(Dataset):
 # 组 batch（collate）
 # --------------------------------------------------------------------------------------
 
-def collate_samples(samples: Sequence[dict], verify: bool = True) -> dict:
+def collate_samples(samples: Sequence[dict], verify: bool = True,
+                    expect_channels: int | None = None) -> dict:
     """把若干样本拼成一个 batch，并定义**明确的 batch 契约**（训练与自检都按它取值）：
 
-        image      : Tensor (B, 1, 512, 512) float32
-        label      : Tensor (B, 512, 512)    int64 ∈ {0,1}
+        image      : Tensor (B, C, 512, 512) float32；**C = 2×data.z_context+1**（默认 3 = [z-1,z,z+1]）
+        label      : Tensor (B, 512, 512)    int64 ∈ {0,1}（**只监督中心层 z**）
         case       : list[str]，长度 B（每个样本来自哪个病人）
-        z          : list[int]，长度 B（每个样本是第几层）
+        z          : list[int]，长度 B（每个样本的中心层号）
+        window     : list[list[int]]，长度 B（2.5D 三层窗的层号，**全部在本病例内**）
         orig_hw    : list[tuple[int,int]]，长度 B（每个样本**补边前**的面内尺寸）
         pad_offset : list[tuple[int,int]]，长度 B（内容在补边画布里的左上角 (top, left)）
 
@@ -1029,11 +1222,12 @@ def collate_samples(samples: Sequence[dict], verify: bool = True) -> dict:
     ``orig_hw`` / ``pad_offset`` 都是长度 B 的 tuple 列表，含义不再依赖默认行为。
 
     ``verify=True``（默认）时顺带校验 batch 的不变量：所有样本形状一致、
-    ``label`` 取值 ⊂ {0,1}、``image`` 值域 ⊂ [0,1]、张量形状与 ``orig_hw`` 自洽。
+    ``label`` 取值 ⊂ {0,1}、``image`` 值域 ⊂ [0,1]、张量形状与 ``orig_hw`` 自洽、
+    ``image`` 通道数等于 ``expect_channels``（给了才判；由 ``data.z_context`` 推出来）。
     这些校验的开销可以忽略（只是比较几个整数），但能在训练早期抓住「buffered/memmap 复用、
-    增强把尺寸改坏、collate 拼错」这类最难查的问题。
+    增强把尺寸改坏、2.5D 窗口取错层、collate 拼错」这类最难查的问题。
 
-    注意（历史教训）：``image`` 是 ``(B,1,H,W)``、``label`` 是 ``(B,H,W)``，
+    注意（历史教训）：``image`` 是 ``(B,C,H,W)``、``label`` 是 ``(B,H,W)``，
     **比较空间维时要错开一个通道维**（``image.shape[2:]`` vs ``label.shape[1:]``），
     写成 ``label.shape[2:]`` 会得到空 tuple 而恒真/恒假。
     """
@@ -1051,6 +1245,7 @@ def collate_samples(samples: Sequence[dict], verify: bool = True) -> dict:
         "label": label,
         "case": [str(s["case"]) for s in samples],
         "z": [int(s["z"]) for s in samples],
+        "window": [[int(v) for v in s.get("window", [s["z"]])] for s in samples],
         "orig_hw": [(int(s["orig_hw"][0]), int(s["orig_hw"][1])) for s in samples],
         # 补边偏移不在样本里携带，而是由 orig_hw + 张量形状**当场推导**：
         # 这样它一定与 batch 的形状自洽（样本里再存一份就有写歪的可能）。
@@ -1059,7 +1254,10 @@ def collate_samples(samples: Sequence[dict], verify: bool = True) -> dict:
     if verify:
         if tuple(label.shape[1:]) != (height, width):
             raise RuntimeError(f"batch 内 image {tuple(image.shape)} 与 label {tuple(label.shape)} 尺寸不符"
-                               f"（注意 image 是 (B,1,H,W)、label 是 (B,H,W)，比较时要错开通道维）")
+                               f"（注意 image 是 (B,C,H,W)、label 是 (B,H,W)，比较时要错开通道维）")
+        if expect_channels is not None and int(image.shape[1]) != int(expect_channels):
+            raise RuntimeError(f"batch 内 image 通道数是 {int(image.shape[1])}，与 data.z_context 推出的 "
+                               f"{int(expect_channels)} 不一致（2.5D 窗口或 model.in_channels 配错了）")
         if any(hw[0] > height or hw[1] > width for hw in batch["orig_hw"]):
             raise RuntimeError(f"batch 内样本的 orig_hw 超过张量形状 {(height, width)}："
                                f"{batch['orig_hw']}（补边只能放大，不能缩小）")
@@ -1118,173 +1316,243 @@ class _CyclicPool:
             return []
         if k > len(self._items):
             LOGGER.error("池内样本不足：需要 %d 个，池里只有 %d 个（本轮会有重复；"
-                         "请检查 batch_size/pos_ratio_target 与数据集规模是否匹配）", k, len(self._items))
+                         "请检查 batch_size 与 data.pos_ratio_train 是否与数据集规模匹配）",
+                         k, len(self._items))
         return [self._pop_unseen() for _ in range(k)]
 
 
-class ProportionalBatchSampler(BatchSampler):
-    """「单一池 + batch 内阳性比例」的采样器（不是 torch 自带的任何一种）。
+# --------------------------------------------------------------------------------------
+# 平衡采样（BalancedBatchSampler）
+# --------------------------------------------------------------------------------------
 
-    每个 batch 的构造：
-      1. 先把 ``P`` 个含肿瘤层在 ``B`` 个 batch 上**尽量均摊**，得到每批的阳性数
-         ``第 q 批 = ceil(P*q/B) - ceil(P*(q-1)/B)``，每批再按 ``n_pos`` 封顶；
-      2. 阴性层把每个 batch 补满到 ``batch_size``。
+def slice_usage(drawn: Sequence[int]) -> tuple:
+    """统计一串样本索引的重复情况，返回 ``(最小出现次数, 最大出现次数)``。
 
-    为什么均摊而不是「每个 batch 恒取 ``pos_ratio_target``」：那样每批要 2 个阳性，
-    而整个训练集只有 12–14% 的阳性层，硬凑就要把 batch 数放大到「阴性层一个都别重复」的程度，
-    反而制造出上百个**全阴性** batch（旧的分桶实现在远程跑出过 566 个 batch / 117 个全阴性，
-    基线口径见 docs/baseline.md）。改成「阳性总数在整轮均摊 + 阴性补满」之后，
-    每个阳性层在一轮里**恰好出现一次**，也不会为了凑比例而丢弃阴性层。
+    用途：自检里核对「阳性层重复上限」「阴性层覆盖率」这两条新口径——
+    旧的均摊采样器保证的是「每个阳性层恰好一次」，平衡采样器改成了「重复但不超过上限」。
+    """
+    indices = [int(v) for v in drawn]
+    if not indices:
+        return 0, 0
+    counts: dict = {}
+    for value in indices:
+        counts[value] = counts.get(value, 0) + 1
+    values = list(counts.values())
+    return int(min(values)), int(max(values))
 
-    ``pos_ratio_target`` 只是**每批阳性数的上限**，不是每批的实际比例：一轮的阳性层总数是固定的
-    （``P``），摊到 ``B`` 个 batch 上每批就是 ``P/B`` 个。fold 0 实测 ``P=617, B=642``
-    → 每批实际 1 个（不是上限 2 个），所以「提高每批阳性数」要靠加大 ``batch_size``。
 
-    保证（自检脚本逐条验证）：
-      * batch 大小恒为 ``batch_size``（池子够大时），形状恒为 ``(B,1,512,512)``；
-      * 一轮 epoch 内**每一层切片至少出现一次**（阳性层恰好一次、无重复）；
+def plan_balanced_slots(n_pos_slices: int, n_neg_slices: int, batch_size: int,
+                        pos_ratio: float = 0.5, min_pos_per_batch: int = 2,
+                        max_pos_repeat: int = 8, epoch_samples: int | None = None) -> dict:
+    """算「一轮 epoch 的槽位计划」：每批几个阳性/阴性、一共几个 batch。
+
+    口径（**固定预算、改比例**，第 4 轮拍板）：
+      1. 每批阳性数 ``n_pos = clamp(round(batch_size × pos_ratio), min_pos_per_batch, batch_size-1)``，
+         每批阴性数 ``n_neg = batch_size - n_pos``。**每批比例是恒定的**（不像旧口径那样只是"上限"）。
+      2. 预算 ``S``：``epoch_samples`` 给了就用它，否则用**数据集切片数**（≈ 旧口径的一轮样本量，
+         epoch 墙钟基本不变）。
+      3. 阳性槽位总数 ``= min(round(S × pos_ratio), n_pos_slices × max_pos_repeat)``。
+         第二项是**重复上限**：阳性层只有 ``n_pos_slices`` 个，比例要得越高就得把同一层反复喂进去，
+         上限防止过拟合到少数层。上限真的卡住时比例会低于目标（日志会显式打印）。
+      4. ``B = max(ceil(阳性槽位 / n_pos), ceil(阴性槽位 / n_neg))``，再取 ``max(1, ...)``；
+         总槽位 ``= B × batch_size``。
+      5. 兜底：``n_pos_slices == 0``（理论上不该发生，验证侧才可能）时退化成「全部阴性」；
+         阳性层太少、连"每批一个"都填不满时把 ``n_pos`` 压到能在 ``B`` 个 batch 里摊开的程度，
+         并置 ``pool_limited=True``（自检会按它放宽阳性数断言，不误报）。
+
+    返回的全部是**计划值**（不含随机性），自检可以拿它逐条等号比对。
+    """
+    n_pos_slices = int(n_pos_slices)
+    n_neg_slices = int(n_neg_slices)
+    batch_size = int(batch_size)
+    if batch_size < 2:
+        raise ValueError(f"batch_size 必须 >= 2（要同时放正负样本），收到 {batch_size}")
+    if not 0.0 <= float(pos_ratio) <= 1.0:
+        raise ValueError(f"pos_ratio 必须落在 [0,1]，收到 {pos_ratio}")
+    budget = int(epoch_samples) if epoch_samples else int(n_pos_slices + n_neg_slices)
+    budget = max(1, budget)
+
+    def clamp_pos(value: int) -> int:
+        return max(1, min(int(value), batch_size - 1))
+
+    n_pos = clamp_pos(int(round(batch_size * float(pos_ratio))))
+    n_neg = batch_size - n_pos
+    pos_slots = min(int(round(budget * float(pos_ratio))), n_pos_slices * int(max_pos_repeat))
+    neg_slots = max(0, int(round(budget * (1.0 - float(pos_ratio)))))
+    by_pos = int(math.ceil(pos_slots / n_pos)) if pos_slots > 0 else 0
+    by_neg = int(math.ceil(neg_slots / n_neg)) if (neg_slots > 0 and n_neg > 0) else 0
+    batches = max(1, by_pos, by_neg)
+    # 阳性层的"预算上限"（pos_slots = min(以比例算出的需求, P×max_pos_repeat)）**可能低于批数**：
+    # 那就把批数压到阳性能支撑的水平，保证「每个 batch 至少一个阳性层」——这是平衡采样的底线，
+    # 宁可轮短一点（一个 epoch 少跑几批），也不要回到"很多批一个阳性都没有"的旧问题。
+    # 反过来，正数够多时千万不要动批数：批数是被阴性槽位顶上去的，砍掉它会连阴性一起砍，
+    # 比例反而超过目标（本地自检抓到过这个反向错误）。
+    if n_pos_slices > 0 and pos_slots < batches:
+        batches = max(1, pos_slots)
+
+    pool_limited = False
+    if n_pos_slices <= 0:
+        n_pos = 0
+        n_neg = batch_size
+        pool_limited = True
+    elif n_pos_slices * n_pos < batches:
+        # 连「每个 batch 分到一个阳性层」都做不到：把 n_pos 压到 data 能支撑的值
+        n_pos = clamp_pos(max(1, n_pos_slices // batches))
+        n_neg = batch_size - n_pos
+        pool_limited = True
+
+    slots = batches * batch_size
+    # 实际槽位数按「批数 × 每批配比」算，而不是按预算算：阴性槽位可能把 batch 数顶上去，
+    # 于是阳性槽位也跟着变多。这里的数就是 __iter__ 真正会产出的量，文档/日志一律以它为准。
+    pos_total = batches * n_pos
+    neg_total = slots - pos_total
+    # 重复上限的最终裁决：批数已经被阴性槽位定死时，"每批 n_pos 个"仍可能超过 max_pos_repeat，
+    # 此时把每批阳性数压到上限允许的水平（比例随之下降）——否则 max_pos_repeat 只是打印出来好看。
+    repeat_cap = n_pos_slices * int(max_pos_repeat)
+    if n_pos_slices > 0 and pos_total > repeat_cap:
+        n_pos = int(repeat_cap // batches)
+        n_neg = batch_size - n_pos
+        pool_limited = pool_limited or n_pos < int(round(batch_size * float(pos_ratio)))
+        pos_total = batches * n_pos
+        neg_total = slots - pos_total
+    return {
+        "batch_size": batch_size,
+        "n_pos_per_batch": int(n_pos),
+        "n_neg_per_batch": int(n_neg),
+        "batches": int(batches),
+        "slots": int(slots),
+        "pos_slots": int(pos_total),
+        "neg_slots": int(neg_total),
+        "n_pos_slices": n_pos_slices,
+        "n_neg_slices": n_neg_slices,
+        "budget": int(budget),
+        "pos_ratio_target": float(pos_ratio),
+        "pos_repeat": (pos_total / n_pos_slices) if n_pos_slices else 0.0,
+        "neg_coverage": (min(1.0, neg_total / n_neg_slices) if n_neg_slices else 0.0),
+        "actual_pos_ratio": (pos_total / slots) if slots else 0.0,
+        "repeat_capped": bool(n_pos_slices > 0 and pos_total >= repeat_cap and n_pos < batch_size - 1
+                              and pos_total / max(1, n_pos_slices) >= float(max_pos_repeat) - 1e-9),
+        "pool_limited": bool(pool_limited),
+    }
+
+
+class BalancedBatchSampler(BatchSampler):
+    """**正负定比的平衡采样器**（第 4 轮取代旧的 ``ProportionalBatchSampler``）。
+
+    为什么换掉旧口径：旧的 `ProportionalBatchSampler` 保证的是「每个阳性层一轮恰好出现一次 +
+    阴性层尽量不重复」，于是 batch 内的阳性比例被"阳性层总数 / 一轮 batch 数"死死钉住 ——
+    fold 0 上 `bs=16` 实际每批只有 1~2 个阳性（12%），与整体 13.8% 几乎一样，**等于没有过采样**。
+    第 3 轮首折正式训练的结果就是这个代价：`dice` 项长期横盘在 0.90（= 肿瘤 soft Dice≈0.1）、
+    `ce` 掉到 0.009、验证整卷 Dice 恒 ≈0.000 —— 模型塌缩到全预测背景
+    （完整分析见 docs/preprocess_notes.md 7.2 与 8.1）。
+
+    现在的口径（每批比例恒定）：
+      * 每批 ``n_pos`` 个含肿瘤层 + ``n_neg`` 个不含肿瘤层（默认 ``pos_ratio_train=0.5`` → 各半）；
+      * 阳性层池、阴性层池各自用 ``_CyclicPool`` 轮转：**阳性层会被重复采样**
+        （重复次数上限 ``data.max_pos_repeat``），阴性层不再要求一轮覆盖；
+      * 一轮的 batch 数由「槽位预算」算出（见 ``plan_balanced_slots``），
+        默认预算 = 数据集切片数 ⇒ **epoch 墙钟与旧口径基本一致**，只是每批的阳性从 1~2 个变成 ``n_pos`` 个。
+
+    保证（``src/selfcheck_data.py`` 逐条验证）：
+      * 每个 batch 的大小恒为 ``batch_size``，且**阳性层数恰好是 ``n_pos``**（不全阴性 batch）；
+      * 一轮内每个阳性层的出现次数 **<= max_pos_repeat**；
       * 采样顺序只由 ``(train.seed, epoch, 病例集合)`` 决定（sha256 派生，不用内置 ``hash()``），
         与 ``num_workers`` 无关；**同一个 epoch 可复现、相邻 epoch 不同**。
 
-    一轮的 batch 数取三个下界的最大值（``自身 __len__`` 即此值）：
-      * ``ceil(切片数 / batch_size)``：把整个数据集过一遍；
-      * ``ceil(阳性层数 / n_pos)``：给阳性层留够槽位（阳性多、batch 大时这条会成为上界）；
-      * ``ceil(阴性层数 / (batch_size - n_pos))``：让阴性层尽量不要重复抽。
-    所以 batch 数**可能大于** ``ceil(切片数 / batch_size)``（当 ``P`` 相对 ``n_pos`` 很大时），
-    自检里不能拿「切片数/batch_size」直接等号比对。
+    **病人级隔离**（不可协商）：阳性池 / 阴性池都只是 ``dataset`` 的切片索引，而 ``dataset`` 只由
+    本折 ``train`` 病例构成；采样器只做「重排 + 重复」，**绝不跨病人、绝不引入 val 病例**。
+    验证侧的 ``make_val_loader`` 完全不受本类影响（顺序读、原始分布）。
 
-    **全阴性 batch 数由 batch 数与阳性层数共同决定**：能覆盖全部阴性层的最小 batch 数可能大于
-    ``P``（fold 0 实测：``B=642`` 而 ``P=617``），此时按均摊公式必然有 ``B-P`` 个 batch 一个阳性
-    也分不到（fold 0 是 25 个）。本地穷举过 ``B`` 的可行区间，这个数量就是该约束下的下界，
-    不是采样 bug；要减少它就得接受阴性层重复（或调 ``batch_size``，见下一段）。
+    参数：
+        dataset：``CTSliceDataset``（只用它的 ``pos_flags`` / ``case_ids``）。
+        batch_size：每批样本数。
+        data_cfg：**合并后的 data 节**（``data_config(cfg)`` 的输出）；缺键时用 ``DEFAULT_DATA_CFG``。
+        seed：``train.seed``；与 ``epoch``、病例集合一起派生每轮的采样顺序。
     """
 
     #: 告警的打印上限，避免刷屏
     MAX_WARNINGS = 5
 
     def __init__(self, dataset: CTSliceDataset, batch_size: int = 8,
-                 pos_ratio_target: float = 0.30, seed: int = 42,
-                 verbose: bool = False) -> None:
-        if int(batch_size) < 1:
-            raise ValueError(f"batch_size 必须 >= 1，收到 {batch_size}")
-        if not 0.0 <= float(pos_ratio_target) <= 1.0:
-            raise ValueError(f"pos_ratio_target 必须落在 [0,1]，收到 {pos_ratio_target}")
+                 data_cfg: dict | None = None, seed: int = 42) -> None:
+        merged = dict(DEFAULT_DATA_CFG)
+        merged.update({k: v for k, v in (data_cfg or {}).items() if k != "augment"})
         if len(dataset) == 0:
             raise ValueError("数据集里没有任何切片（index 为空？）")
         self.dataset = dataset
         self.batch_size = int(batch_size)
-        self.pos_ratio_target = float(pos_ratio_target)
+        if self.batch_size < 2:
+            raise ValueError(f"batch_size 必须 >= 2（平衡采样要同时放正负样本），收到 {batch_size}")
         self.seed = int(seed)
-        self.verbose = bool(verbose)
+        self.pos_ratio_target = float(merged.get("pos_ratio_train", 0.5))
+        self.min_pos_per_batch = int(merged.get("min_pos_per_batch", 2) or 1)
+        self.max_pos_repeat = int(merged.get("max_pos_repeat", 8) or 1)
+        self.epoch_samples = merged.get("epoch_samples")
         self._epoch = 0
         self._warnings = 0
-        # 一轮 epoch 的 batch 数：先把阳性槽位留够（ceil(P / n_pos)），再用阴性层把每批补满
-        self._n_pos = self._target_pos_per_batch()
-        self._n_neg = self.batch_size - self._n_pos
-        n_pos_slices = int(dataset.pos_flags.sum())
-        by_positive = int(-(-n_pos_slices // self._n_pos)) if n_pos_slices > 0 else 0
-        by_samples = int(-(-len(dataset) // self.batch_size))
-        if self._n_neg > 0:
-            # 让阴性层一轮不重复所需的最少 batch 数（不够时 _CyclicPool 会重复抽取）
-            by_negative = int(-(-(len(dataset) - n_pos_slices) // self._n_neg))
-            self._n_batches = max(1, by_samples, by_positive, by_negative)
-        else:
-            self._n_batches = max(1, by_positive)
-        self._plan = self._build_plan()
-        self.n_positive = n_pos_slices
-        self.n_negative = int(len(dataset) - n_pos_slices)
+
+        flags = np.asarray(dataset.pos_flags)
+        self.pos_indices: list = [int(v) for v in np.flatnonzero(flags).tolist()]
+        self.neg_indices: list = [int(v) for v in np.flatnonzero(~flags).tolist()]
+        self.n_positive = len(self.pos_indices)
+        self.n_negative = len(self.neg_indices)
+
+        self._plan = plan_balanced_slots(
+            n_pos_slices=self.n_positive, n_neg_slices=self.n_negative,
+            batch_size=self.batch_size, pos_ratio=self.pos_ratio_target,
+            min_pos_per_batch=self.min_pos_per_batch, max_pos_repeat=self.max_pos_repeat,
+            epoch_samples=(int(self.epoch_samples) if self.epoch_samples else None),
+        )
+        #: 兼容字段：旧代码/日志里读的是 ``_n_pos`` / ``_n_batches``
+        self._n_pos = int(self._plan["n_pos_per_batch"])
+        self._n_neg = int(self._plan["n_neg_per_batch"])
+        self._n_batches = int(self._plan["batches"])
 
     # ---------------- 计划与长度 ----------------
 
-    def _target_pos_per_batch(self) -> int:
-        """目标阳性数/批：``min(batch_size, max(1, round(batch_size * pos_ratio_target)))``。
-
-        ``batch_size=8, pos_ratio_target=0.30`` → ``round(2.4) = 2``：这是每批的**上限**。
-        实际每批放几个还要看阳性层总数够不够摊（见类 docstring：fold 0 上 617 个阳性层
-        摊到 642 个 batch，于是每批实际只有 1 个，批次平均比例 0.12 而不是 0.25）。
-        想提高每批阳性数就把 ``batch_size`` 提上去：按 fold 0 的数字，``batch_size=16``（n_pos=5）
-        时一轮 351 个 batch、每批 1~2 个阳性、全阴性 0 个；``batch_size=10`` 时每批 2 个。
-        """
-        return min(self.batch_size, max(1, int(round(self.batch_size * self.pos_ratio_target))))
-
-    def _build_plan(self) -> list:
-        """一轮 epoch 内每批的阳性数清单（长度 = batch 数，合计 = 阳性层总数）。
-
-        ``第 q 批 = ceil(P*q/B) - ceil(P*(q-1)/B)``，再按 ``n_pos`` 封顶：
-        每批是 ``floor(P/B)`` 或 ``ceil(P/B)``，且合计恰好 P（覆盖每个阳性层一次）。
-
-        不要用 ``max(q, ceil(P*q/B))`` 那种「保证前几批达标」的写法：它会把阳性前置到前 P 批、
-        后面整段全 0。
-        """
-        import math
-
-        batches = max(1, int(self._n_batches))
-        total = int(self.dataset.pos_flags.sum())
-
-        def cum(q: int) -> int:
-            return min(total, int(math.ceil(total * q / batches)))
-
-        return [min(self._n_pos, cum(q) - cum(q - 1)) for q in range(1, batches + 1)]
-
     def __len__(self) -> int:
-        """一轮 epoch 的 batch 数 = 「切片覆盖 / 阳性槽位 / 阴性槽位」三个下界的最大值。
-
-        注意它**可能大于** ``ceil(切片数 / batch_size)``：阳性层相对 ``n_pos`` 很多时，
-        要给每个阳性层留够槽位就得加 batch（多出来的槽位由阴性层填）。
-        """
+        """一轮 epoch 的 batch 数（由槽位预算与每批比例算出，见 ``plan_balanced_slots``）。"""
         return int(self._n_batches)
 
     def batch_targets(self) -> dict:
-        """本采样器的「可达阳性数/批」区间，供自检脚本判阈值与打印。
+        """本轮的计划值（供自检逐条等号比对与日志打印）。
 
-        ``ideal`` = 每批最多放几个阳性（配置目标）；``observed_max`` / ``floor`` = 均摊计划里
-        实际出现的最大/最小值。阳性层稀少时两者会低于 ``ideal``，这是覆盖与比例之间的取舍，
-        **自检必须按这个区间判，不能拿全局 0.30 直接当阈值**（旧版就是这样在 val 侧误报的）。
+        与旧采样器的同名方法不同，这里**不再是区间而是定值**：每批阳性数就是
+        ``pos_per_batch``，不存在"摊薄"。除 ``plan_balanced_slots`` 的原字段外，额外带上
+        本采样器的配置项（``max_pos_repeat`` / ``pos_ratio_train`` 等），
+        这样调用方不必再去翻 sampler 的属性（自检脚本就踩过一次 KeyError）。
         """
-        plan = list(self._plan)
-        return {
-            "batch_size": int(self.batch_size),
-            "batches": int(self._n_batches),
-            "ideal": int(self._n_pos),
-            "floor": int(min(plan)) if plan else 0,
-            "observed_max": int(max(plan)) if plan else 0,
-            "pos_slices": int(self.n_positive),
-            "neg_slices": int(self.n_negative),
-            "plan_head": plan[:12],
-        }
+        plan = dict(self._plan)
+        plan.update({
+            "max_pos_repeat": int(self.max_pos_repeat),
+            "min_pos_per_batch": int(self.min_pos_per_batch),
+            "pos_ratio_train": float(self.pos_ratio_target),
+            "epoch_samples": (int(self.epoch_samples) if self.epoch_samples else None),
+        })
+        return plan
 
     # ---------------- 迭代 ----------------
 
     def __iter__(self) -> Iterator[list]:
         self._epoch += 1
         rng = random.Random(self._seed_for_epoch(self._epoch))
-        pos_pool = _CyclicPool(np.flatnonzero(np.asarray(self.dataset.pos_flags)).tolist(), rng)
-        neg_pool = _CyclicPool(np.flatnonzero(~np.asarray(self.dataset.pos_flags)).tolist(), rng)
+        pos_pool = _CyclicPool(self.pos_indices, rng)
+        neg_pool = _CyclicPool(self.neg_indices, rng)
+        n_pos, n_neg = int(self._n_pos), int(self._n_neg)
 
-        for want_pos in self._plan:
-            batch = pos_pool.take(want_pos) + neg_pool.take(self.batch_size - want_pos)
+        for _ in range(int(self._n_batches)):
+            batch = pos_pool.take(n_pos) + neg_pool.take(n_neg)
             if len(batch) < self.batch_size:
                 self._warn_shortage(len(batch))
-            rng.shuffle(batch)   # 阴性切片不总排在 batch 尾部；用本轮 rng，保证可复现
+            rng.shuffle(batch)   # 阳性不总排在 batch 头部；用本轮 rng，保证可复现
             yield batch
-
-        self._warn_coverage()
 
     def _warn_shortage(self, got: int) -> None:
         if self._warnings >= self.MAX_WARNINGS:
             return
         self._warnings += 1
-        LOGGER.warning("本 batch 只凑到 %d/%d 个样本（阳性或阴性层太少），比例可能偏离目标；"
-                       "一轮仍会覆盖数据集里每一层切片。", got, self.batch_size)
-
-    def _warn_coverage(self) -> None:
-        """抽样槽位装不下全部切片时给出一次告警（这会让「一轮覆盖全部切片」失效）。"""
-        slots = self._n_batches * self.batch_size
-        if slots < len(self.dataset):
-            self._warn_shortage(slots)
-            LOGGER.warning("一轮 %d 个 batch × %d = %d 个槽位 < 数据集 %d 层切片："
-                           "本轮无法覆盖全部切片，请调大 batch 数或检查 batch_size/pos_ratio_target",
-                           self._n_batches, self.batch_size, slots, len(self.dataset))
+        LOGGER.warning("本 batch 只凑到 %d/%d 个样本（阳性或阴性池为空？），比例会偏离目标。",
+                       got, self.batch_size)
 
     def _seed_for_epoch(self, epoch: int) -> int:
         """由 (seed, epoch, 病例集合) 派生本轮种子；用 sha256 派生，跨进程、跨机器稳定。"""
@@ -1303,29 +1571,47 @@ class ProportionalBatchSampler(BatchSampler):
         """
         self._epoch = int(epoch)
 
-    def describe(self) -> str:
-        """返回采样器配置与一轮计划的多行描述。"""
-        plan = self._plan
-        from collections import Counter
+    # ---------------- 描述 ----------------
 
-        counts = Counter(plan)
-        return "\n".join([
-            f"ProportionalBatchSampler：batch_size={self.batch_size} "
-            f"pos_ratio_target={self.pos_ratio_target} → n_pos={self._n_pos}/批（上限）"
-            f"seed={self.seed}",
-            f"  数据集 {len(self.dataset)} 层切片（阳性 {self.n_positive} / 阴性 {self.n_negative}），"
-            f"一轮 {self._n_batches} 个 batch；阳性层均摊后每批 "
-            + "、".join(f"{k} 个的有 {v} 批" for k, v in sorted(counts.items())),
-            f"  每个阳性层一轮出现恰好 1 次；阴性层不足时会在 _CyclicPool 里重复抽取"
-            f"（含阳性的 batch 会因此被摊薄，这不是 bug）。",
-        ])
+    def describe(self) -> str:
+        """返回采样器配置、一轮计划与实测比例目标的多行描述（训练启动时打进日志）。"""
+        plan = self.batch_targets()
+        lines = [
+            f"BalancedBatchSampler：batch_size={self.batch_size}，"
+            f"data.pos_ratio_train={self.pos_ratio_target:.2f} → 每批 {self._n_pos} 正 + {self._n_neg} 阴"
+            f"（实际阳性占比 {plan['actual_pos_ratio']:.3f}）；seed={self.seed}",
+            f"  数据集 {len(self.dataset)} 层切片（阳性 {self.n_positive} / 阴性 {self.n_negative}）；"
+            f"槽位预算 {plan['budget']}（data.epoch_samples="
+            f"{'null→用切片数' if not self.epoch_samples else self.epoch_samples}）"
+            f" → 一轮 {self._n_batches} 个 batch / {plan['slots']} 个槽位",
+            f"  阳性层一轮重复 {plan['pos_repeat']:.2f} 次（上限 data.max_pos_repeat="
+            f"{self.max_pos_repeat}，各层尽量均摊）；阴性层覆盖率 {plan['neg_coverage']:.2%}"
+            f"（不再要求一轮全过一遍）",
+            f"  病人级隔离：样本索引只在本折 train 病例内重排与重复（不跨病人、不引入 val 病例）；"
+            f"病例集合 {list(self.dataset.case_ids)}",
+        ]
+        if self._n_pos < 1:
+            lines.append("  **警告**：本折训练集里没有含肿瘤的切片 —— 只能产出全阴性 batch，"
+                         "请检查 data/splits.json 与 cache 是否配对。")
+        elif plan["pool_limited"]:
+            lines.append(f"  **注**：阳性层只有 {self.n_positive} 层，撑不起每批 "
+                         f"{self.min_pos_per_batch} 个的下限 → 已退化为每批 {self._n_pos} 个阳性"
+                         f"（不会出现全阴性 batch，比例仍尽力贴近目标）。")
+        elif plan.get("repeat_capped"):
+            lines.append(f"  **注**：阳性重复上限 max_pos_repeat={self.max_pos_repeat} 卡住了比例"
+                         f"（目标 {self.pos_ratio_target:.2f} → 实际 {plan['actual_pos_ratio']:.3f}）；"
+                         f"想更接近目标就调大 data.max_pos_repeat 或调小 data.epoch_samples。")
+        if self.n_negative < self._n_neg:
+            lines.append(f"  **警告**：阴性切片只有 {self.n_negative} 个，少于每批所需，"
+                         f"每个 epoch 内会被重复抽到（这不影响阳性比例，只是阴性多样性下降）。")
+        return "\n".join(lines)
 
 
 def make_batch_sampler(ds: CTSliceDataset, cfg: dict, generator=None) -> BatchSampler:
-    """构造训练用 ``BatchSampler``（单一池 + batch 内阳性比例固定）。
+    """构造训练用 ``BalancedBatchSampler``（每批固定 ``n_pos`` 个阳性 + ``n_neg`` 个阴性）。
 
     ``generator`` 只用来取一个额外的 seed 偏移（``torch.Generator`` 的随机数流跨进程不可靠，
-    因此真正的随机源是「seed + epoch」派生出的 ``random.Random``，见 ``ProportionalBatchSampler``）。
+    因此真正的随机源是「seed + epoch」派生出的 ``random.Random``，见 ``BalancedBatchSampler``）。
     """
     train_cfg = (cfg or {}).get("train") or {}
     seed = int(train_cfg.get("seed", 42))
@@ -1334,25 +1620,31 @@ def make_batch_sampler(ds: CTSliceDataset, cfg: dict, generator=None) -> BatchSa
             seed = seed + int(generator.initial_seed()) % 100000
         except Exception:  # noqa: BLE001 - 自定义 generator 没有 initial_seed 时忽略
             pass
-    sampler = ProportionalBatchSampler(
+    data_cfg = data_config(cfg)
+    if train_cfg.get("pos_ratio_target") is not None:
+        LOGGER.info("注意：train.pos_ratio_target=%s 自第 4 轮起**不再生效**（保留只为兼容旧命令/旧 "
+                    "checkpoint）；每批阳性数改由 data.pos_ratio_train=%.2f / data.min_pos_per_batch=%d / "
+                    "data.max_pos_repeat=%d 决定。",
+                    train_cfg.get("pos_ratio_target"), float(data_cfg.get("pos_ratio_train", 0.5)),
+                    int(data_cfg.get("min_pos_per_batch", 2)), int(data_cfg.get("max_pos_repeat", 8)))
+    sampler = BalancedBatchSampler(
         ds,
         batch_size=int(train_cfg.get("batch_size", 8)),
-        pos_ratio_target=float(train_cfg.get("pos_ratio_target", 0.30)),
+        data_cfg=data_cfg,
         seed=seed,
     )
-    targets = sampler.batch_targets()
-    # 「实际过采样倍数」不能拿 pos_ratio_target / 整体阳性率 算：那个目标只是每批的**上限**。
-    # 正确口径是「一轮里阳性层的出现次数 / 一轮总槽位数」再除以整体阳性率
-    # （每个阳性层恰好抽一次，所以出现次数就是 P；B×bs 是一轮槽位数）。fold 0 实测
-    # 617/(642×8) = 0.120，整体 0.138 → 0.87 倍，也就是**几乎没有重复采样**。
-    slots = max(1, targets["batches"] * sampler.batch_size)
-    epoch_ratio = targets["pos_slices"] / slots
-    LOGGER.info("训练采样器：batch_size=%d，每批阳性上限 n_pos=%d（pos_ratio_target=%.2f）；"
-                "一轮 %d 个 batch，每批实际 %d~%d 个阳性层，阳性层一轮出现占比 %.4f"
-                "（整体 %.4f，约 %.2f 倍）",
-                sampler.batch_size, targets["ideal"], sampler.pos_ratio_target,
-                targets["batches"], targets["floor"], targets["observed_max"],
-                epoch_ratio, ds.pos_ratio, epoch_ratio / max(1e-9, ds.pos_ratio))
+    plan = sampler.batch_targets()
+    LOGGER.info("训练采样器（平衡采样）：batch_size=%d → 每批 %d 正 + %d 阴（阳性占比 %.3f，"
+                "整体阳性率 %.4f ⇒ 过采样 %.2f 倍）；一轮 %d 个 batch；"
+                "阳性层重复 %.2f 次（上限 %d）、阴性层覆盖率 %.2f%%",
+                sampler.batch_size, plan["n_pos_per_batch"], plan["n_neg_per_batch"],
+                plan["actual_pos_ratio"], ds.pos_ratio,
+                plan["actual_pos_ratio"] / max(1e-9, ds.pos_ratio),
+                plan["batches"], plan["pos_repeat"], sampler.max_pos_repeat,
+                100.0 * plan["neg_coverage"])
+    if plan["pool_limited"]:
+        LOGGER.warning("阳性层只有 %d 层，撑不起每批 %d 个的下限：本折每批阳性数退化为 %d。",
+                       sampler.n_positive, sampler.min_pos_per_batch, plan["n_pos_per_batch"])
     return sampler
 
 
@@ -1404,10 +1696,12 @@ def _fold_cases(splits: dict, fold: int, which: str) -> list:
 
 
 def make_train_loader(splits: dict | None, fold: int, cfg: dict) -> DataLoader:
-    """训练加载器：阳性层均摊采样 + 训练增强；顺序由 ``ProportionalBatchSampler`` 决定（不额外 shuffle）。
+    """训练加载器：**平衡采样**（每批 ``n_pos`` 正 + ``n_neg`` 阴）+ 训练增强；顺序由
+    ``BalancedBatchSampler`` 决定（不额外 shuffle）。
 
     训练病例直接取自 ``splits`` 里该折的 ``train``（21 例 = 16 含肿瘤 + 5 仅肝脏），
-    不依赖 ``cases="train"`` 的并集语义，避免「漏传 fold 时静默用上全部 25 例」。
+    不依赖 ``cases="train"`` 的并集语义，避免「漏传 fold 时静默用上全部 25 例」——
+    这也是病人级隔离的入口：val 病例根本不在这个 dataset 里，采样器再怎么重复也抽不到它们。
 
     采样顺序只由 ``(train.seed, epoch, 病例集合)`` 决定，与 ``num_workers`` 无关，
     因此换机器、改 worker 数都能复现同一条采样序列。
@@ -1416,21 +1710,28 @@ def make_train_loader(splits: dict | None, fold: int, cfg: dict) -> DataLoader:
 
     splits = _load_splits(splits, cfg)
     seed = int(((cfg or {}).get("train") or {}).get("seed", 42))
+    data_cfg = data_config(cfg)
     cache_dir = ((cfg or {}).get("paths") or {}).get("cache", "cache")
     ds = CTSliceDataset(_fold_cases(splits, fold, "train"), cache_dir, "train", cfg,
                         augment=True, fold=int(fold))
     generator = make_generator(seed + int(fold))
     batch_sampler = make_batch_sampler(ds, cfg, generator=generator)
-    verify = bool(data_config(cfg).get("verify_batch", True))
+    verify = bool(data_cfg.get("verify_batch", True))
+    expect = window_channels(resolve_z_context(data_cfg))
     return DataLoader(ds, batch_sampler=batch_sampler, generator=generator,
-                      collate_fn=lambda samples: collate_samples(samples, verify=verify),
+                      collate_fn=lambda samples: collate_samples(samples, verify=verify,
+                                                                 expect_channels=expect),
                       **_loader_kwargs(cfg))
 
 
 def make_val_loader(splits: dict | None, fold: int, cfg: dict) -> DataLoader:
     """验证加载器：顺序、无增强（仍然补边到 ``data.target_hw``，形状与训练侧一致）。
 
-    验证阶段是「按病人整卷推理」（第 4 轮 ``src/infer.py``），逐层按 z 顺序读即可；
+    **验证侧的分布必须保持原始**（fold 0 上阳性切片只有 ~10%）：指标要反映真实的类不平衡表现，
+    所以这里**不做任何平衡采样**、也不重复抽样——顺序读一遍即可。旧版自检曾把训练侧的采样预算
+    套到 val batch 上，误报「阳性切片 0 超出预算」，`check_batch` 里现在明确不判 val 的阳性数。
+
+    验证阶段是「按病人整卷推理」（``src/infer.py`` 的 ``predict_volume``），逐层按 z 顺序读即可；
     这里不 shuffle 是为了让每折的验证顺序固定、指标可复现。
     """
     from src.utils import make_generator
@@ -1444,8 +1745,11 @@ def make_val_loader(splits: dict | None, fold: int, cfg: dict) -> DataLoader:
     batch_size = data_cfg.get("val_batch_size") or int(train_cfg.get("batch_size", 8))
     generator = make_generator(int(train_cfg.get("seed", 42)) + int(fold))
     verify = bool(data_cfg.get("verify_batch", True))
+    expect = window_channels(resolve_z_context(data_cfg))
     return DataLoader(ds, batch_size=int(batch_size), shuffle=False, drop_last=False,
-                      generator=generator, collate_fn=lambda samples: collate_samples(samples, verify=verify),
+                      generator=generator,
+                      collate_fn=lambda samples: collate_samples(samples, verify=verify,
+                                                                 expect_channels=expect),
                       **_loader_kwargs(cfg))
 
 

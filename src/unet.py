@@ -18,11 +18,14 @@
 输入输出契约：
     ``forward(x)``：``x`` 是 ``(B, in_channels, H, W)`` 的 float 张量，
     返回 **logits** ``(B, out_channels, H, W)``（不过 softmax；softmax/CE 在 ``src.losses`` 里做）。
+    ``in_channels`` 默认 3：``data.z_context=1`` 时 dataset 给的是 ``[z-1, z, z+1]`` 三层 2.5D 输入
+    （``z_context=0`` 则退化为单层 2D 的 1 通道）；通道维对 2D 卷积没有特殊含义，结构不变，
+    但构造时会校验 ``in_channels == 2×z_context+1``，避免配置改了一边忘了另一边。
     H/W 可以是任意正整数——内部会补到 ``pad_to_multiple`` 的整数倍再裁回；
     但 ``data.target_hw``（默认 512×512）已是 16 的倍数，所以常规路径不会触发内部补边。
 
 依赖：torch（只用 ``torch.nn`` / ``torch.nn.functional``）。
-前后接口：上游是 ``src.dataset`` 产出的 ``(B,1,512,512)`` 影像；下游是 ``src.losses.build_loss``
+前后接口：上游是 ``src.dataset`` 产出的 ``(B,3,512,512)`` 影像；下游是 ``src.losses.build_loss``
     与 ``src.train``；推理侧由 ``src.infer.predict_volume`` 调用。
 用法：``model = build_unet(cfg)``（等价于 ``UNet2D(**cfg["model"])``，见 ``src.train.build_model``）。
 """
@@ -164,11 +167,14 @@ class UNet2D(nn.Module):
     输入边长必须是 16 的整数倍（``data.target_hw=512`` 满足），否则前向内部先补边再裁回。
 
     参数：
-        in_channels：输入通道数（本项目 1）。
+        in_channels：输入通道数（本项目 **3** = 2.5D 的 ``[z-1, z, z+1]`` 三层；
+            ``data.z_context=0`` 时退化为单层 2D 的 1）。
         out_channels：输出类别数（本项目 2：0=背景，1=肿瘤）。
         encoder_channels：编码器各级通道数；瓶颈取最后一级 ×2。
         norm：``batch`` / ``instance`` / ``group`` / ``none``（见 ``make_norm``）。
         pad_to_multiple：前向内部把 H/W 补到该值的整数倍再裁回（16 = 4 级下采样）。
+        z_context：2.5D 上下文半径（仅用于**记录与自洽校验**：``in_channels`` 必须等于
+            ``2×z_context+1``）。通道维在 2D 卷积里跟普通通道没有区别，网络结构不需要为它改动。
         encoder_pretrained / pretrained_weights_path：预训练编码器配置（基础版为 None；
             真正加载由 ``load_encoder_pretrained`` 负责，构造时只是记录下来，不做任何 IO）。
 
@@ -179,7 +185,7 @@ class UNet2D(nn.Module):
 
     def __init__(self, in_channels: int = 1, out_channels: int = 2,
                  encoder_channels: Sequence[int] = DEFAULT_ENCODER_CHANNELS,
-                 norm: str = "batch", pad_to_multiple: int = 16,
+                 norm: str = "batch", pad_to_multiple: int = 16, z_context: int = 0,
                  encoder_pretrained: str | None = None,
                  pretrained_weights_path: str | None = None) -> None:
         super().__init__()
@@ -196,6 +202,15 @@ class UNet2D(nn.Module):
         self.encoder_channels = tuple(channels)
         self.norm = str(norm)
         self.pad_to_multiple = max(1, int(pad_to_multiple))
+        self.z_context = int(z_context)
+        # 2.5D 自洽：通道数必须等于 2r+1（r=0 → 1）。写死数字最容易在改 z_context 时忘改另一边，
+        # dataset 侧 collate 也会独立校验一次（两侧都拦，才不会被单点遗漏骗过去）。
+        expected = 2 * self.z_context + 1
+        if self.in_channels != expected:
+            raise ValueError(
+                f"model.in_channels={self.in_channels} 与 z_context={self.z_context} 不自洽："
+                f"2.5D 窗口的通道数必须是 2×z_context+1 = {expected}。"
+                f"（data.z_context=1 → model.in_channels=3；两者都在 configs/default.yaml 里）")
         self.encoder_pretrained = encoder_pretrained
         self.pretrained_weights_path = pretrained_weights_path
 
@@ -282,7 +297,9 @@ class UNet2D(nn.Module):
 
     def describe(self) -> str:
         """一行摘要（通道走向、归一化、补边对齐、参数量），训练启动时打进日志。"""
-        return (f"UNet2D(in={self.in_channels}, out={self.out_channels}, "
+        window = ("单层 2D" if self.z_context <= 0
+                  else f"2.5D 三层窗 z±{self.z_context}（{self.in_channels} 通道）")
+        return (f"UNet2D(in={self.in_channels} [{window}], out={self.out_channels}, "
                 f"encoder={list(self.encoder_channels)}, bottleneck={self.encoder_channels[-1] * 2}, "
                 f"下采样 {len(self.encoder_channels)} 次（对齐 {self.pad_to_multiple}）, "
                 f"norm={self.norm}, 可训练参数 {count_parameters(self) / 1e6:.3f} M)")
@@ -297,8 +314,10 @@ def build_unet(cfg: dict) -> UNet2D:
 
     这里只认 ``configs/default.yaml`` 的 ``model`` 节；缺键时用默认值，
     因此 ``--set model.encoder_channels=[16,32,64,128]`` 这类临时改动可以直接生效。
+    ``data.z_context`` 会一起传进来做自洽校验（``in_channels == 2×z_context+1``）。
     """
     model_cfg = (cfg or {}).get("model") or {}
+    data_cfg = (cfg or {}).get("data") or {}
     channels = model_cfg.get("encoder_channels") or list(DEFAULT_ENCODER_CHANNELS)
     return UNet2D(
         in_channels=int(model_cfg.get("in_channels", 1)),
@@ -306,6 +325,7 @@ def build_unet(cfg: dict) -> UNet2D:
         encoder_channels=tuple(int(c) for c in channels),
         norm=str(model_cfg.get("norm", "batch")),
         pad_to_multiple=int(model_cfg.get("pad_to_multiple", 16)),
+        z_context=int(data_cfg.get("z_context", 0) or 0),
         encoder_pretrained=model_cfg.get("encoder_pretrained"),
         pretrained_weights_path=model_cfg.get("pretrained_weights_path"),
     )

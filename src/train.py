@@ -21,7 +21,7 @@
     想测某个 batch_size 就显式给 ``--set train.batch_size=8``（给了就不再用默认的 2）。
 
 进度与随机性：
-    * 采样顺序由 ``ProportionalBatchSampler`` 按 ``(train.seed, epoch, 病例集合)`` 派生，与
+    * 采样顺序由 ``BalancedBatchSampler`` 按 ``(train.seed, epoch, 病例集合)`` 派生，与
       ``num_workers`` 无关；``--resume`` 时用 ``sampler.set_epoch(已完成轮数)`` 把序列接上；
     * 增强的随机源在 ``CTSliceDataset`` 构造时按 ``(seed, fold, split)`` 固定；
     * ``set_seed(train.seed)`` 固定 random/numpy/torch/cuda，DataLoader 的 worker 种子由
@@ -59,7 +59,14 @@ import torch
 import torch.nn as nn
 
 try:
-    from src.dataset import data_config, format_hw, make_train_loader, reset_open_cache
+    from src.dataset import (
+        data_config,
+        format_hw,
+        make_train_loader,
+        reset_open_cache,
+        resolve_z_context,
+        window_channels,
+    )
     from src.infer import load_label_volume, predict_volume
     from src.losses import build_loss
     from src.unet import build_unet, count_parameters, load_encoder_pretrained
@@ -80,7 +87,14 @@ try:
     )
 except ModuleNotFoundError:  # pragma: no cover - 兜底：把仓库根塞进 sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from src.dataset import data_config, format_hw, make_train_loader, reset_open_cache  # type: ignore
+    from src.dataset import (  # type: ignore
+        data_config,
+        format_hw,
+        make_train_loader,
+        reset_open_cache,
+        resolve_z_context,
+        window_channels,
+    )
     from src.infer import load_label_volume, predict_volume  # type: ignore
     from src.losses import build_loss  # type: ignore
     from src.unet import build_unet, count_parameters, load_encoder_pretrained  # type: ignore
@@ -110,10 +124,13 @@ EXIT_RESUME = 4
 EXIT_INTERRUPTED = 130
 
 #: metrics.csv 的列（顺序固定；续跑时沿用同一表头，便于直接 pandas.read_csv）
+#: 第 4 轮在**末尾追加**了 val_iou_mean / val_precision_mean / val_recall_mean /
+#: val_pred_voxels / val_prob_peak（不改旧列，第 4 轮的 evaluate 读旧 csv 也不会炸）。
 CSV_COLUMNS = [
     "epoch", "lr", "train_loss", "train_dice", "train_ce", "train_batches",
     "train_pos_ratio", "train_seconds", "val_dice_mean", "val_dice_min", "val_dice_max",
     "val_seconds", "is_best", "best_dice", "patience", "epoch_seconds", "gpu_peak_mb",
+    "val_iou_mean", "val_precision_mean", "val_recall_mean", "val_pred_voxels", "val_prob_peak",
 ]
 
 
@@ -324,13 +341,22 @@ def check_prerequisites(cfg: dict, fold: int) -> tuple:
 
     model_cfg = (cfg or {}).get("model") or {}
     loss_cfg = (cfg or {}).get("loss") or {}
+    data_cfg = data_config(cfg)
     out_channels = int(model_cfg.get("out_channels", 2))
     if out_channels < 2 and bool(loss_cfg.get("softmax", True)):
         problems.append(f"model.out_channels={out_channels} 时 loss.softmax 必须为 false"
                         f"（单通道是 sigmoid 口径；本项目的标签只有背景/肿瘤两类）")
-    if int(model_cfg.get("in_channels", 1)) != 1:
-        problems.append(f"model.in_channels={model_cfg.get('in_channels')}："
-                        f"数据侧给的是单通道切片（data 的 image 是 (B,1,H,W)）")
+    # 2.5D 自洽（第 4 轮）：dataset 按 data.z_context 叠出 2r+1 个通道，模型首层必须与之相同。
+    # 两处都拦一次（unet.UNet2D 构造时也拦），因为这是"改了配置一边忘了另一边"的典型现场。
+    z_context = resolve_z_context(data_cfg)
+    expect_channels = window_channels(z_context)
+    in_channels = int(model_cfg.get("in_channels", 1))
+    if in_channels != expect_channels:
+        problems.append(f"model.in_channels={in_channels} 与 data.z_context={z_context} 不自洽："
+                        f"2.5D 窗口的通道数必须是 2×z_context+1 = {expect_channels}"
+                        f"（z_context=1 → 3 通道 [z-1,z,z+1]；z_context=0 → 1 通道单层 2D）")
+    info["z_context"] = z_context
+    info["in_channels"] = expect_channels
     return info, problems
 
 
@@ -439,6 +465,7 @@ def train_one_epoch(model: nn.Module, loader, criterion, optimizer, scaler, devi
                 "label": [int(v) for v in labels.shape],
                 "cases": sorted({str(c) for c in batch["case"]}),
                 "z": [int(v) for v in batch["z"]],
+                "window": [[int(v) for v in w] for w in batch.get("window", [])],
                 "image_range": [round(float(images.min()), 6), round(float(images.max()), 6)],
                 "orig_hw": [[int(hw[0]), int(hw[1])] for hw in batch["orig_hw"]],
                 "pad_offset": [[int(o[0]), int(o[1])] for o in batch["pad_offset"]],
@@ -514,12 +541,50 @@ def volume_dice(pred_bin, gt_bin, eps: float = 1e-6) -> float:
     return float((2.0 * intersection + eps) / (denominator + eps))
 
 
+def volume_metrics(pred_bin, gt_bin, eps: float = 1e-6) -> dict:
+    """整卷二值指标：Dice / IoU / Precision / Recall（一次算完 TP/FP/FN）。
+
+    口径（第 4 轮新增，与 ``volume_dice`` 以及第 4 轮 ``src/metrics.py`` 保持一致）：
+      * ``dice = (2TP + eps) / (2TP + FP + FN + eps)``，两边都空记 1.0；
+      * ``iou = (TP + eps) / (TP + FP + FN + eps)``，两边都空记 1.0；
+      * ``precision = TP / (TP + FP)``：**预测为空时记 0.0 并把 ``precision_defined=False``**
+        —— 这是刻意的：塌缩成全背景时 precision 在数学上未定义，若记 1.0 会让日志看起来"完美"，
+        而实际 recall = 0（第 3 轮首折就是这么骗过眼睛的，见 docs/preprocess_notes.md 8.1）；
+      * ``recall = TP / (TP + FN)``：GT 为空时记 0.0（本项目验证集恒有肿瘤，不会走到）。
+
+    返回 dict：``dice / iou / precision / recall / precision_defined / tp / fp / fn /
+    pred_voxels / gt_voxels``。
+    """
+    pred = np.asarray(pred_bin) > 0
+    gt = np.asarray(gt_bin) > 0
+    tp = float(np.count_nonzero(pred & gt))
+    fp = float(np.count_nonzero(pred & ~gt))
+    fn = float(np.count_nonzero(~pred & gt))
+    both_empty = (tp + fp + fn) == 0.0
+    dice = 1.0 if both_empty else float((2.0 * tp + eps) / (2.0 * tp + fp + fn + eps))
+    iou = 1.0 if both_empty else float((tp + eps) / (tp + fp + fn + eps))
+    precision_defined = (tp + fp) > 0.0
+    return {
+        "dice": dice,
+        "iou": iou,
+        "precision": float(tp / (tp + fp)) if precision_defined else 0.0,
+        "recall": float(tp / (tp + fn)) if (tp + fn) > 0.0 else 0.0,
+        "precision_defined": bool(precision_defined),
+        "tp": int(tp), "fp": int(fp), "fn": int(fn),
+        "pred_voxels": int(tp + fp), "gt_voxels": int(tp + fn),
+    }
+
+
 def validate(model: nn.Module, cases, cache_dir, cfg: dict, device: torch.device,
              amp: dict, batch_slices: int | None = None) -> dict:
-    """对验证集每例做**整卷推理**再逐例算 Dice，返回 macro 口径的均值。
+    """对验证集每例做**整卷推理**再逐例算指标，返回 macro 口径的均值。
 
-    口径（用户拍板，别改成全局聚合）：先对每例算整卷 Dice，再对若干例取平均，每例等权。
+    口径（用户拍板，别改成全局聚合）：先对每例算整卷指标，再对若干例取平均，每例等权。
     肿瘤体积跨 3 个数量级，聚合口径会被大病灶主导，看不出小病灶退化。
+
+    指标：Dice（选 best.pt 与早停用）+ IoU / Precision / Recall（第 4 轮新增的诊断项），
+    外加两个**一眼就能看出塌缩**的量：``pred_voxels_total``（全预测背景时恒 0）与
+    ``prob_peak_max``（第 3 轮首折全程只有 0.005）。
     """
     eval_cfg = (cfg or {}).get("eval") or {}
     model_cfg = (cfg or {}).get("model") or {}
@@ -538,28 +603,31 @@ def validate(model: nn.Module, cases, cache_dir, cfg: dict, device: torch.device
         if tuple(pred.shape) != tuple(gt.shape):
             raise RuntimeError(f"case {case}：预测卷 {tuple(pred.shape)} 与 GT 卷 {tuple(gt.shape)} "
                                f"形状不一致（轴序或 pad_offset 裁回出错）")
-        gt_bin = gt > 0
+        metrics = volume_metrics(pred, gt)
         per_case[int(case)] = {
-            "dice": round(volume_dice(pred, gt_bin), 6),
-            "gt_voxels": int(np.count_nonzero(gt_bin)),
-            "pred_voxels": int(np.count_nonzero(pred)),
+            **{k: (round(v, 6) if isinstance(v, float) else v) for k, v in metrics.items()},
             "prob_peak": meta.get("prob_peak"),
             "seconds": meta.get("seconds"),
         }
     seconds = time.perf_counter() - started
-    values = [float(v["dice"]) for v in per_case.values()]
-    if not values:
-        return {"cases": {}, "dice_mean": float("nan"), "dice_min": float("nan"),
-                "dice_max": float("nan"), "seconds": seconds,
-                "gt_voxels_total": 0, "pred_voxels_total": 0}
+    keys = ("dice", "iou", "precision", "recall")
+    if not per_case:
+        empty = {key: float("nan") for key in keys}
+        return {"cases": {}, **{f"{key}_mean": value for key, value in empty.items()},
+                "dice_min": float("nan"), "dice_max": float("nan"), "seconds": seconds,
+                "gt_voxels_total": 0, "pred_voxels_total": 0, "prob_peak_max": 0.0}
+    dice_values = [float(v["dice"]) for v in per_case.values()]
+    means = {f"{key}_mean": float(np.mean([float(v[key]) for v in per_case.values()]))
+             for key in keys}
     return {
         "cases": per_case,
-        "dice_mean": float(np.mean(values)),
-        "dice_min": float(np.min(values)),
-        "dice_max": float(np.max(values)),
+        **means,
+        "dice_min": float(np.min(dice_values)),
+        "dice_max": float(np.max(dice_values)),
         "seconds": seconds,
         "gt_voxels_total": int(sum(int(v["gt_voxels"]) for v in per_case.values())),
         "pred_voxels_total": int(sum(int(v["pred_voxels"]) for v in per_case.values())),
+        "prob_peak_max": float(max(float(v.get("prob_peak") or 0.0) for v in per_case.values())),
     }
 
 
@@ -722,8 +790,11 @@ def run_debug(*, model, criterion, optimizer, train_loader, val_cases, cache_dir
 
     LOGGER.info("=" * 78)
     LOGGER.info("--debug 冒烟自检：训练侧 %d 例 %s / %d 层切片 / 一轮 %d 个 batch；"
-                "batch_size=%d；跑 %d 个 iteration 后退出（**不写 runs/**）",
+                "batch_size=%d；输入 %s；跑 %d 个 iteration 后退出（**不写 runs/**）",
                 len(train_cases), train_cases, len(dataset), len(train_loader), batch_size,
+                ("单层 2D" if int((cfg.get("data") or {}).get("z_context", 0) or 0) <= 0
+                 else f"2.5D z±{int((cfg.get('data') or {}).get('z_context', 1))}"
+                      f"（{window_channels(int((cfg.get('data') or {}).get('z_context', 1)))} 通道）"),
                 int(args.debug_iters))
     LOGGER.info("采样器：\n%s", train_loader.batch_sampler.describe())
     LOGGER.info("=" * 78)
@@ -779,15 +850,16 @@ def run_debug(*, model, criterion, optimizer, train_loader, val_cases, cache_dir
         parts = dict(getattr(criterion, "last_parts", {}) or {})
         allocated = (float(torch.cuda.memory_allocated(device)) / 1024 ** 2
                      if device.type == "cuda" else 0.0)
-        LOGGER.info("iteration %d：image %s / label %s（logits %s）；病例 %s",
+        LOGGER.info("iteration %d：image %s / label %s（logits %s）；病例 %s；z=%s；2.5D 窗口 %s",
                     step, tuple(images.shape), tuple(labels.shape), tuple(logits.shape),
-                    sorted({str(c) for c in batch["case"]}))
-        LOGGER.info("  值域 [%.4f, %.4f]；label 取值 %s；**含肿瘤切片 %d/%d = %.3f**（配置目标 %.2f）；"
-                    "orig_hw %s；补边偏移 %s",
+                    sorted({str(c) for c in batch["case"]}), list(batch["z"])[:8],
+                    [list(w) for w in batch.get("window", [])][:8])
+        LOGGER.info("  值域 [%.4f, %.4f]；label 取值 %s；**含肿瘤切片 %d/%d = %.3f**"
+                    "（平衡采样目标 %.2f）；orig_hw %s；补边偏移 %s",
                     float(images.min()), float(images.max()),
                     sorted(int(v) for v in torch.unique(labels).tolist()),
                     pos_slices, n_slices, pos_slices / max(1, n_slices),
-                    float(train_cfg.get("pos_ratio_target", 0.30) or 0.0),
+                    float(data_config(cfg).get("pos_ratio_train", 0.5) or 0.0),
                     [[int(hw[0]), int(hw[1])] for hw in batch["orig_hw"]][:3],
                     [[int(o[0]), int(o[1])] for o in batch["pad_offset"]][:3])
         LOGGER.info("  loss %.4f（dice %.4f + ce %.4f）；各 batch 分段耗时：取 batch %.3f s / "
@@ -856,6 +928,10 @@ def run_debug(*, model, criterion, optimizer, train_loader, val_cases, cache_dir
                     format_hw(meta["orig_hw"]), format_hw(meta["target_hw"]),
                     tuple(meta["pad_offset"]), int(meta["n_slices"]), float(meta["seconds"]),
                     int(meta["batch_slices"]), float(meta["threshold"]))
+        debug_metrics = volume_metrics(pred, gt)
+        LOGGER.info("  （随机权重下的指标同样没有意义，只看链路通不通）IoU %.4f / 精确率 %.4f"
+                    "（定义=%s）/ 召回率 %.4f", debug_metrics["iou"], debug_metrics["precision"],
+                    debug_metrics["precision_defined"], debug_metrics["recall"])
     elif int(args.debug_val_cases) > 0:
         LOGGER.warning("--debug-val-cases=%d 但这一折没有可用验证病例，跳过整卷推理自检",
                        int(args.debug_val_cases))
@@ -904,10 +980,12 @@ def main(argv=None) -> int:
                 fold, "**--debug 冒烟自检**" if args.debug else "正式训练",
                 rel_to_root(resolve_path(args.config)))
     LOGGER.info("=" * 78)
-    LOGGER.info("设备：%s%s；随机种子：%d；目标面内尺寸：%s（pad_align=%s）",
+    LOGGER.info("设备：%s%s；随机种子：%d；目标面内尺寸：%s（pad_align=%s）；输入：%s",
                 device,
                 f"（{torch.cuda.get_device_name(device)}）" if device.type == "cuda" else "",
-                seed, format_hw(data_cfg["target_hw"]), data_cfg.get("pad_align"))
+                seed, format_hw(data_cfg["target_hw"]), data_cfg.get("pad_align"),
+                "单层 2D（1 通道，z_context=0）" if int(data_cfg.get("z_context", 0)) <= 0
+                else f"2.5D 三层窗 z±{int(data_cfg['z_context'])}（{window_channels(int(data_cfg['z_context']))} 通道）")
     LOGGER.info("训练配置：epochs=%d，batch_size=%d，lr=%g，val_every=%d，早停 patience=%d，"
                 "grad_clip_norm=%g，num_workers=%d",
                 epochs, int(train_cfg.get("batch_size", 8)), float(train_cfg.get("lr", 1e-3)),
@@ -1045,6 +1123,12 @@ def main(argv=None) -> int:
         "batch_size": int((run_cfg.get("train") or {}).get("batch_size", 8)),
         "target_hw": [int(v) for v in data_cfg["target_hw"]],
         "pad_align": data_cfg.get("pad_align"),
+        "z_context": int(data_cfg.get("z_context", 0) or 0),
+        "in_channels": int(window_channels(int(data_cfg.get("z_context", 0) or 0))),
+        "pos_ratio_train": float(data_cfg.get("pos_ratio_train", 0.5) or 0.0),
+        "max_pos_repeat": int(data_cfg.get("max_pos_repeat", 8) or 1),
+        "sampler_plan": (train_loader.batch_sampler.batch_targets()
+                         if hasattr(train_loader.batch_sampler, "batch_targets") else {}),
         "cases": {"train": info["train_cases"], "val": info["val_cases"]},
         "n_slices": {"train": int(len(train_loader.dataset))},
         "model": model.describe(),
@@ -1076,10 +1160,11 @@ def main(argv=None) -> int:
                                           log_every=log_every)
             if epoch == start_epoch + 1 and train_stats.get("first_batch"):
                 first = train_stats["first_batch"]
-                LOGGER.info("首个 batch 形态：image %s / label %s；病例 %s；z=%s；值域 [%.4f, %.4f]；"
-                            "orig_hw %s；补边偏移 %s",
+                LOGGER.info("首个 batch 形态：image %s / label %s；病例 %s；z=%s；2.5D 窗口 %s；"
+                            "值域 [%.4f, %.4f]；orig_hw %s；补边偏移 %s",
                             tuple(first["image"]), tuple(first["label"]), first["cases"],
-                            first["z"][:8], first["image_range"][0], first["image_range"][1],
+                            first["z"][:8], first.get("window", [])[:8],
+                            first["image_range"][0], first["image_range"][1],
                             first["orig_hw"][:3], first["pad_offset"][:3])
             if epoch == start_epoch + 1 and train_stats["data_seconds"] > train_stats["compute_seconds"]:
                 LOGGER.warning("取数耗时 %.1f s 超过计算耗时 %.1f s：**数据加载是瓶颈**。"
@@ -1088,9 +1173,12 @@ def main(argv=None) -> int:
                                "data.num_workers（当前 %d）。",
                                train_stats["data_seconds"], train_stats["compute_seconds"],
                                int(data_cfg.get("num_workers", 8)))
+            # 采样器/调度器的推进放在训练结束、**验证之前**：验证用的是"本轮训练时实际用的 lr"，
+            # scheduler.step() 之后就变成下一轮的了。所以先记下本轮的 lr 再 step，日志里打印的是
+            # 真正作用于本轮权重更新的那个值（旧版先 step 再打印，日志里的 lr 比实际"超前一轮"）。
+            epoch_lr = float(optimizer.param_groups[0]["lr"])
             if scheduler is not None:
                 scheduler.step()
-            current_lr = float(optimizer.param_groups[0]["lr"])
 
             val_stats: dict = {}
             if (epoch % val_every == 0) or (epoch == epochs):
@@ -1107,7 +1195,7 @@ def main(argv=None) -> int:
             epoch_seconds = time.perf_counter() - epoch_started
             row = {
                 "epoch": epoch,
-                "lr": f"{current_lr:.6g}",
+                "lr": f"{epoch_lr:.6g}",
                 "train_loss": round(train_stats["loss"], 6),
                 "train_dice": round(train_stats["dice_loss"], 6),
                 "train_ce": round(train_stats["ce_loss"], 6),
@@ -1123,6 +1211,12 @@ def main(argv=None) -> int:
                 "patience": patience,
                 "epoch_seconds": round(epoch_seconds, 3),
                 "gpu_peak_mb": train_stats["peak_memory_mb"],
+                # 第 4 轮追加的诊断列（见 CSV_COLUMNS 的说明）
+                "val_iou_mean": round(val_stats["iou_mean"], 6) if val_stats else "",
+                "val_precision_mean": round(val_stats["precision_mean"], 6) if val_stats else "",
+                "val_recall_mean": round(val_stats["recall_mean"], 6) if val_stats else "",
+                "val_pred_voxels": int(val_stats["pred_voxels_total"]) if val_stats else "",
+                "val_prob_peak": round(float(val_stats["prob_peak_max"]), 6) if val_stats else "",
             }
             append_metrics_row(out_dir / "metrics.csv", row)
 
@@ -1130,7 +1224,7 @@ def main(argv=None) -> int:
                 writer.add_scalar("train/loss", train_stats["loss"], epoch)
                 writer.add_scalar("train/dice_loss", train_stats["dice_loss"], epoch)
                 writer.add_scalar("train/ce_loss", train_stats["ce_loss"], epoch)
-                writer.add_scalar("train/lr", current_lr, epoch)
+                writer.add_scalar("train/lr", epoch_lr, epoch)
                 writer.add_scalar("train/pos_ratio", train_stats["pos_ratio"], epoch)
                 writer.add_scalar("time/epoch_seconds", epoch_seconds, epoch)
                 if train_stats["peak_memory_mb"]:
@@ -1139,6 +1233,11 @@ def main(argv=None) -> int:
                     writer.add_scalar("val/dice_mean", val_stats["dice_mean"], epoch)
                     writer.add_scalar("val/dice_min", val_stats["dice_min"], epoch)
                     writer.add_scalar("val/dice_max", val_stats["dice_max"], epoch)
+                    writer.add_scalar("val/iou_mean", val_stats["iou_mean"], epoch)
+                    writer.add_scalar("val/precision_mean", val_stats["precision_mean"], epoch)
+                    writer.add_scalar("val/recall_mean", val_stats["recall_mean"], epoch)
+                    writer.add_scalar("val/pred_voxels", val_stats["pred_voxels_total"], epoch)
+                    writer.add_scalar("val/prob_peak", val_stats["prob_peak_max"], epoch)
                     writer.add_scalar("val/best_dice", float(best["dice"]), epoch)
                     for case_id, rec in sorted(val_stats["cases"].items()):
                         writer.add_scalar(f"val/dice_case_{int(case_id)}", rec["dice"], epoch)
@@ -1150,18 +1249,29 @@ def main(argv=None) -> int:
                 LOGGER.info("epoch %d/%d | lr %.2e | 训练 loss %.4f（dice %.4f + ce %.4f）| "
                             "%d 个 batch / %.1f s［取数 %.1f s + 计算 %.1f s］| "
                             "验证整卷 Dice %.4f［%s；min %.3f max %.3f］/ %.1f s | "
+                            "IoU %.4f 精确率 %.4f 召回率 %.4f | 预测体素 %d（GT %d）峰值概率 %.4f | "
                             "best %.4f@ep%d | patience %d/%d | 峰值显存 %.0f MB",
-                            epoch, epochs, current_lr, train_stats["loss"], train_stats["dice_loss"],
+                            epoch, epochs, epoch_lr, train_stats["loss"], train_stats["dice_loss"],
                             train_stats["ce_loss"], train_stats["batches"], train_stats["seconds"],
                             train_stats["data_seconds"], train_stats["compute_seconds"],
                             val_stats["dice_mean"], per_case, val_stats["dice_min"],
-                            val_stats["dice_max"], val_stats["seconds"], float(best["dice"]),
+                            val_stats["dice_max"], val_stats["seconds"],
+                            val_stats["iou_mean"], val_stats["precision_mean"],
+                            val_stats["recall_mean"],
+                            int(val_stats["pred_voxels_total"]), int(val_stats["gt_voxels_total"]),
+                            float(val_stats["prob_peak_max"]),
+                            float(best["dice"]),
                             int(best["epoch"]), patience, early_stop, train_stats["peak_memory_mb"])
+                if int(val_stats["pred_voxels_total"]) == 0:
+                    LOGGER.warning("本轮验证**一个前景体素都没预测**（pred_voxels=0，峰值概率 %.4f）："
+                                   "这就是第 3 轮首折的塌缩形态。先看训练那行的 dice 项是否贴在 0.9 附近"
+                                   "横盘、ce 是否 <0.01；处置见 docs/preprocess_notes.md 8.1。",
+                                   float(val_stats["prob_peak_max"]))
             else:
                 LOGGER.info("epoch %d/%d | lr %.2e | 训练 loss %.4f（dice %.4f + ce %.4f）| "
                             "%d 个 batch / %.1f s［取数 %.1f s + 计算 %.1f s］| "
                             "本轮不验证（val_every=%d）| best %.4f@ep%d | 峰值显存 %.0f MB",
-                            epoch, epochs, current_lr, train_stats["loss"], train_stats["dice_loss"],
+                            epoch, epochs, epoch_lr, train_stats["loss"], train_stats["dice_loss"],
                             train_stats["ce_loss"], train_stats["batches"], train_stats["seconds"],
                             train_stats["data_seconds"], train_stats["compute_seconds"],
                             val_every, float(best["dice"]), int(best["epoch"]),

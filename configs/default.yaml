@@ -27,7 +27,10 @@ preprocess:
 
 # ---------- 模型 ----------
 model:
-  in_channels: 1
+  in_channels: 3                  # 2.5D 三层输入（第 4 轮）：必须是 2×data.z_context+1。
+                                  #   dataset 把 [z-1, z, z+1] 三层叠成通道维，标签仍取中心层 z；
+                                  #   远端层用端点复制（z=0 时三层都是切片 0），不会跨病人取层。
+                                  #   改成 1 就退回单层 2D 口径（此时 data.z_context 必须为 0）。
   out_channels: 2                 # 0=背景, 1=肿瘤（label 1 肝脏已置 0）
   encoder_channels: [32, 64, 128, 256]
   norm: batch
@@ -46,11 +49,25 @@ data:
   target_hw: [512, 512]           # 面内统一补边到的目标尺寸（H, W）；只能比实际尺寸大，不能小
   pad_align: center               # center = 居中补边（默认）；bottom-right = 右侧/下侧补 0
                                   # 补边值与背景同为 0；非 512 病例的补边区在增强后不再严格为 0
+  z_context: 1                    # 2.5D 上下文半径：1 = 取 [z-1, z, z+1] 三层当 3 通道输入。
+                                  #   0 = 退回单层 2D（此时 model.in_channels 必须是 1）。
+                                  #   边界层用**端点复制**（z=0 → 三层都是第 0 层；z=nz-1 → 三层都是最后一层），
+                                  #   不做跨病人取层（样本的 (case,z) 只在本病例内索引）。
+                                  #   几何增强对三通道施加同一套参数，强度增强只作用于中心通道。
   index_cache_size: 8             # 每个 worker 缓存的 nibabel 句柄数（num_workers × 该值 = 并发句柄上限）
   num_workers: 8                  # 远程 52 核，8 worker × lru_cache(8) 句柄可控
   pin_memory: true
   persistent_workers: false       # 折内 epoch 之间不重建 worker（调试时可保持不变）
   val_batch_size: null            # null = 用 train.batch_size；验证是顺序读，只影响速度
+  pos_ratio_train: 0.5            # **训练侧平衡采样**（第 4 轮）：一轮的槽位里阳性层占比目标。
+                                  #   0.5 = 每批正负各半（bs=16 → 8 正 8 阴）。阴性层不再要求
+                                  #   「一轮不重复」，阳性层按需重复（重复上限见 max_pos_repeat）。
+                                  #   验证侧**不受影响**：val loader 仍顺序读、保持原始 9.85% 分布。
+  min_pos_per_batch: 2            # 每批阳性层数下限（batch 很小时防止比例取整成 0）
+  max_pos_repeat: 8               # 单个阳性层一轮最多重复几次（防止过拟合到少数层；
+                                  #   比例因此可能达不到 pos_ratio_train，日志会打印实际值）
+  epoch_samples: null             # 一轮总槽位数预算；null = 用数据集切片数（≈ 旧口径的一轮样本量），
+                                  #   于是 epoch 墙钟基本不变、只是比例改了。给了数就按它算 batch 数。
   pos_ratio_tolerance: 0.20       # 自检脚本判定「实测阳性比例偏离目标」的阈值
   verify_batch: true              # collate 时校验 batch 不变量（形状/值域/label 取值），开销可忽略
   augment:                        # 仅训练；验证侧不做任何几何变换
@@ -63,9 +80,9 @@ data:
     rotation_deg: 15.0            # 旋转 ±15°
     scale_range: [0.9, 1.1]       # 缩放 0.9–1.1（采样坐标口径，>1 = 内容放大）
     shift_frac: 0.1               # 平移 ±10% 面内边长（按 512 换算成像素位移）
-    gamma_prob: 0.2               # 随机 gamma 校正 img**gamma（单调的强度重排，只动 image）
+    gamma_prob: 0.2               # 随机 gamma 校正 img**gamma（单调的强度重排；2.5D 下只动**中心通道**）
     gamma_range: [0.75, 1.33]     #   <1 提亮、>1 压暗；要求输入已在 [0,1]（cache 正好是）
-    noise_prob: 0.2               # 高斯噪声，只动 image
+    noise_prob: 0.2               # 高斯噪声（2.5D 下只动中心通道；相邻层是真实数据，不该被噪声改掉）
     noise_std: 0.01               #   sigma 每次从 U(0, noise_std) 抽，故 0.01 是强度上界
 
 # ---------- 损失（src/losses.py，手搓 Dice + CE，不依赖 MONAI） ----------
@@ -73,7 +90,7 @@ loss:
   softmax: true                   # 对 logits 做 softmax（多类互斥：0=背景 1=肿瘤）
   to_onehot_y: false              # 本版 label 是 (B,H,W) 整数；Dice 内部一律转 one-hot
   batch: true                     # true = 交集/并集在整个 batch 上聚合；false = 逐样本再平均
-                                  #   batch 内常只有 1~2 个含肿瘤切片，逐样本口径更容易被空样本带偏
+                                  #   注意：与 dice_positive_only 的分工见 docs/preprocess_notes.md 8.2
   lambda_dice: 1.0                # 总损失 = λ_dice × (1 - Dice) + λ_ce × CE
   lambda_ce: 1.0
   include_background: false       # Dice 只算**肿瘤类**（不含背景）。这是第 3 轮首次正式训练踩出来的：
@@ -82,17 +99,29 @@ loss:
                                   #   就是这个解，验证整卷 Dice 恒为 0.0000），模型两个 epoch 就掉进去出不来。
                                   #   改成 false 后 dice 项 = 1 - 肿瘤 soft Dice，全背景解的损失是 1.0，
                                   #   必须找到肿瘤才能下降——与我们的上报指标（肿瘤整卷 Dice）同向。
+  dice_positive_only: true        # **Dice 项只在含前景的样本上算**（第 4 轮）：batch 里先挑出
+                                  #   Y.sum()>0 的样本，在这部分上聚合 soft Dice；全背景的样本
+                                  #   不参与 Dice（它们的 Y 全 0，只会把并集分母撑大、把梯度摊薄），
+                                  #   **但 CE 仍然对整批所有样本计算**（背景压 FP 的信号不能丢）。
+                                  #   与平衡采样配套：每批正负各半时，这一项保证 Dice 梯度只花在
+                                  #   「有肿瘤可找」的样本上。batch=false 时按逐样本口径筛选后再平均。
   smooth: 0.00001                 # Dice 平滑项（防「预测与 GT 都为空」时 0/0）
-  ce_class_weights: null          # 例：[0.2, 1.0] 给肿瘤类加权；null = 不加权
+  ce_class_weights: null          # **下一级杠杆**（默认不加权，第 4 轮先不动）：例 [0.2, 1.0] 给肿瘤类
+                                  #   加权，等价于把「背景像素主导 CE」再压一档。触发条件：换成平衡采样
+                                  #   + dice_positive_only 后 dice 项仍长期在 0.8 以上横盘（即依旧欠检出）
+                                  #   才启用；用 --set loss.ce_class_weights=[0.2,1.0] 即可试，无需改代码。
 
 # ---------- 训练 ----------
 train:
-  batch_size: 16                  # 第 3 轮按 --debug 实测定的：显存两点外推 ≈ 376 MB/样本 + 4.7 GB 静态
-                                  #   → bs=16 峰值 ≈ 10.7 GB（bs=2 实测 5416 MB、bs=8 实测 7671 MB，
-                                  #   40 GB 卡余量充足）。选 16 而不是更大：fold 0 上 bs=16 → 一轮 351 个
-                                  #   batch、每批 1~2 个阳性、**全阴性 batch 归零**，且每 epoch 仍有 351 次
-                                  #   参数更新（bs=32 只剩 176 次，样本量这么小时更新次数更值钱）。
-  lr: 0.001
+  batch_size: 16                  # 第 3 轮按 --debug 实测定的（bs=16 峰值 10920 MB / reserved 12152 MB，
+                                  #   40 GB 卡余量充足）。**第 4 轮 2.5D 后要重新标定**：输入通道 1→3，
+                                  #   第一级特征图显存上升，先跑
+                                  #   python -m src.train --fold 0 --debug --set train.batch_size=16 复测。
+  lr: 0.001                       # 第 3 轮口径（AdamW + cosine 退火到 0，T_max=epochs）。
+                                  #   第 3 轮首折实测：12 轮内 dice 项从 0.94 只降到 0.90、验证整卷 Dice
+                                  #   恒 ≈0.000 —— lr 不背这个锅（根因是采样比例，见 todo 第 4 轮），
+                                  #   所以第 4 轮**先不改 lr**，等新采样口径的曲线出来再定。要试就：
+                                  #   --set train.lr=5e-4 / --set train.min_lr_ratio=0.01
   weight_decay: 0.0001
   scheduler: cosine               # CosineAnnealingLR（none = 不用调度器）
   min_lr_ratio: 0.0               # eta_min = lr × 该值（0 = 余弦退火到 0；0.01 = 留 1% 学习率）
@@ -101,11 +130,9 @@ train:
   amp: bf16                       # A100 支持 bf16；bf16 只用 autocast、**不启用 GradScaler**
                                   #   （bf16 与 fp32 同指数范围，不需要 loss scaling；fp16 才会开）
                                   #   off = 纯 fp32（排查 NaN 时可用）
-  pos_ratio_target: 0.30          # batch 内阳性层数的**上限**（round(bs×该值)，bs=8 → 2）。
-                                  # 注意实际每批阳性数 = 阳性层总数/一轮 batch 数：fold 0 实测
-                                  # bs=8 时一轮 642 个 batch、617 个阳性层 → 每批实际 1 个、25 个
-                                  # 全阴性 batch；想提高每批阳性数优先调大 batch_size（bs=16 → 1~2 个、
-                                  # 全阴性 0 个），见 docs/preprocess_notes.md 6.3
+  pos_ratio_target: 0.30          # **第 4 轮起此键不再生效**（保留只为兼容旧命令与旧 checkpoint 指纹）。
+                                  #   实际每批阳性数改由 data.pos_ratio_train / data.min_pos_per_batch /
+                                  #   data.max_pos_repeat 决定；采样器构造时会打印一行「忽略」提示。
   val_every: 1                    # 每多少轮做一次整卷验证（早停与 best.pt 只看验证轮）
   grad_clip_norm: 0.0             # >0 时对梯度做裁剪
   log_every: 50                   # 每多少个 batch 打一行进度（0 = 只在 epoch 结束时打）

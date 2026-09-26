@@ -42,17 +42,18 @@ python scripts/preprocess.py        # 预处理 → cache/（第 1 轮，已跑�
 python scripts/inflate_cache.py --remove-gz   # 第 3 轮：把已有的 .nii.gz 缓存就地转成 .nii（一次性，可省则省）
 python scripts/check_cache.py       # 缓存体检（已跑过）
 python scripts/make_splits.py       # 5 折划分 → data/splits.json（已跑过）
-python -m src.train --fold 0 --debug   # 第 3 轮：冒烟跑 3 个 iteration，看形状/显存/耗时（不落盘）
+python -m src.selfcheck_data        # 第 4 轮：数据回归自检（2.5D 三层窗 + 平衡采样器 + 病人级隔离）
+python -m src.train --fold 0 --debug   # 第 4 轮：冒烟自检，看形状（3 通道）/显存/耗时（不落盘）
 python -m src.train --fold 0           # 正式训练（每轮整卷验证 + 早停 + best.pt）
 python -m src.train --fold 0 --resume  # 中断后续跑（从 runs/fold0/last.pt 恢复）
 for f in 0 1 2 3 4; do python -m src.train --fold $f; done   # 5 折
-python -m src.evaluate --all        # 第 4 轮：汇总 5 折指标
+python -m src.evaluate --all        # 第 5 轮：汇总 5 折指标
 ```
 
 自检 / 核对类（改过对应代码后才需要重跑；只读 cache，不需要 GPU，不写 runs/）：
 
 ```bash
-python -m src.selfcheck_data        # 第 2 轮：数据进模型的形态（shape/值域/标签/补边/增强/采样器）
+python -m src.selfcheck_data        # 数据进模型的形态（2.5D 三层窗 / 平衡采样器 / 增强 / 补边）
 python scripts/probe_axis.py --case 31   # 只在改动写盘逻辑后需要重跑
 ```
 
@@ -60,18 +61,20 @@ python scripts/probe_axis.py --case 31   # 只在改动写盘逻辑后需要重�
 「cache 与配置、代码三者是否自洽」，任何一轮改了预处理、dataset、配置之后都应当重跑一遍
 （秒级到十几秒）。它不产生训练产物，也不需要 GPU（日志里的显存行只是顺带报告）。
 
-## 模块一览（第 3 轮后）
+## 模块一览（第 4 轮后）
 
 | 文件 | 作用 |
 | --- | --- |
-| `src/dataset.py` | 切片数据集（补边到 512×512）、`ProportionalBatchSampler`、自实现 2D 增强、batch 契约 |
-| `src/unet.py` | 手搓 2D U-Net（`DoubleConv2d` / `UNet2D`），预训练接口占位 |
-| `src/losses.py` | 手搓 `DiceCELoss`（softmax + CE + soft Dice）与 `build_loss(cfg)` |
-| `src/infer.py` | 整卷推理：`predict_volume` / `seg_prob_to_label` / `load_label_volume`（第 3 轮提前落地） |
-| `src/train.py` | 训练入口：前置校验 → 训练 → 每轮整卷验证 → 早停 → checkpoint / metrics.csv / TensorBoard；`--debug` / `--resume` |
-| `src/selfcheck_data.py` | 数据侧回归自检（只读 cache） |
+| `src/dataset.py` | 切片数据集（2.5D 三层窗 + 补边到 512×512）、`BalancedBatchSampler`（每批正负定比）、自实现 2D 增强、batch 契约 |
+| `src/unet.py` | 手搓 2D U-Net（`DoubleConv2d` / `UNet2D`）；`in_channels` 与 `data.z_context` 两处自洽校验 |
+| `src/losses.py` | 手搓 `DiceCELoss`（softmax + CE + soft Dice，`dice_positive_only` 只对含前景样本算 Dice）与 `build_loss(cfg)` |
+| `src/infer.py` | 整卷推理：`predict_volume` / `seg_prob_to_label` / `load_label_volume`（拼卷逻辑与输入通道数无关） |
+| `src/train.py` | 训练入口：前置校验 → 训练 → 每轮整卷验证（Dice/IoU/精确率/召回率/塌缩指标）→ 早停 → checkpoint / metrics.csv / TensorBoard；`--debug` / `--resume` |
+| `src/selfcheck_data.py` | 数据侧回归自检（只读 cache）：补边 / 2.5D 三层窗 / 增强 / 平衡采样器 / 病人级隔离 |
 
 ## 其他约定
 
 - 显存 40 GiB 单卡：优先 patch-based（如 96³–128³）训练，注意 `num_workers` 与 52 核的匹配。
 - 代码风格与运行说明随改动一起更新，但保持精简；实验配置、随机种子、指标口径要写清楚，便于跨轮次复现。
+- **病人级隔离是硬约束**：划分、采样、增强、2.5D 窗口都只能在本病例内部取数据，任何改动都要过
+  `src/selfcheck_data.py` 里那几条断言（见 `docs/preprocess_notes.md` 8.3）。

@@ -159,10 +159,12 @@ def predict_volume(model: torch.nn.Module, case, cache_dir, cfg: dict, device=No
     """对一个病例做整卷推理，返回 ``(prob, pred, meta)``。
 
     参数：
-        model：``src.unet.UNet2D``（或任何 ``(B,1,H,W) → (B,C,H,W)`` 的网络）。
+        model：``src.unet.UNet2D``（或任何 ``(B,C,H,W) → (B,C',H,W)`` 的网络，C 由
+            ``data.z_context`` 决定：1 → 单层 2D，3 → 2.5D 三层窗）。
         case：病例号（int 或字符串数字）。
         cache_dir：``cache/`` 根目录（其下 ``image/`` 与 ``label/``）。
-        cfg：总配置（读 ``data.target_hw`` / ``data.pad_align`` / ``eval.threshold`` / amp 口径）。
+        cfg：总配置（读 ``data.target_hw`` / ``data.pad_align`` / ``data.z_context`` /
+             ``eval.threshold`` / amp 口径）。
         device：推理设备；``None`` 时取模型参数所在设备（与模型不一致会直接报错，不静默搬运）。
         pad_to_multiple：与 ``model.pad_to_multiple`` 对齐；``data.target_hw`` 不是它的整数倍时
             只打印一条告警（模型前向内部会补边再裁回，结果仍然正确，只是多一层无谓开销）。
@@ -175,11 +177,13 @@ def predict_volume(model: torch.nn.Module, case, cache_dir, cfg: dict, device=No
         prob：``(H, W, Z)`` float32，肿瘤通道概率，**已裁回补边前的原始面内尺寸**；
         pred：``(H, W, Z)`` uint8 ∈ {0,1}，``prob >= threshold``；
         meta：dict（case / orig_hw / target_hw / pad_offset / n_slices / threshold / amp /
-              device / batch_slices / seconds / tumor_channel / prob_peak）。
+              device / batch_slices / seconds / tumor_channel / in_channels / prob_peak /
+              pred_voxels）。
 
     实现要点：
-        * 逐层读取复用 ``CTSliceDataset``（与训练完全同一套“/65535 → 居中补边”口径），
-          不另写一份读盘逻辑——两处口径一旦分叉，验证指标就会骗人；
+        * 逐层读取复用 ``CTSliceDataset``（与训练完全同一套「2.5D 三层窗 → /65535 → 居中补边」
+          口径），因此调用方**不需要**知道输入是 1 通道还是 3 通道——dataset 出来什么就喂什么。
+          这也是「读盘口径只有一份」的价值：2.5D 落地时本文件的拼卷逻辑一行都不用改。
         * 概率先写进 ``(target_h, target_w, nz)`` 画布，**最后统一按 pad_offset 裁回**；
         * 模型暂时切到 ``eval()``，函数返回前恢复原来的 ``train/eval`` 状态。
     """
@@ -257,6 +261,8 @@ def predict_volume(model: torch.nn.Module, case, cache_dir, cfg: dict, device=No
         "n_slices": n_slices,
         "threshold": float(thr),
         "tumor_channel": tumor_channel,
+        "in_channels": int(dataset.in_channels),   # 1 = 单层 2D；3 = 2.5D 三层窗
+        "z_context": int(dataset.z_context),
         "amp": amp_name if use_amp else "off",
         "device": str(torch_device),
         "batch_slices": batch_slices,

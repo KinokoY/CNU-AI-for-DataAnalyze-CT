@@ -7,6 +7,14 @@
 跑完每一步请把终端输出贴回本地：第 1 步（预处理）与第 3 步（数据自检）是几何口径的依据，
 第 4.1 步（`--debug`）是 batch_size 与训练链路的实测依据——这三处的输出尤其要贴回来。
 
+> **第 4 轮（当前）改了什么、要重跑什么**：训练口径换成**平衡采样**（每批正负定比，默认各半）
+> + **Dice 只对含前景的样本算** + **2.5D 三层输入**（`data.z_context=1` → `model.in_channels=3`）
+> + 验证侧新增 IoU/精确率/召回率与塌缩指标。**缓存与划分不用动**（预处理指纹不变，不需要重跑
+> `preprocess.py` / `fetch_manifest.py`）。远程要按顺序跑：
+> `python -m src.selfcheck_data` → `python -m src.train --fold 0 --debug` →
+> `python -m src.train --fold 0 --out-dir runs/smoke_fold0 --set train.epochs=12`（短跑判读）。
+> 改动理由与第 3 轮首折的塌缩复盘见 `docs/preprocess_notes.md` 第八节。
+
 ---
 
 ## 0. 环境确认（秒级）
@@ -163,17 +171,42 @@ python scripts/make_splits.py
 
 ---
 
-## 3. 数据自检（第 2 轮交付，秒级到十几秒）
+## 3. 数据自检（第 2 轮交付、第 4 轮扩充，秒级到十几秒）
 
 ```bash
 python -m src.selfcheck_data
 ```
 
 做什么（只读 cache，不建模型、不训练）：核对 splits / 清单 / 预处理指纹 → 构建 train 与 val
-两侧的 `CTSliceDataset`（都统一补边到 512×512）→ 实测 3 个 batch 的形态 → 打印一个病例的逐层
-肿瘤体素数曲线 → 自检增强与采样器 → 把结果写到 `reports/selfcheck_data.json`。
+两侧的 `CTSliceDataset`（都统一补边到 512×512、**2.5D 三层窗**）→ 实测 3 个 batch 的形态 →
+打印一个病例的逐层肿瘤体素数曲线 → 自检增强、**2.5D 三层窗**与**平衡采样器** →
+把结果写到 `reports/selfcheck_data.json`。
 
-期望输出（关键几行；下面的数字是 fold 0 的**实测值**）：
+**第 4 轮新增/变化的输出行**（数字是 fold 0 的口径举例，实跑以贴回的为准）：
+
+```
+第 4 轮数据自检：Dataset（2.5D 3 通道 + 统一补边到 512x512）+ 平衡采样器 + 增强（fold=0）
+整体阳性率：train 侧 0.1381（617/4469），val 侧 0.0985（149/1513）；**训练侧平衡采样目标 0.50**（≈ 3.6 倍过采样），验证侧保持原始分布不做平衡
+BalancedBatchSampler：batch_size=16，data.pos_ratio_train=0.50 → 每批 8 正 + 8 阴（实际阳性占比 0.500）；seed=42
+  数据集 4469 层切片（阳性 617 / 阴性 3852）；槽位预算 4469（data.epoch_samples=null→用切片数） → 一轮 280 个 batch / 4480 个槽位
+  阳性层一轮重复 3.63 次（上限 data.max_pos_repeat=8，各层尽量均摊）；阴性层覆盖率 36.2%（不再要求一轮全过一遍）
+  病人级隔离：样本索引只在本折 train 病例内重排与重复（不跨病人、不引入 val 病例）；病例集合 [...]
+训练侧每批阳性数（计划值，定值）：8 正 + 8 阴 = 16；一轮 280 个 batch / 4480 个槽位；...
+2.5D 窗口自检（z_context=1 → 3 通道）：抽 3 例查首/中/末层 —— 首层窗口 [0, 0, 1]、末层窗口 [nz-2, nz-1, nz-1]；中心通道与单层读取不一致 0 处；上下文通道与邻居层不一致 0 处；端点复制+中心一致+上下文干净 3/3 例；增强确实改了中心层 N/M 例
+采样器自检：每轮 280 个 batch（计划 280）× 16 = 4480 个槽位；每批阳性数 [8]（计划 8 正 + 8 阴）；同 epoch 可复现=True；相邻 epoch 不同=True；batch 大小越界=0 种；阳性层出现 2240 次/去重 617 个（重复 3~4 次，上限 8）；阴性层出现 ... 次/去重 ... 个（覆盖率 36.2%）；全阴性 batch=0；抽到的病例 [...]（越界 0 个）
+```
+
+第 4 轮的判读要点：
+
+- **`每批阳性数 [8]` 是定值**：每批恰好 `n_pos = clamp(round(bs × pos_ratio_train), min_pos_per_batch, bs−1)`
+  个含肿瘤切片。旧的 `train.pos_ratio_target` 是"上限"、实际由均摊决定（每批 1~2 个），那个口径已废弃。
+- **阳性层重复 3~4 次是设计**：阳性层只有 617 个，凑出 50% 的比例必须重复；上限 `data.max_pos_repeat`。
+- **阴性层覆盖率掉到 ~36% 也是设计**：只有阳性层还保证"一轮至少出现一次"，阴性层改为轮转池重复抽取。
+- **`（越界 0 个）`必须是 0**：病人级隔离断言，非 0 立即停手并贴回该行。
+- **2.5D 行的两个"不一致 0 处"**：中心通道必须等于"该层单独读一次"、上下文通道必须等于"相邻层
+  单独读一次"。非 0 说明窗口叠层/补边/通道顺序写错了，贴回该行与上面的 batch 行。
+
+期望输出（关键几行；下面的数字是 fold 0 的**第 3 轮实测值**，第 4 轮改口径后会有变化，以实跑为准）：
 
 ```
 划分：data/splits.json，5 折，每折 train=[21, 21, 21, 21, 21] / val=[4, 4, 4, 4, 4]
@@ -183,24 +216,16 @@ split=train fold=0：21 例、4469 层切片、含肿瘤 617 层（0.1381）、�
   原始   342x342：切片   480（含肿瘤   15 =  3.12%）  病例  1 例 [55]  补边占比 55.38%
   原始   512x512：切片  2187（含肿瘤  376 = 17.19%）  病例 16 例 [...]  补边占比 0.00%
 split=val fold=0：4 例、1513 层切片、含肿瘤 149 层（0.0985）、原始面内尺寸 4 种 → 统一补边到 512x512（center）
-原始面内尺寸与清单逐例一致（21 例）：{'342x342': 1, '351x351': 1, '411x411': 1, '424x424': 1, '436x436': 1, '512x512': 16}
-整体阳性率：train 侧 0.1381（617/4469），val 侧 0.0985（149/1513）；目标 batch 内比例 0.30（≈ 2.2 倍过采样）
-训练侧可达阳性数/批：理想 2 / 本轮计划 0~1（617 个阳性层摊到 642 个 batch）；计划前 12 批 = [1, 1, ...]
-batch 1：image (8, 1, 512, 512) / label (8, 512, 512)；病例 ['34', '37', '42', '45', '53', '54', '55']；z=[...]
-        值域 [0.0000, 1.0000]；label 取值 [0, 1]；**含肿瘤切片 1/8 = 0.125**（配置目标 0.30）；补边样本 4/8（补边像素均值 18.2%）
-        orig_hw [[512, 512], [436, 436], ...]；补边偏移 [[0, 0], [38, 38], ...]
-        取该 batch 耗时 6.7 s（含首次冷读），其后 0.008 s
+batch 1：image (16, 3, 512, 512) / label (16, 512, 512)（2.5D 3 通道 = 层 [z-1, z, z+1] 为中心）；病例 [...]；z=[...]
+        中心通道值域 [0.0000, 1.0000]；label 取值 [0, 1]；**含肿瘤切片 8/16 = 0.500**（平衡采样目标 0.50）；补边样本 .../16
+        orig_hw [...]；补边偏移 [...]；三层窗 [[0,0,1], [0,1,2], ...]
+        取该 batch 耗时 ... s（含首次冷读），其后 ... s
 3 个 train batch 的空间维只有 1 种：[(512, 512)]（统一补边后应恒为 1 种）
 逐层肿瘤体素数（case 56）：nibabel shape=(nx,ny,nz)=(411, 411, 478)，切片轴=最后一维，含肿瘤层 132/478，峰值在第 389 层
   首 10% 层（z<48）阳性占比 0.000，尾 10% 层阳性占比 0.104
 增强自检（16 个样本 = 8 含肿瘤 + 8 全背景）：image 被改动 15 个（0.94）；含肿瘤组的 label 被改动 8/8（1.00）；全背景组 label 仍全空 8/8
-ProportionalBatchSampler：batch_size=8 pos_ratio_target=0.3 → n_pos=2/批（实际比例 0.250）seed=42
-  数据集 4469 层切片（阳性 617 / 阴性 3852），一轮 642 个 batch；阳性层均摊后每批 0 个的有 25 批、1 个的有 617 批
-采样器自检：每轮 642 个 batch（预期下限 642；切片数/batch_size ≈ 558.6）；同 epoch 可复现=True；
-        相邻 epoch 不同=True；batch 大小越界=0 种；阳性层抽到 617 次/去重 617 个（共 617）；
-        覆盖切片 4469/4469；全阴性 batch=25
-自检通过：21 例 / 4469 层切片的形态、值域、标签、补边、增强与采样比例均符合约定。
-下一步：第 3 轮 python -m src.train --fold 0 --debug
+自检通过：21 例 / 4469 层切片的形态、值域、标签、2.5D 三层窗、补边、增强与平衡采样比例均符合约定。
+下一步：python -m src.train --fold 0 --debug（冒烟自检，不落盘）
 ```
 
 判读要点：
@@ -269,21 +294,27 @@ ProportionalBatchSampler：batch_size=8 pos_ratio_target=0.3 → n_pos=2/批（�
 
 ---
 
-## 4. 第 3 轮：模型 + 损失 + 训练（冒烟 → 标定 → 正式 → 续跑）
+## 4. 训练（冒烟 → 标定 → 正式 → 续跑）：第 3 轮落地、第 4 轮换口径
 
 交付物：`src/unet.py`（手搓 2D U-Net）、`src/losses.py`（手搓 Dice+CE）、`src/train.py`（训练入口），
-以及**提前到本轮落地**的 `src/infer.py`（整卷推理：`predict_volume` / `seg_prob_to_label` / `load_label_volume`）——
-每轮验证要用整卷推理，第 4 轮只在它上面补 `postprocess` / `metrics` / `evaluate`。
+以及 `src/infer.py`（整卷推理：`predict_volume` / `seg_prob_to_label` / `load_label_volume`）——
+训练期每轮验证用它，`evaluate` 只在它上面补 `postprocess` / `metrics` / `evaluate`。
 
-代码要点（细节见 `docs/preprocess_notes.md` 第七节）：
+代码要点（细节见 `docs/preprocess_notes.md` 第七、八节）：
 
+- 输入：**2.5D 三层窗**（`data.z_context=1` → `model.in_channels=3`，`[z−1, z, z+1]` 叠成通道，
+  标签只监督中心层）。标量切片仍是 512×512、统一居中补边。
 - 网络：4 级下采样 U-Net，编码 `32/64/128/256`、瓶颈 `512`，`MaxPool2d` 下采样、
   `ConvTranspose2d` 上采样 + 跳跃拼接，`BatchNorm` + ReLU，输出 2 通道 logits（0=背景 1=肿瘤）；
   前向内部按 `pad_to_multiple=16` 对齐（512 已是 16 的倍数，正式流程不会触发）。
-- 损失：自实现 `DiceCELoss = 1×(1 - Dice) + 1×CE`，`softmax=True`、`batch=True`（整 batch 聚合）、
-  背景类计入 Dice、`smooth=1e-5`；**不做补边区域 ignore mask**（第 6 轮再定）。
-- 验证：每轮对验证集 4 例做**整卷推理**，逐例算整卷肿瘤 Dice 再取平均（macro，每例等权），
-  用它选 `best.pt` 与早停；不逐层平均（空切片会把指标稀释掉）。
+- 采样：`BalancedBatchSampler` 每批固定 `n_pos` 正 + `n_neg` 阴（`data.pos_ratio_train=0.5`
+  → bs=16 时 8 正 8 阴）；阳性层重复次数上限 `data.max_pos_repeat`；**验证侧不做平衡采样**。
+- 损失：自实现 `DiceCELoss = 1×(1 - Dice) + 1×CE`，`softmax=True`、`batch=True`、`include_background=false`、
+  **`dice_positive_only=true`（Dice 只对含前景的样本聚合，CE 仍对整批算）**、`smooth=1e-5`；
+  **不做补边区域 ignore mask**（需要时再说）。
+- 验证：每轮对验证集 4 例做**整卷推理**，逐例算整卷 Dice / IoU / 精确率 / 召回率再取平均（macro，
+  每例等权），外加 `pred_voxels_total` 与 `prob_peak_max` 两个塌缩指标；
+  用 Dice 选 `best.pt` 与早停；不逐层平均（空切片会把指标稀释掉）。
 - AMP：`bf16` 只用 autocast，**不启用 GradScaler**（bf16 与 fp32 同指数范围，不需要 loss scaling）；
   `amp: fp16` 才启用 GradScaler；`amp: off` 走纯 fp32（排查 NaN 用）。
 - 随机性：`train.seed` 固定 random/numpy/torch/cuda；采样顺序由 `(seed, epoch, 病例集合)` 派生，
@@ -295,41 +326,49 @@ ProportionalBatchSampler：batch_size=8 pos_ratio_target=0.3 → n_pos=2/批（�
 python -m src.train --fold 0 --debug
 ```
 
-做什么：校验 `data/splits.json` 与 `cache/cache_manifest.json`（病例集合 + 预处理指纹）→ 只取该折
-**前 2 例**建数据集（`batch_size=2`）→ 跑 3 个 iteration，打印每个 batch 的 shape / 值域 / label 取值 /
-**实测阳性比例** / 分段耗时（取 batch、搬 GPU、前向+损失、反向、优化器）/ 显存 allocated 与峰值 →
+做什么：校验 `data/splits.json` 与 `cache/cache_manifest.json`（病例集合 + 预处理指纹 +
+**2.5D 通道数和 `model.in_channels` 是否自洽**）→ 只取该折 **前 2 例**建数据集（`batch_size=2`）→
+跑 3 个 iteration，打印每个 batch 的 shape / 中心通道值域 / label 取值 / **实测阳性比例** /
+**三层窗层号** / 分段耗时（取 batch、搬 GPU、前向+损失、反向、优化器）/ 显存 allocated 与峰值 →
 再用**当前（随机）权重**对 1 例验证病人做一次整卷推理，确认 `prob (H,W,Z)` 形状、`pad_offset` 裁回与
 GT 卷形状一致 → 退出，**不创建 `runs/`**。
 
-期望输出（**下面是 fold 0 在远程的实测日志，只做了截断**；病例与 z 会随折不同）：
+期望输出（**下面是 fold 0 的形态示例；`--set train.batch_size=16` 时的第 3 轮实测数字仍可对照**）：
 
 ```
 前置校验通过：fold 0 的 train 21 例 [31, 32, ...] / val 4 例 [33, 57, 59, 60]；cache 清单 25 例，预处理指纹与配置一致；splits 指纹 c96d9c1092ad27a0
---debug 冒烟自检：训练侧 2 例 [31, 32] / 230 层切片 / 一轮 18 个 batch；batch_size=16；跑 3 个 iteration 后退出（**不写 runs/**）
-iteration 1：image (16, 1, 512, 512) / label (16, 512, 512)（logits (16, 2, 512, 512)）；病例 ['31', '32']
-  值域 [0.0000, 1.0000]；label 取值 [0, 1]；**含肿瘤切片 3/16 = 0.188**（配置目标 0.30）；orig_hw [[512, 512], [512, 512], [512, 512]]；补边偏移 [[0, 0], [0, 0], [0, 0]]
-  loss 1.5927（dice 0.6832 + ce 0.9095）；各 batch 分段耗时：取 batch 0.588 s / 搬到 GPU 0.009 s / 前向+损失 1.690 s / 反向 9.869 s / 优化器 0.071 s；显存 allocated 209 MB / 峰值 10920 MB
-iteration 2：…… 前向+损失 0.066 s / 反向 0.117 s / 优化器 0.001 s……
-平均（排除第 1 个 iteration 的冷启动）：前向+损失 0.065 s / 反向 0.117 s / 优化器 0.001 s → 单步合计 0.183 s（batch_size=16）
-峰值显存（batch_size=16，512×512 输入，amp=bf16）：allocated 10920 MB / reserved 12152 MB（含约 4.7 GB 不随 batch 增长的静态开销：cuDNN autotune 工作区；两点标定见 docs/baseline.md 4.1）
-要标定更大的 batch 就直接复测（一次约 1 分钟，比任何外推都准）：python -m src.train --fold 0 --debug --set train.batch_size=32
+设备：cuda（NVIDIA A100-PCIE-40GB）；随机种子：42；目标面内尺寸：512x512（pad_align=center）；输入：2.5D 三层窗 z±1（3 通道）
+--debug 冒烟自检：训练侧 2 例 [31, 32] / 230 层切片 / 一轮 18 个 batch；batch_size=16；输入 2.5D z±1（3 通道）；跑 3 个 iteration 后退出（**不写 runs/**）
+BalancedBatchSampler：batch_size=16，data.pos_ratio_train=0.50 → 每批 8 正 + 8 阴（实际阳性占比 0.500）；seed=42
+iteration 1：image (16, 3, 512, 512) / label (16, 512, 512)（logits (16, 2, 512, 512)）；病例 ['31', '32']；z=[0, 1, 2, ...]；2.5D 窗口 [[0, 0, 1], [0, 1, 2], [1, 2, 3], ...]
+  值域 [0.0000, 1.0000]；label 取值 [0, 1]；**含肿瘤切片 8/16 = 0.500**（配置目标 0.50）；orig_hw [[512, 512], ...]；补边偏移 [[0, 0], ...]
+  loss 1.20xx（dice 0.60xx + ce 0.6xx）；各 batch 分段耗时：取 batch ... s / 搬到 GPU ... s / 前向+损失 ... s / 反向 ... s / 优化器 ... s；显存 allocated ... MB / 峰值 ... MB
+峰值显存（batch_size=16，512×512×3 通道输入，amp=bf16）：allocated ... MB / reserved ... MB
 整卷推理自检：case 33（用当前（随机）权重，……**指标数值本身没有意义**）
-  prob (512, 512, 135)（峰值 1.0000）/ pred (512, 512, 135)（前景 33153297 体素）/ GT (512, 512, 135)（前景 434721 体素）；整卷 Dice = 0.0245（随机权重）
-  原始面内 512x512 → 补边画布 512x512，pad_offset=(0, 0)，nz=135；推理耗时 2.6 s（infer_batch_slices=8，阈值 0.50）
+  prob (512, 512, 135)（峰值 ...）/ pred (512, 512, 135)（前景 ... 体素）/ GT (512, 512, 135)（前景 434721 体素）；整卷 Dice = ...（随机权重）
+  （随机权重下的指标同样没有意义，只看链路通不通）IoU ... / 精确率 ...（定义=...）/ 召回率 ...
+  原始面内 512x512 → 补边画布 512x512，pad_offset=(0, 0)，nz=135；推理耗时 ~2.6 s（infer_batch_slices=8，阈值 0.50）
 --debug 结束：**没有写盘**（runs/ 下不会出现本折产物）。
 ```
 
+> 说明 0（**第 4 轮先看这两条**）：`image` 的通道维必须是 **3**（`2×data.z_context+1`），
+> 且每个样本打印的 `2.5D 窗口` 必须是**连续三层**、中心那个等于该样本的 `z`；
+> `含肿瘤切片` 必须是 `n_pos`（bs=16 → 8），若还是 1~2 说明拉到的仍是旧采样器。
+>
 > 说明 1：debug 用的 2 例是**该折 train 排序后的前 2 例**（fold 0 → [31, 32]，val 前 1 例 → 33），
 > 所以每次 `--debug` 的病例都固定、日志可逐次对比。这两例都是 512×512，所以 `pad_offset` 是 `(0,0)`；
 > 抽到非 512 病例时会出现 `(85,85)` 这类非零偏移（342→512 的偏移），这是正常的。
 >
 > 说明 2：**整卷推理自检的耗时是最能反映缓存格式的数**——未压缩 `.nii` 下 case 33（135 层）是 2.6 s；
 > 还是 `.nii.gz` 时同一例要 **77 s**（见 1.3）。
+>
+> 说明 3：2.5D 之后每层要读 3 个切片（首末层是端点复制），**取数耗时会涨一点**，但未压缩缓存下
+> 仍是毫秒级；若 `--debug` 里"取 batch"明显变慢，先按 1.3 确认缓存格式，再考虑调大 `data.num_workers`。
 
 判读要点：
 
-- **`image (B,1,512,512)` / `label (B,512,512)` / `logits (B,2,512,512)`**：形状必须逐字对得上，
-  这是「dataset 补边 → 模型 → 损失」三处口径对齐的唯一证据。
+- **`image (B,3,512,512)` / `label (B,512,512)` / `logits (B,2,512,512)`**：形状必须逐字对得上，
+  这是「dataset 叠层 → 模型 → 损失」三处口径对齐的唯一证据。
 - **首个 iteration 的 loss 在 1.4~1.7 之间是正常的**：随机初始化时 logits 近似为 0，
   背景类拿不到「几乎全对」的 Dice（实测 dice 项 ≈0.68，对应背景 Dice≈0.65 而不是 0.97），
   CE 也略高于 ln2（实测 ≈0.91，说明随机权重下模型是"自信地乱猜"）。
@@ -338,23 +377,23 @@ iteration 2：…… 前向+损失 0.066 s / 反向 0.117 s / 优化器 0.001 s�
   `n_pos=1, n_neg=1`，于是「阴性槽位」这条下界变成 ≈ 阴性层数（远大于 `切片数/2`）。
   当前默认 `batch_size=16` 时是全折 351 个 batch（口径见 `docs/preprocess_notes.md` 6.3）；
   想看真实量级就按默认配置再跑一次 `--debug`（不加 `--set`）。
-- **实测阳性比例不等于 `pos_ratio_target`**：`0.30` 是每批阳性数的**上限**，实际每批几个由
-  「阳性层总数 / 一轮 batch 数」决定（第 2 轮已实测：fold 0 上 bs=8 → 每批 1 个）。`--debug` 只跑 3 个
-  batch，抽到 1~2 个阳性都算正常。
+- **实测阳性比例 = `data.pos_ratio_train`**（不是"上限"）：平衡采样器每批凑的阳性数就是
+  `n_pos`（bs=16 → 8），所以 `--debug` 只跑 3 个 batch 也应该每批都是 8 个阳性切片。
+  若只有 1~2 个，说明远程拉到的还是旧采样器（见 `docs/preprocess_notes.md` 8.2）。
 - **`pad_offset` 与 `nz`**：`pad_offset` 只对非 512 病例非零（342→512 是 `(85,85)`）；若这里打印的
   面内尺寸与 `docs/preprocess_notes.md` 的面内尺寸表不符，说明 cache 或划分对不上，先别继续。
-- **显存与单步耗时用来定 `batch_size`**（第 6 轮的依据）。实测（`max_memory_allocated`）：
+- **显存与单步耗时用来定 `batch_size`**。**第 3 轮的单通道实测**（`max_memory_allocated`，
+  作为对照基线；第 4 轮 2.5D 之后要重新看 `--debug` 的实测值）：
 
-  | batch_size | 峰值 allocated | 备注 |
+  | batch_size | 峰值 allocated（1 通道） | 备注 |
   | --- | --- | --- |
   | 2 | 5416 MB | |
   | 8 | 7671 MB | |
-  | **16（当前默认）** | **10920 MB**（reserved 12152 MB） | 每批 1~2 个阳性、全阴性 batch 0 个；单步 0.183 s |
+  | **16（当前默认）** | **10920 MB**（reserved 12152 MB） | 单步 0.183 s |
 
-  三点拟合 ≈ **376 MB/样本 + 4.7 GB 静态开销**（静态里主要是 cuDNN autotune 的工作区）。
-  40 GB 卡上 `batch_size=32`（≈16.7 GB）仍然安全，但每 epoch 的更新次数会从 351 掉到 176，
-  样本量这么小时不划算 —— 所以定稿 **16**。要改就直接复测一次，别做线性外推
-  （把静态开销也按 batch 缩放会偏小很多：从 bs=16 外推 bs=8 只有 5460 MB，真实是 7671 MB）。
+  单通道三点拟合 ≈ **376 MB/样本 + 4.7 GB 静态开销**（静态里主要是 cuDNN autotune 的工作区）。
+  2.5D（3 通道）之后第一级特征图变大，峰值会高于同 batch 的单通道值，**以 `--debug` 实测为准**，
+  不做外推。40 GB 卡余量充足，`batch_size=16` 先照旧用，需要时再复测上调。
 - **第 1 个 iteration 的 forward/backward 特别慢是正常的**（实测 2.05 s / 10.4 s）：
   `cudnn.benchmark=True` 的一次性 autotune，稳态是 0.040 s / 0.071 s。
 - **整卷推理那一步的耗时**（实测 77 s）在把缓存换成未压缩 `.nii`（见 1.3）后会掉到 ~2 s；
@@ -376,58 +415,62 @@ python -m src.train --fold 0 --debug --set train.batch_size=32  # 想试更大 b
 python -m src.train --fold 0
 ```
 
-做什么：建 train loader（阳性层均摊 + 2D 增强）→ 训练一个 epoch → 每 `train.val_every` 轮做一次
-**整卷验证**（4 例）→ 按验证集整卷 Dice 的 macro 均值更新 `best.pt` / 累计 `patience` →
-写 `last.pt`、追加 `metrics.csv`、写 TensorBoard → `patience >= train.early_stop_patience`（默认 20）时早停。
-`epochs` 默认 200。
+做什么：建 train loader（**平衡采样**：每批 `n_pos` 正 + `n_neg` 阴 + 2D 增强）→ 训练一个 epoch →
+每 `train.val_every` 轮做一次**整卷验证**（4 例）→ 按验证集整卷 Dice 的 macro 均值更新 `best.pt` /
+累计 `patience` → 写 `last.pt`、追加 `metrics.csv`、写 TensorBoard →
+`patience >= train.early_stop_patience`（默认 20）时早停。`epochs` 默认 200。
 
 期望输出（形态示例）：开头是设备/配置/前置校验/模型/损失/优化器/采样器几段，然后是每轮一行：
 
 ```
-设备：cuda（NVIDIA A100-PCIE-40GB）；随机种子：42；目标面内尺寸：512x512（pad_align=center）
+设备：cuda（NVIDIA A100-PCIE-40GB）；随机种子：42；目标面内尺寸：512x512（pad_align=center）；输入：2.5D 三层窗 z±1（3 通道）
 训练配置：epochs=200，batch_size=16，lr=0.001，val_every=1，早停 patience=20，grad_clip_norm=0，num_workers=8
-模型：UNet2D(in=1, out=2, encoder=[32, 64, 128, 256], bottleneck=512, 下采样 4 次（对齐 16）, norm=batch, 可训练参数 9.243 M)
-DiceCELoss（自实现）：λ_dice=1 λ_ce=1；softmax=True batch=True include_background=True smooth=1e-05；to_onehot_y=False（内部一律 one-hot）；ce_class_weights=None
+模型：UNet2D(in=3 [2.5D 三层窗 z±1（3 通道）], out=2, encoder=[32, 64, 128, 256], bottleneck=512, 下采样 4 次（对齐 16）, norm=batch, 可训练参数 9.25 M)
+DiceCELoss（自实现）：λ_dice=1 λ_ce=1；softmax=True batch=True include_background=False smooth=1e-05；to_onehot_y=False（内部一律 one-hot）；dice_positive_only=True（Dice 只在含前景的样本上算（CE 仍对整批算））；ce_class_weights=None
 优化器：AdamW(lr=0.001, weight_decay=0.0001)；调度器：CosineAnnealingLR(T_max=200, eta_min=0)
 AMP：bf16 autocast（**不启用 GradScaler**：bf16 与 fp32 同指数范围，不需要 loss scaling）
 前置校验通过：fold 0 的 train 21 例 [...] / val 4 例 [...]
-训练 loader：21 例 / 4469 层切片 → 一轮 351 个 batch（batch_size=16）；验证 4 例（整卷推理）
-首个 batch 形态：image (16, 1, 512, 512) / label (16, 512, 512)；病例 ['31', '32', '34', ...]；z=[...]；值域 [0.0000, 1.0000]；orig_hw [[512, 512], [512, 512], ...]；补边偏移 [[0, 0], [0, 0], ...]
-epoch 1/200 | lr 1.00e-03 | 训练 loss 1.5921（dice 0.6827 + ce 0.9094）| 351 个 batch / 76.4 s［取数 6.1 s + 计算 70.3 s］| 验证整卷 Dice 0.0731［33:0.101 57:0.052 59:0.000 60:0.139；min 0.000 max 0.139］/ 11.2 s | best 0.0731@ep1 | patience 0/20 | 峰值显存 10920 MB
-epoch 2/200 | lr 1.00e-03 | 训练 loss 0.8917（dice 0.4102 + ce 0.4815）| 351 个 batch / 76.1 s［取数 6.0 s + 计算 70.1 s］| 验证整卷 Dice 0.2864［...］/ 11.0 s | best 0.2864@ep2 | patience 0/20 | 峰值显存 10920 MB
+训练采样器（平衡采样）：batch_size=16 → 每批 8 正 + 8 阴（阳性占比 0.500，整体阳性率 0.1381 ⇒ 过采样 3.62 倍）；一轮 280 个 batch；阳性层重复 3.63 次（上限 8）、阴性层覆盖率 36.2%
+训练 loader：21 例 / 4469 层切片 → 一轮 280 个 batch（batch_size=16）；验证 4 例（整卷推理）
+首个 batch 形态：image (16, 3, 512, 512) / label (16, 512, 512)；病例 [...]；z=[...]；2.5D 窗口 [[0,0,1], [0,1,2], ...]；值域 [0.0000, 1.0000]；orig_hw [...]；补边偏移 [...]
+epoch 1/200 | lr 1.00e-03 | 训练 loss …（dice … + ce …）| 280 个 batch / … s［取数 … s + 计算 … s］| 验证整卷 Dice …［33:… 57:… 59:… 60:…；min … max …］/ … s | IoU … 精确率 … 召回率 … | 预测体素 …（GT …）峰值概率 … | best …@ep1 | patience 0/20 | 峰值显存 … MB
 ...
-epoch 68/200 | lr 4.42e-04 | 训练 loss 0.2134（dice 0.1502 + ce 0.0632）| 351 个 batch / 76.3 s［取数 6.1 s + 计算 70.2 s］| 验证整卷 Dice 0.6127［...］/ 11.3 s | best 0.6231@ep61 | patience 7/20 | 峰值显存 10920 MB
-训练结束：best 整卷 Dice 0.6231 @ epoch 61；本次跑完 81 轮（epoch 1 → 81），用时 117.5 分钟
+训练结束：best 整卷 Dice … @ epoch …；本次跑完 … 轮（epoch 1 → …），用时 … 分钟
 产物：runs/fold0（best.pt / last.pt / metrics.csv / run.json / train.log / tensorboard/）
 ```
 
-> 上面的 loss / Dice 是**形态示例**（数字本身没有意义），batch 数与耗时按实测口径推：
-> `batch_size=16` → fold 0 一轮 351 个 batch、单步 0.183 s（前向 0.065 + 反向 0.117）≈ 70 s 计算，
-> 验证 4 例整卷 ≈ 11 s ⇒ **每 epoch 约 85~90 s**，200 epoch 满跑约 5 h；
-> 早停（patience 20）一般会在 60~120 轮触发，每折落地大约 1.5~3 h。
+> 上面的数字是**形态示例**：`batch_size=16` 时 fold 0 一轮 **280 个 batch**（平衡采样后由
+> 「正负各半」的槽位预算算出，不再是 351），单步约 0.183 s（第 3 轮单通道实测）⇒ 计算 ~50 s；
+> 2.5D 之后单步会更慢一些，以实测为准。验证 4 例整卷 ≈ 11 s。
 > 若日志里 `取数` 涨到分钟级，先按 1.3 确认缓存格式，再考虑调大 `data.num_workers`。
 
 判读要点：
 
-- **训练 loss 前几轮应明显下降**（1.1~1.2 → 0.2~0.4 量级），dice 项与 ce 项都要降；
-  若 3~5 轮后 loss 完全不动或变成 `nan`，先按下面的报错表处理，别让它跑满 200 轮。
-- **验证整卷 Dice 从 0.0x 起步是正常的**（随机权重常把整卷判成背景或乱判），看的是**趋势**；
-  首折能否到 0.5+ 属于第 6 轮按曲线判断的事，本轮先确认链路正确。
+- **训练 loss 前几轮应明显下降**，且 **`dice` 项必须从 1.0 附近往下走**（`dice_positive_only=true`
+  之后它仍然是 `1 - 肿瘤 soft Dice`，但只在含前景的样本上聚合）。若 3~5 轮后 loss 完全不动或
+  变成 `nan`，先按下面的报错表处理，别让它跑满 200 轮。
+- **验证整卷 Dice 从 0.0x 起步是正常的**（随机权重常把整卷判成背景或乱判），看的是**趋势**。
+- **第 4 轮新增的三行判读（比 Dice 更早暴露塌缩）**：
+  * `预测体素 N（GT M）`：**N=0 就是"一个前景体素都没预测"**，日志会额外打一条警告；
+  * `峰值概率`：整卷肿瘤概率的最大值。第 3 轮首折全程 0.005，健康训练应当稳步抬到 0.9+；
+  * `IoU / 精确率 / 召回率`：预测为空时精确率记 0.0（`精确率 0.0000` + `预测体素 0` 同时出现即塌缩）；
+    召回率长期为 0 而精确率很高，说明模型只敢圈很小的一块（欠检出）。
 - **`验证整卷 Dice` 是 macro 均值**（先逐例算、再平均），括号里是逐例值（fold 0 的 val 是
   33/57/59/60，见 `data/splits.json`）：某例长期为 0 通常说明该例病灶最小/最难
   （`docs/data.md`：肿瘤体积跨 3 个数量级），不是 bug。
-- **每轮那行的 `dice` / `ce` 两项要一起看**：`include_background=false` 之后，
-  `dice` 项就是 `1 - 肿瘤 soft Dice`，所以它**贴着 0.5 左右不动 + `ce` 掉到 0.01 以下是「坍缩到
-  全预测背景」的特征**（第 3 轮首次正式训练的真实现象：`dice 0.4996 + ce 0.0078`、
-  验证整卷 Dice 恒 0.0000）。健康曲线应该是 `dice` 项从 1.0 附近往下走、`ce` 稳在 0.05~0.3 量级，
-  验证整卷 Dice 从 0.0x 抬起来。判坍缩的详细分析与修法见 `docs/preprocess_notes.md` 7.2。
+- **每轮那行的 `dice` / `ce` 两项要一起看**：`dice` 项就是 `1 - 肿瘤 soft Dice`，
+  **`dice` 项贴在 0.9 以上横盘 + `ce` 掉到 0.01 以下是「塌缩到全预测背景」的特征**
+  （第 3 轮首折的真实曲线：12 轮里 dice 0.93→0.90、ce 0.010→0.009、验证 Dice 恒 ≈0.000）。
+  第 4 轮的平衡采样 + `dice_positive_only` 就是针对它；判读与修法见
+  `docs/preprocess_notes.md` 8.1 / 8.2。
 - **`best` 与 `patience`**：只有验证轮才更新；`patience` 达到 `early_stop_patience` 就停在那一轮，
   `best.pt` 仍指向历史最优。每轮都会覆盖 `last.pt`（续跑用），`best.pt` 只在刷新时写。
-- **`峰值显存`** 是本次运行的历史峰值；把它与 `--debug` 的外推值对照，可以判断还能不能再加 batch。
+- **`峰值显存`** 是本次运行的历史峰值；把它与 `--debug` 的实测值对照，可以判断还能不能再加 batch。
 - **每轮那行的 `［取数 x s + 计算 y s］` 是判断瓶颈的唯一依据**：正常应是「计算远大于取数」
-  （未压缩缓存下取数几秒、计算一两分钟）。若 `取数 > 计算`，说明数据加载拖住了 GPU：
+  （未压缩缓存下取数几秒、计算几十秒到一两分钟）。若 `取数 > 计算`，说明数据加载拖住了 GPU：
   先看 `python -m src.selfcheck_data` 有没有 `仍是压缩的 .nii.gz` 告警（有就按 1.3 转换），
-  已经是 `.nii` 再考虑调大 `data.num_workers`（52 核，可到 16）。第 1 轮 epoch 若出现
+  已经是 `.nii` 再考虑调大 `data.num_workers`（52 核，可到 16）。注意 **2.5D 每层要读 3 个切片**，
+  取数耗时会比单通道略高，这是预期内的。第 1 轮 epoch 若出现
   `取数耗时 ... 超过计算耗时 ...：**数据加载是瓶颈**` 的告警，也是同一件事。
 
 ### 4.2.1 短跑烟测：先拿一份「能预测出东西」的权重给下游开发用
@@ -436,22 +479,27 @@ epoch 68/200 | lr 4.42e-04 | 训练 loss 0.2134（dice 0.1502 + ce 0.0632）| 35
 python -m src.train --fold 0 --out-dir runs/smoke_fold0 --set train.epochs=12
 ```
 
-用途：第 4 轮（整卷推理 → 3D 后处理 → 指标 → 报告）的开发需要一份**真实**的 `best.pt`；
-12 个 epoch 约 17 分钟，足够让模型从「全预测背景」变成「至少圈得出肿瘤」，于是后处理、
+用途：整卷推理 → 3D 后处理 → 指标 → 报告这一段的开发需要一份**真实**的 `best.pt`；
+12 个 epoch 约十几分钟，足够让模型从「全预测背景」变成「至少圈得出肿瘤」，于是后处理、
 病灶级检出、FP 统计这些代码路径才真的被走到（空预测会把所有分支都走成退化路径，掩盖 bug）。
 
-判读：
-- `dice` 项应从 1.0 附近明显下降（它就是 `1 - 肿瘤 soft Dice`）；
-- `验证整卷 Dice` 至少有一例 > 0，`metrics.csv` 里 `best_dice` 不为 0；
-- **不要求指标好看**，它只是下游代码的输入。
+**第 4 轮它就是「口径修好没有」的第一道验收**（比正式 200 轮便宜得多）：
+
+- `dice` 项应从 1.0 附近**明显下降**（跌破 0.7 才算真的在找肿瘤）；
+- 每轮那行的 `预测体素` 必须 > 0，且 `峰值概率` 明显抬起来（不再停在 0.00x）；
+- `验证整卷 Dice` 至少有一例 > 0.05，`metrics.csv` 里 `best_dice` 不为 0；
+- **仍然不要求指标好看**，它是下游代码的输入 + 口径是否修好的信号。
+- 若 12 轮后 `dice` 项仍贴在 0.9 横盘、`预测体素` 仍是 0：**停下来把整段日志贴回**，
+  下一级杠杆是 `--set loss.ce_class_weights=[0.2,1.0]` 或回调 `train.pos_ratio_train`，
+  别直接开 200 轮。
 
 注意：
 - **写进独立目录** `--out-dir runs/smoke_fold0`，别和正式训练的 `runs/fold0` 混在一起；
 - 全新开始（非 `--resume`）时 `train.py` 会把同目录里上一轮的
   `best.pt` / `last.pt` / `metrics.csv` / `tensorboard` 改名成 `*.prev` 只留一代 ——
   否则 `metrics.csv` 是追加写的，新一轮的 epoch 1..N 会接在旧内容后面，同一个 epoch 号出现两次；
-- 12 epoch 的权重**不是结果**，第 4 轮的评估报告里要标注它的来源（epoch 数与 run 目录）。
-- 下游要评这份权重时，`python -m src.evaluate --fold 0 --run-dir runs/smoke_fold0`（第 4 轮交付该开关）。
+- 12 epoch 的权重**不是结果**，评估报告里要标注它的来源（epoch 数与 run 目录）。
+- 下游要评这份权重时，`python -m src.evaluate --fold 0 --run-dir runs/smoke_fold0`（待交付该开关）。
 
 ### 4.2.2 5 折依次跑
 
@@ -479,10 +527,13 @@ python -m src.train --fold 0 --resume
 ```
 
 - 从 `last.pt` 恢复 `model/optimizer/scheduler`、已完成的轮数、`best` 与 `patience`，
-  并把采样顺序接到 `epoch = 已完成轮数 + 1`（`ProportionalBatchSampler.set_epoch`），
+  并把采样顺序接到 `epoch = 已完成轮数 + 1`（`BalancedBatchSampler.set_epoch`），
   与「一口气跑完」的采样序列一致；
 - `paths` 与 `train.epochs` 不参与 checkpoint 指纹，所以「先 `--set train.epochs=5` 试水、再 `--resume`
   跑满 200」是允许的；**其它任何配置项改了都会拒绝续跑（退出码 4）并列出差异**；
+- **第 3 轮的 `last.pt`/`best.pt` 不能用来续跑**：本轮换了采样口径、损失口径与输入通道数，
+  配置指纹必然不同（会以退出码 4 明确拒绝）。要重新开始就在 `runs/fold<k>/` 里删掉旧权重，
+  或者直接跑（全新开始时旧的 `best.pt`/`last.pt`/`metrics.csv`/`tensorboard` 会自动改名成 `*.prev`）；
 - Ctrl-C 中断时 `last.pt` 是上一轮结束时的状态（退出码 130），可直接 `--resume`。
 
 ### 4.5 退出码
@@ -490,7 +541,7 @@ python -m src.train --fold 0 --resume
 | 码 | 含义 | 处置 |
 | --- | --- | --- |
 | 0 | 正常结束（含 `--debug` 跑完、`--resume` 发现已跑满） | 看日志最后的 `best` 与产物 |
-| 2 | 前置校验失败（splits / 清单 / cache 文件 / 模型与损失搭配） | 按带 `-` 的行修，见 4.6 |
+| 2 | 前置校验失败（splits / 清单 / cache 文件 / 模型与损失搭配 / **2.5D 通道数不自洽**） | 按带 `-` 的行修，见 4.6 |
 | 3 | 训练出现 NaN/Inf 损失（或 `--debug` 的整卷推理形状不符） | `--set train.amp=off` 复现；或调小 `train.lr` |
 | 4 | `--resume` 的 checkpoint 缺失 / 属于别的折 / 与当前配置不一致 | 按日志里的差异行处理，或删掉 `last.pt` 重跑 |
 | 130 | 被 Ctrl-C 中断 | `--resume` 续跑 |
@@ -499,40 +550,52 @@ python -m src.train --fold 0 --resume
 
 | 输出 | 含义 / 该贴回什么 |
 | --- | --- |
-| `cache_manifest.cfg_hash=... 与当前配置算出的 ... 不一致` | 缓存来自别的预处理参数 → 重跑 `python scripts/preprocess.py`（只改 `preprocess` 节才会变；改 `loss`/`train` 等不会） |
+| `cache_manifest.cfg_hash=... 与当前配置算出的 ... 不一致` | 缓存来自别的预处理参数 → 重跑 `python scripts/preprocess.py`（只改 `preprocess` 节才会变；改 `loss`/`train`/`data.z_context` 等不会） |
 | `读不到 cache 清单 ... 先跑 python scripts/fetch_manifest.py` | 远程没有清单 → 先跑 `fetch_manifest.py`（只读 cache、秒级） |
 | `cache 清单与 data/splits.json 的病例集合不一致：只在清单里 [...]，只在划分里 [...]` | 缓存与划分不是同一批病人 → **贴回这一行**，先别训练 |
 | `验证集里出现不含肿瘤的病例 [...]` | 划分被改坏（5 例仅肝脏只应进训练集）→ 贴回，并检查 `data/splits.json` |
 | `cache/image/ 下缺 N 例：[...]` | cache 不完整 → 重跑 `preprocess.py` |
 | `model.out_channels=1 时 loss.softmax 必须为 false` | 配置自相矛盾（单通道是 sigmoid 口径）→ 改回 `out_channels: 2` |
+| `model.in_channels=... 与 data.z_context=... 不自洽：2.5D 窗口的通道数必须是 2×z_context+1 = ...` | 2.5D 配置改了一边忘了另一边 → 把 `data.z_context` 与 `model.in_channels` 配对（1↔3、0↔1、2↔5） |
+| `batch 内 image 通道数是 N，与 data.z_context 推出的 M 不一致` | dataset 给的通道数与配的对不上（多半是 `z_context` 被 `--set` 改过）→ 贴回该行 |
+| `image 里出现非有限值` / `image 值域 [...] 超出 [0,1]` | 增强或叠层把值推出值域 → **贴回该行 + 前后 20 行日志** |
 | `--debug 出现非有限损失` / 训练 `epoch N 第 M 个 batch 的损失是 nan` | AMP 溢出或数据异常 → 先 `--set train.amp=off` 复现；贴回该行 + 前后 20 行日志 |
 | `预测卷 (H,W,Z) 与 GT 卷 (H,W,Z) 形状不一致` | 轴序或 `pad_offset` 裁回出错 → **贴整段 traceback 与该行**（这是最需要立刻修的一类） |
 | `tumor_channel=... 超出输出通道数 ...` / `target 形状 ... 与 logits ... 不匹配` | 模型输出通道与标签口径不一致 → 贴回该行 |
+| `本轮验证**一个前景体素都没预测**（pred_voxels=0，峰值概率 ...）` | 就是第 3 轮首折的塌缩形态 → 贴回该行 + 本轮训练那行（看 `dice`/`ce`），见 `docs/preprocess_notes.md` 8.1 |
+| `自检发现 N 个问题` + 带 `-` 的行（selfcheck_data） | 数据侧口径不对 → 把带 `-` 的行整段贴回 |
 | `TensorBoard 不可用（...）` | 只是告警：`metrics.csv` 照常写；把告警贴回即可 |
 | `TypeError: ... got an unexpected keyword argument` | 多半是库里参数名/版本不匹配 → **贴整段 traceback** |
 | 退出码 2 + 一串 `-` 行 | 前置校验失败：**把带 `-` 的行整段贴回** |
 
 只想快速验证训练链路（不写产物、1 例验证、3 个 iteration）：`python -m src.train --fold 0 --debug`。
 
-### 4.7 第 6 轮要用的调节项（先别在首折乱调）
+### 4.7 第 4 轮起可调的口径（先别在首折乱调）
 
 | 参数 | 作用 | 备注 |
 | --- | --- | --- |
-| `train.batch_size` | 每批样本数；**直接决定每批阳性切片数**（bs=8 → 每批 0~1 个、25 个全阴性 batch；**bs=16 → 每批 1~2 个、全阴性 0 个**） | 第 3 轮已按实测定为 **16**（≈10.7 GB）；按 `--debug` 的显存标定，512×512 下 A100 余量很大 |
-| `train.pos_ratio_target` | 每批阳性数的**上限**（`round(bs×该值)`），不是实际比例 | 实际比例由「阳性层总数 / 一轮 batch 数」决定，见 `docs/preprocess_notes.md` 6.3 |
-| `train.lr` / `train.min_lr_ratio` | 初始学习率 / 余弦退火的下界（`eta_min = lr × 该值`） | `min_lr_ratio=0` 是退火到 0 |
-| `train.early_stop_patience` | 连续多少轮没有提升就停 | 默认 20；首折看曲线再定 |
+| `train.batch_size` | 每批样本数 | 第 3 轮定为 **16**；2.5D 后峰值显存以 `--debug` 实测为准 |
+| `data.pos_ratio_train` | **训练侧每批阳性切片占比目标**（0.5 = 正负各半） | 每批阳性数 = `clamp(round(bs×该值), min_pos_per_batch, bs−1)`；配 `--set data.pos_ratio_train=0.3` 可回退到 nnU-Net 式的偏保守口径 |
+| `data.min_pos_per_batch` | 每批阳性数下限 | 防止 batch 很小时比例取整成 0 |
+| `data.max_pos_repeat` | 单个阳性层一轮最多重复几次 | 太小会让实际比例达不到 `pos_ratio_train`（日志会打印实际值）；太大有过拟合到少数层的风险 |
+| `data.epoch_samples` | 一轮总槽位数预算 | `null` = 用数据集切片数（epoch 墙钟与旧口径一致） |
+| `data.z_context` / `model.in_channels` | 2.5D 半径 / 输入通道数 | 必须配对：`0↔1`、`1↔3`、`2↔5`；两处都会校验 |
+| `train.pos_ratio_target` | **已废弃**（旧口径的每批阳性上限） | 保留键只为兼容旧命令/旧 checkpoint 指纹；采样器构造时会提示"不再生效" |
+| `train.lr` / `train.min_lr_ratio` | 初始学习率 / 余弦退火下界（`eta_min = lr × 该值`） | 第 4 轮**先不改**（塌缩不是 lr 的锅）；要看曲线再定 |
+| `train.early_stop_patience` | 连续多少轮没有提升就停 | 默认 20 |
 | `train.val_every` | 每多少轮验证一次 | 验证要跑 4 例整卷，`val_every=2` 可省一半时间 |
-| `loss.include_background` | Dice 是否含背景类 | **必须 false**（true 会坍缩到全预测背景，实测证据见 `docs/preprocess_notes.md` 7.2） |
+| `loss.include_background` | Dice 是否含背景类 | **必须 false**（true 存在全预测背景的平凡最优解，证据见 `docs/preprocess_notes.md` 7.2） |
+| `loss.dice_positive_only` | Dice 是否只在含前景的样本上算 | 默认 **true**（第 4 轮新增）；`false` 可回退到"整批聚合" |
+| `loss.ce_class_weights` | CE 的类别权重（如 `[0.2, 1.0]`） | **下一级杠杆**，默认 `null`；只在平衡采样后仍欠检出时启用 |
 | `loss.lambda_dice` / `loss.lambda_ce` | 两项权重 | 默认 1.0 / 1.0 |
-| `eval.threshold` / `eval.infer_batch_slices` | 概率→标签阈值 / 整卷推理批大小 | 训练期验证与第 4 轮评估共用同一口径 |
+| `eval.threshold` / `eval.infer_batch_slices` | 概率→标签阈值 / 整卷推理批大小 | 训练期验证与评估共用同一口径 |
 
 ---
 
-## 5. 后续步骤（第 4 轮起，命令占位）
+## 5. 后续步骤（评估，命令占位）
 
 ```bash
-# 第 4 轮交付 src/postprocess.py + src/metrics.py + src/evaluate.py 后：
+# 交付 src/postprocess.py + src/metrics.py + src/evaluate.py 后：
 python -m src.evaluate --fold 0
 python -m src.evaluate --all             # 汇总 5 折均值 ± 标准差
 ```
