@@ -90,7 +90,7 @@ loss:
   softmax: true                   # 对 logits 做 softmax（多类互斥：0=背景 1=肿瘤）
   to_onehot_y: false              # 本版 label 是 (B,H,W) 整数；Dice 内部一律转 one-hot
   batch: true                     # true = 交集/并集在整个 batch 上聚合；false = 逐样本再平均
-                                  #   注意：与 dice_positive_only 的分工见 docs/preprocess_notes.md 8.2
+                                  #   注意：与 dice_positive_only 的分工见 docs/preprocess_notes.md 第三节的损失行
   lambda_dice: 1.0                # 总损失 = λ_dice × (1 - Dice) + λ_ce × CE
   lambda_ce: 1.0
   include_background: false       # Dice 只算**肿瘤类**（不含背景）。这是第 3 轮首次正式训练踩出来的：

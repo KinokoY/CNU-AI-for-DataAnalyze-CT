@@ -12,7 +12,7 @@
     ``to_onehot_y`` / ``reduction`` 的交互绕，出错时只能看到一条 shape mismatch；
     这里每个量都自己算，``per_class_dice`` 可以单独取出来对日志与自检负责。
 
-关键口径（与 ``docs/preprocess_notes.md`` 第 3/4 轮记录一致，改前先读那两节）：
+关键口径（与 ``docs/preprocess_notes.md`` 第三节的损失行一致，改前先读那节）：
     * **输入**：``logits (B, C, H, W)``（**未过 softmax**）与 ``target (B, H, W)``（整数标签，
       本项目 label ⊂ {0,1}，C=2）。CE / softmax 都在 **float32** 上做（autocast 下也不降精度）。
     * ``softmax=True``（本项目默认）：多类互斥，``softmax`` 后取各类概率；``False`` 时按多标签
@@ -243,7 +243,7 @@ class SoftDiceLoss(nn.Module):
 class DiceCELoss(nn.Module):
     """``lambda_dice × (1 - Dice) + lambda_ce × CE``：本项目的训练损失。
 
-    参数（前 5 个与 ``docs/todo.md`` 里写死的接口一致）：
+    参数（前 5 个是当初定下的接口签名，保持兼容）：
         softmax=True：对 logits 做 softmax 后算 Dice，CE 走 ``cross_entropy``（多类互斥）；
         to_onehot_y=False：本项目 label 已是整数标签，Dice 内部一律转 one-hot；
         batch=True：Dice 在整个 batch 上聚合（见 ``SoftDiceLoss``）；
@@ -370,7 +370,7 @@ class DiceCELoss(nn.Module):
 def build_loss(cfg: dict) -> DiceCELoss:
     """按 ``cfg['loss']`` 构造训练损失（缺键时用与 ``configs/default.yaml`` 一致的默认值）。
 
-    对齐 ``docs/todo.md`` 的接口：``DiceCELoss(softmax=True, to_onehot_y=False, batch=True,
+    接口签名：``DiceCELoss(softmax=True, to_onehot_y=False, batch=True,
     lambda_dice=1.0, lambda_ce=1.0)``；其余项（include_background / smooth / ce_class_weights /
     positive_only）由配置提供，都有默认值，所以只写前 5 个参数也能工作。
     """

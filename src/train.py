@@ -116,7 +116,7 @@ except ModuleNotFoundError:  # pragma: no cover - 兜底：把仓库根塞进 sy
 
 LOGGER = setup_logger("train")
 
-#: 退出码（docs/baseline.md 第 4 节有对照表）
+#: 退出码（docs/baseline.md 第 1 节的命令段有对照表）
 EXIT_OK = 0
 EXIT_PREREQ = 2
 EXIT_NUMERIC = 3
@@ -144,7 +144,7 @@ class NonFiniteLoss(RuntimeError):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="CT 肝脏肿瘤 2D U-Net 训练（单折）；运行手册见 docs/baseline.md 第 4 节")
+        description="CT 肝脏肿瘤 2D U-Net 训练（单折）；运行手册见 docs/baseline.md")
     parser.add_argument("--config", default="configs/default.yaml", help="配置文件")
     parser.add_argument("--fold", type=int, default=0, help="第几折（0-4），取自 data/splits.json")
     parser.add_argument("--debug", action="store_true",
@@ -261,11 +261,12 @@ def environment_summary(device: torch.device) -> dict:
 def check_prerequisites(cfg: dict, fold: int) -> tuple:
     """训练启动前的硬校验，返回 ``(info, problems)``；``problems`` 非空时 main 以码 2 退出。
 
-    核对的四件事（对应 docs/todo.md 第 3 轮的要求）：
+    核对的五件事：
       1. ``data/splits.json`` 里有 fold、train/val 都非空；
       2. ``cache/cache_manifest.json`` 存在、预处理指纹与当前配置一致、病例集合与划分一致；
       3. 本折每个病例的 ``cache/image`` 与 ``cache/label`` 文件都在；
-      4. 模型与损失的搭配（``out_channels`` 与 ``loss.softmax``）不会算出错误结果。
+      4. 模型与损失的搭配（``out_channels`` 与 ``loss.softmax``）不会算出错误结果；
+      5. 2.5D 自洽：``model.in_channels == 2×data.z_context+1``。
     另外校验「验证集里不出现不含肿瘤的病例」：5 例仅肝脏病例按约定只进训练集。
     """
     paths = (cfg or {}).get("paths") or {}
@@ -531,7 +532,7 @@ def volume_dice(pred_bin, gt_bin, eps: float = 1e-6) -> float:
     """整卷二值 Dice：``(2|A∩B| + eps) / (|A| + |B| + eps)``。
 
     与第 4 轮 ``src/metrics.py::dice`` 用**同一公式**（含 eps、以及"两边都空记 1.0"的口径），
-    这样训练期的早停指标与最终评估报告可以直接对照。第 4 轮交付后如需换成公共实现，
+    这样训练期的早停指标与最终评估报告可以直接对照。第 5 轮如需换成公共实现，
     只要公式不变，数值就一一对应。
     """
     pred = np.asarray(pred_bin) > 0
@@ -549,7 +550,7 @@ def volume_metrics(pred_bin, gt_bin, eps: float = 1e-6) -> dict:
       * ``iou = (TP + eps) / (TP + FP + FN + eps)``，两边都空记 1.0；
       * ``precision = TP / (TP + FP)``：**预测为空时记 0.0 并把 ``precision_defined=False``**
         —— 这是刻意的：塌缩成全背景时 precision 在数学上未定义，若记 1.0 会让日志看起来"完美"，
-        而实际 recall = 0（第 3 轮首折就是这么骗过眼睛的，见 docs/preprocess_notes.md 8.1）；
+        而实际 recall = 0（第 3 轮首折就是这么骗过眼睛的；判读口径见 docs/preprocess_notes.md 第三节的验证行）；
       * ``recall = TP / (TP + FN)``：GT 为空时记 0.0（本项目验证集恒有肿瘤，不会走到）。
 
     返回 dict：``dice / iou / precision / recall / precision_defined / tp / fp / fn /
@@ -892,10 +893,10 @@ def run_debug(*, model, criterion, optimizer, train_loader, val_cases, cache_dir
         peak_reserved = float(torch.cuda.max_memory_reserved(device)) / 1024 ** 2
         LOGGER.info("峰值显存（batch_size=%d，512×512 输入，amp=%s）：allocated %.0f MB / "
                     "reserved %.0f MB（含约 4.7 GB 不随 batch 增长的静态开销：cuDNN autotune 工作区；"
-                    "两点标定见 docs/baseline.md 4.1）",
+                    "第 4 轮 2.5D 实测 bs=16 → 10969 MB，见 docs/preprocess_notes.md 第二节）",
                     batch_size, amp["name"], peak_alloc, peak_reserved)
-        # 只给「下一个该测多少」的建议，**不做线性外推**：实测 bs=16 → 10920 MB，
-        # 而把静态开销一起按 batch 缩放会算出 bs=8 ≈ 5460 MB（真实值 7671 MB），偏小得离谱。
+        # 只给「下一个该测多少」的建议，**不做线性外推**：实测 bs=16 → 10969 MB（2.5D），
+        # 而把静态开销一起按 batch 缩放会算出 bs=8 ≈ 5460 MB（真实值远大于此），偏小得离谱。
         configured = int((cfg.get("train") or {}).get("batch_size", batch_size) or batch_size)
         suggest = configured if configured != batch_size else (batch_size * 2 if batch_size < 32 else 48)
         LOGGER.info("要标定更大的 batch 就直接复测（一次约 1 分钟，比任何外推都准）："
@@ -997,7 +998,7 @@ def main(argv=None) -> int:
     if problems:
         for item in problems:
             LOGGER.error("  - %s", item)
-        LOGGER.error("前置校验失败：发现 %d 个问题，训练未启动（处置见 docs/baseline.md 第 4 节）",
+        LOGGER.error("前置校验失败：发现 %d 个问题，训练未启动（处置见 docs/baseline.md 第 3 节）",
                      len(problems))
         return EXIT_PREREQ
     LOGGER.info("前置校验通过：fold %d 的 train %d 例 %s / val %d 例 %s；cache 清单 %d 例，"

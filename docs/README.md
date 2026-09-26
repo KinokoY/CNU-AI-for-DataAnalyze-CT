@@ -31,37 +31,23 @@ conda 环境 `unet`（已激活），Python 3.11.16，解释器 `/home/phdauser0
 
 安装新包需用户在远程手动执行，优先在现有依赖内解决问题。
 
-## 命令速查（哪些是正式流程、哪些只是自检）
+## 命令速查
 
-所有命令都在**仓库根目录**执行，每步的期望输出与报错处置见 `docs/baseline.md`。
-
-正式流程（数据 → 训练 → 评估，跑一遍就够）：
-
-```bash
-python scripts/preprocess.py        # 预处理 → cache/（第 1 轮，已跑过；现在默认写未压缩 .nii）
-python scripts/inflate_cache.py --remove-gz   # 第 3 轮：把已有的 .nii.gz 缓存就地转成 .nii（一次性，可省则省）
-python scripts/check_cache.py       # 缓存体检（已跑过）
-python scripts/make_splits.py       # 5 折划分 → data/splits.json（已跑过）
-python -m src.selfcheck_data        # 第 4 轮：数据回归自检（2.5D 三层窗 + 平衡采样器 + 病人级隔离）
-python -m src.train --fold 0 --debug   # 第 4 轮：冒烟自检，看形状（3 通道）/显存/耗时（不落盘）
-python -m src.train --fold 0           # 正式训练（每轮整卷验证 + 早停 + best.pt）
-python -m src.train --fold 0 --resume  # 中断后续跑（从 runs/fold0/last.pt 恢复）
-for f in 0 1 2 3 4; do python -m src.train --fold $f; done   # 5 折
-python -m src.evaluate --all        # 第 5 轮：汇总 5 折指标
-```
-
-自检 / 核对类（改过对应代码后才需要重跑；只读 cache，不需要 GPU，不写 runs/）：
+所有命令都在**仓库根目录**执行。**完整命令清单、每步的期望输出与报错处置统一在 `docs/baseline.md`**，
+这里只列最常用的几条：
 
 ```bash
-python -m src.selfcheck_data        # 数据进模型的形态（2.5D 三层窗 / 平衡采样器 / 增强 / 补边）
-python scripts/probe_axis.py --case 31   # 只在改动写盘逻辑后需要重跑
+python -m src.selfcheck_data                                    # 数据回归自检（改过 dataset/配置后必跑）
+python -m src.train --fold 0 --debug --set train.batch_size=16   # 冒烟自检（不落盘）
+python -m src.train --fold 0 --out-dir runs/smoke_fold0 --set train.epochs=12   # 12 轮短跑
+python -m src.train --fold 0                                    # 正式训练（--resume 续跑）
+python scripts/probe_axis.py --case 31                          # 只在改动写盘逻辑后需要重跑
 ```
 
-`src/selfcheck_data.py` 不是开发期的临时脚本，而是**长期保留的回归自检**：它核对的是
-「cache 与配置、代码三者是否自洽」，任何一轮改了预处理、dataset、配置之后都应当重跑一遍
-（秒级到十几秒）。它不产生训练产物，也不需要 GPU（日志里的显存行只是顺带报告）。
+`src/selfcheck_data.py` 是**长期保留的回归自检**：核对「cache 与配置、代码三者是否自洽」，
+任何一轮改了预处理 / dataset / 配置之后都应当重跑（秒级到十几秒，不需要 GPU、不写 runs/）。
 
-## 模块一览（第 4 轮后）
+## 模块一览
 
 | 文件 | 作用 |
 | --- | --- |
@@ -75,6 +61,6 @@ python scripts/probe_axis.py --case 31   # 只在改动写盘逻辑后需要重�
 ## 其他约定
 
 - 显存 40 GiB 单卡：优先 patch-based（如 96³–128³）训练，注意 `num_workers` 与 52 核的匹配。
-- 代码风格与运行说明随改动一起更新，但保持精简；实验配置、随机种子、指标口径要写清楚，便于跨轮次复现。
-- **病人级隔离是硬约束**：划分、采样、增强、2.5D 窗口都只能在本病例内部取数据，任何改动都要过
-  `src/selfcheck_data.py` 里那几条断言（见 `docs/preprocess_notes.md` 8.3）。
+- 代码风格与运行说明随改动一起更新，但**保持精简**（文档是给下一次开发看的，不是归档）。
+- **病人级隔离是硬约束**：划分、采样、增强、2.5D 窗口都只能在本病例内部取数据，
+  任何改动都要过 `src/selfcheck_data.py` 里那几条断言（口径见 `docs/preprocess_notes.md` 第四节）。

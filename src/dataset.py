@@ -169,7 +169,7 @@ def pad_to_target(array: np.ndarray, target_hw: Sequence[int],
     两个已知代价，写在这里供后续轮次判断：
       * 补边像素被白算，非 512 的 8 例按尺寸推算浪费约 41%、全部 25 例按例加权约 13%；
       * 增强在补边之后施加，所以非 512 病例的补边区在 gamma/噪声/仿射之后**不再严格为 0**。
-        第 3 轮的 loss 可以考虑用 ``orig_hw``+``pad_offset`` 生成 ignore mask；第 6 轮再决定是否要改顺序。
+        若要处理可以用 ``orig_hw``+``pad_offset`` 生成 ignore mask（当前不做，见 `src/losses.py` 的说明）。
     """
     arr = np.asarray(array)
     if arr.ndim != 2:
@@ -1448,7 +1448,7 @@ class BalancedBatchSampler(BatchSampler):
     fold 0 上 `bs=16` 实际每批只有 1~2 个阳性（12%），与整体 13.8% 几乎一样，**等于没有过采样**。
     第 3 轮首折正式训练的结果就是这个代价：`dice` 项长期横盘在 0.90（= 肿瘤 soft Dice≈0.1）、
     `ce` 掉到 0.009、验证整卷 Dice 恒 ≈0.000 —— 模型塌缩到全预测背景
-    （完整分析见 docs/preprocess_notes.md 7.2 与 8.1）。
+    （判读口径见 docs/preprocess_notes.md 第三节的损失/验证行）。
 
     现在的口径（每批比例恒定）：
       * 每批 ``n_pos`` 个含肿瘤层 + ``n_neg`` 个不含肿瘤层（默认 ``pos_ratio_train=0.5`` → 各半）；

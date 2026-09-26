@@ -73,7 +73,7 @@ def make_norm(norm: str, channels: int) -> nn.Module:
     """按配置名建归一化层：``batch`` / ``instance`` / ``group`` / ``none``。
 
     默认 ``batch``（``nn.BatchNorm2d``）。之所以把这几档写在一起：batch_size 只有 8，
-    第 6 轮若要试 ``instance``/``group``（小 batch 更稳），只改配置即可，不必动网络代码。
+    第 7 轮若要试 ``instance``/``group``（小 batch 更稳），只改配置即可，不必动网络代码。
     """
     kind = str(norm or "none").strip().lower()
     channels = int(channels)
@@ -364,7 +364,7 @@ def load_encoder_pretrained(model: nn.Module, name: str | None = None,
         f"与 resnet18/34 的 64/128/256/512 残差块参数形状不匹配，无法直接加载。"
         f"请把 model.encoder_pretrained 设回 null（基础版口径），"
         f"或按 src/unet.py::load_encoder_pretrained 的 docstring 在进阶版里实现移植"
-        f"（实施要点与一条数据泄漏禁忌见 docs/todo.md「进阶版」一节）。")
+        f"（实施要点与一条数据泄漏禁忌见 docs/todo.md 的「进阶版」一节）。")
 
 
 def count_parameters(model: nn.Module, trainable_only: bool = True) -> int:
