@@ -88,3 +88,10 @@
    查表忘了把标记 0（背景）置 0（干净卷求和会得到**全部**体素数）、`label_lesions` 与
    `lesion_stats` 的返回顺序不同（解包错位）、`int(0 维数组)` 在 numpy 2.x 上直接抛异常。
    共同点是**远程跑一次才发现、症状离现场很远**（报告数字全错却不报错），所以值得先在本地钉死。
+10. **跨模块导入要按符号表核对，不要凭记忆**：第 5 轮 `voxel_spacing` 定义在 `src/postprocess`，
+    却在 `src/evaluate` / `src/train` 里写成 `from src.metrics import voxel_spacing`
+    —— 远程一跑就是 `ImportError: cannot import name`（本地 AST 检查抓不到"名字在别的模块里"）。
+    现在 `src/metrics.py` 用 `from src.postprocess import voxel_spacing as voxel_spacing`
+    **显式再导出**一次，让 `from src.metrics import ...` 成为唯一入口。
+    新增/改名模块级符号后，用 AST 扫一遍所有 `from src.X import ...` 是否都能在 `src/X.py`
+    顶层找到（这类检查几秒钟，比远程来回一轮便宜得多）。

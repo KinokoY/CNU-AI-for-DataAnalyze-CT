@@ -43,6 +43,11 @@ try:
         to_mm3,
         unmatched_lesion_stats,
     )
+    # ``voxel_spacing`` 定义在 src.postprocess，这里用 ``as`` 形式**显式再导出**：
+    # 调用方（src.train / src.evaluate）应当只从 src.metrics 取指标相关的入口，
+    # 而 ``from src.metrics import voxel_spacing`` 必须真的能导入到
+    # （第 5 轮就在这儿踩过一次：写成从 metrics 导入但没再导出 ⇒ 远程 ImportError）。
+    from src.postprocess import voxel_spacing as voxel_spacing
 except ModuleNotFoundError:  # pragma: no cover - 兜底：把仓库根塞进 sys.path
     import sys
     from pathlib import Path
@@ -55,6 +60,7 @@ except ModuleNotFoundError:  # pragma: no cover - 兜底：把仓库根塞进 sy
         to_mm3,
         unmatched_lesion_stats,
     )
+    from src.postprocess import voxel_spacing as voxel_spacing  # type: ignore
 
 #: 指标公式里的平滑项（**与 src/train.py 的既往口径一致，不要改**）
 EPS = 1e-6

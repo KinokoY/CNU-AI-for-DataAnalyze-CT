@@ -75,7 +75,7 @@ try:
         dice,
         lesion_detection,
         voxel_metrics,
-        voxel_spacing,
+        voxel_spacing,      # 定义在 src.postprocess，由 src.metrics 显式再导出（导入口径只有一处）
     )
     from src.unet import build_unet, count_parameters, load_encoder_pretrained
     from src.utils import (

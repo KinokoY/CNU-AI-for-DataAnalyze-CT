@@ -63,7 +63,7 @@ try:
         DEFAULT_SIZE_BINS,
         case_metrics,
         summarize,
-        voxel_spacing,
+        voxel_spacing,      # 定义在 src.postprocess，由 src.metrics 显式再导出（导入口径只有一处）
     )
     from src.postprocess import remove_small_lesions
     from src.train import (
