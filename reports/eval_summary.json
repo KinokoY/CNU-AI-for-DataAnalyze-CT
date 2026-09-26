@@ -1,0 +1,1773 @@
+{
+  "schema": "ct-liver-tumor-eval/1",
+  "generated_at": "2026-09-27 00:49:02",
+  "git_commit": "954c803",
+  "stage": "第 5 轮（整卷推理 → 3D 后处理 → 指标 → 评估报告）",
+  "config": "configs/default.yaml",
+  "config_overrides": [],
+  "cfg_hash": "c62f46decefa4095",
+  "preprocess_cfg_hash": "7b4c48b4dc7ef880",
+  "seed": 42,
+  "cache_dir": "cache",
+  "reports_dir": "reports",
+  "splits": "data/splits.json",
+  "splits_digest": "c96d9c1092ad27a0",
+  "folds_requested": [
+    0
+  ],
+  "folds_evaluated": [
+    0
+  ],
+  "folds_skipped": [],
+  "incomplete": false,
+  "settings": {
+    "threshold": 0.5,
+    "min_lesion_mm3": 50.0,
+    "detect_min_mm3": 10.0,
+    "spacing": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "size_bins": [
+      "微型 <100",
+      "小型 100–1k",
+      "中型 1k–10k",
+      "大型 10k–100k",
+      "巨块 ≥100k"
+    ],
+    "overlap_bins": [
+      0.0,
+      0.1,
+      0.25,
+      0.5,
+      0.75
+    ],
+    "z_context": 1,
+    "target_hw": [
+      512,
+      512
+    ],
+    "save_pred": false,
+    "save_raw": false,
+    "limit_cases": 0
+  },
+  "aggregate": {
+    "n_cases": 4,
+    "n_cases_tumor": 4,
+    "n_folds": 1,
+    "macro_clean": {
+      "dice": {
+        "mean": 0.280934,
+        "std": 0.324572,
+        "min": 0.0,
+        "max": 0.575025,
+        "n": 4
+      },
+      "iou": {
+        "mean": 0.195404,
+        "std": 0.225873,
+        "min": 0.0,
+        "max": 0.403534,
+        "n": 4
+      },
+      "precision": {
+        "mean": 0.296272,
+        "std": 0.360022,
+        "min": 0.0,
+        "max": 0.72991,
+        "n": 4
+      },
+      "recall": {
+        "mean": 0.291246,
+        "std": 0.347697,
+        "min": 0.0,
+        "max": 0.690617,
+        "n": 4
+      }
+    },
+    "macro_raw": {
+      "dice": {
+        "mean": 0.280611,
+        "std": 0.324216,
+        "min": 0.0,
+        "max": 0.574975,
+        "n": 4
+      },
+      "iou": {
+        "mean": 0.195098,
+        "std": 0.225541,
+        "min": 0.0,
+        "max": 0.403484,
+        "n": 4
+      },
+      "precision": {
+        "mean": 0.295758,
+        "std": 0.35963,
+        "min": 0.0,
+        "max": 0.729556,
+        "n": 4
+      },
+      "recall": {
+        "mean": 0.291266,
+        "std": 0.347711,
+        "min": 0.0,
+        "max": 0.690617,
+        "n": 4
+      }
+    },
+    "pooled_clean": {
+      "cases": 4,
+      "tp": 216271,
+      "fp": 187113,
+      "fn": 237706,
+      "pred_voxels": 403384,
+      "gt_voxels": 453977,
+      "dice": 0.504504,
+      "iou": 0.337349,
+      "precision": 0.536142,
+      "recall": 0.476392,
+      "precision_defined": true,
+      "pred_mm3": 403384.0,
+      "gt_mm3": 453977.0
+    },
+    "pooled_raw": {
+      "cases": 4,
+      "tp": 216306,
+      "fp": 187468,
+      "fn": 237671,
+      "pred_voxels": 403774,
+      "gt_voxels": 453977,
+      "dice": 0.504356,
+      "iou": 0.337217,
+      "precision": 0.535711,
+      "recall": 0.476469,
+      "precision_defined": true,
+      "pred_mm3": 403774.0,
+      "gt_mm3": 453977.0
+    },
+    "per_case_clean": {
+      "mean": 0.280934,
+      "std": 0.324572,
+      "min": 0.0,
+      "max": 0.575025,
+      "n": 4
+    },
+    "lesion_clean": {
+      "status": "无病灶级结果（本折没有含肿瘤的病例）",
+      "n_cases": 0
+    },
+    "lesion_raw": {
+      "status": "无病灶级结果（本折没有含肿瘤的病例）",
+      "n_cases": 0
+    },
+    "voxel_seconds": 17.355,
+    "wall_minutes": 1.49,
+    "lesion_macro": {
+      "detection_rate_per_case_mean": 0.0,
+      "detection_rate_per_case_std": 0.0
+    }
+  },
+  "folds": [
+    {
+      "fold": 0,
+      "run": "fold0",
+      "checkpoint": "runs/fold0/best.pt",
+      "epoch": 13,
+      "n_cases": 4,
+      "dice_mean": 0.280934,
+      "dice_std": 0.324572,
+      "dice_min": 0.0,
+      "dice_max": 0.575025,
+      "iou_mean": 0.195404,
+      "precision_mean": 0.296272,
+      "recall_mean": 0.291246,
+      "pooled_dice": 0.504504,
+      "pooled_iou": 0.337349,
+      "pooled_precision": 0.536142,
+      "pooled_recall": 0.476392,
+      "detection_rate": 1.0,
+      "n_gt_lesions": 19,
+      "n_detected_lesions": 19,
+      "n_covered": 5,
+      "mean_overlap_frac": 0.144621,
+      "criterion_b_is_trivial": true,
+      "gt_volume_mm3": 453977.0,
+      "pred_volume_mm3": 403384.0,
+      "sec_per_case": 4.34
+    }
+  ],
+  "fp_cohort": {
+    "status": "ok",
+    "checkpoint": "runs/fold0/best.pt",
+    "run": "fold0",
+    "epoch": 13,
+    "threshold": 0.5,
+    "min_lesion_mm3": 50.0,
+    "cases": [
+      {
+        "case": 32,
+        "gt_mm3": 0.0,
+        "is_tumor": false,
+        "run": "fold0",
+        "checkpoint": "runs/fold0/best.pt",
+        "fp_raw": {
+          "fp_voxels": 150124,
+          "fp_mm3": 150124.0,
+          "n_lesions": 17,
+          "lesion_volume_mm3": 150124.0,
+          "largest_mm3": 142093.0,
+          "largest_z_range": [
+            301,
+            400
+          ]
+        },
+        "fp_clean": {
+          "fp_voxels": 149983,
+          "fp_mm3": 149983.0,
+          "n_lesions": 7,
+          "lesion_volume_mm3": 149983.0,
+          "largest_mm3": 142093.0,
+          "largest_z_range": [
+            301,
+            400
+          ]
+        },
+        "pred_lesions_raw": {
+          "n": 17,
+          "volumes_mm3": [
+            119.0,
+            4753.0,
+            29.0,
+            14.0,
+            1.0,
+            600.0,
+            6.0,
+            742.0,
+            8.0,
+            477.0,
+            20.0,
+            1199.0,
+            22.0,
+            24.0,
+            142093.0,
+            3.0,
+            14.0
+          ]
+        },
+        "pred_lesions_clean": {
+          "n": 7,
+          "volumes_mm3": [
+            119.0,
+            4753.0,
+            600.0,
+            742.0,
+            477.0,
+            1199.0,
+            142093.0
+          ]
+        },
+        "postprocess": {
+          "min_lesion_mm3": 50.0,
+          "n_removed": 10,
+          "volume_removed_mm3": 141.0
+        },
+        "prob_peak": 0.999851,
+        "infer_seconds": 2.303
+      },
+      {
+        "case": 34,
+        "gt_mm3": 0.0,
+        "is_tumor": false,
+        "run": "fold0",
+        "checkpoint": "runs/fold0/best.pt",
+        "fp_raw": {
+          "fp_voxels": 414694,
+          "fp_mm3": 414694.0,
+          "n_lesions": 42,
+          "lesion_volume_mm3": 414694.0,
+          "largest_mm3": 240255.0,
+          "largest_z_range": [
+            93,
+            244
+          ]
+        },
+        "fp_clean": {
+          "fp_voxels": 414530,
+          "fp_mm3": 414530.0,
+          "n_lesions": 22,
+          "lesion_volume_mm3": 414530.0,
+          "largest_mm3": 240255.0,
+          "largest_z_range": [
+            93,
+            244
+          ]
+        },
+        "pred_lesions_raw": {
+          "n": 42,
+          "volumes_mm3": [
+            240255.0,
+            63.0,
+            21.0,
+            10.0,
+            52.0,
+            3.0,
+            1935.0,
+            18112.0,
+            97.0,
+            606.0,
+            8071.0,
+            2020.0,
+            1.0,
+            5.0,
+            72843.0,
+            9.0,
+            31.0,
+            1.0,
+            1.0,
+            1.0,
+            621.0,
+            40737.0,
+            19838.0,
+            167.0,
+            185.0,
+            2851.0,
+            4826.0,
+            600.0,
+            2.0,
+            7.0,
+            54.0,
+            37.0,
+            8.0,
+            14.0,
+            365.0,
+            115.0,
+            117.0,
+            1.0,
+            1.0,
+            7.0,
+            3.0,
+            1.0
+          ]
+        },
+        "pred_lesions_clean": {
+          "n": 22,
+          "volumes_mm3": [
+            240255.0,
+            63.0,
+            52.0,
+            1935.0,
+            18112.0,
+            97.0,
+            606.0,
+            8071.0,
+            2020.0,
+            72843.0,
+            621.0,
+            40737.0,
+            19838.0,
+            167.0,
+            185.0,
+            2851.0,
+            4826.0,
+            600.0,
+            54.0,
+            365.0,
+            115.0,
+            117.0
+          ]
+        },
+        "postprocess": {
+          "min_lesion_mm3": 50.0,
+          "n_removed": 20,
+          "volume_removed_mm3": 164.0
+        },
+        "prob_peak": 0.999747,
+        "infer_seconds": 1.754
+      },
+      {
+        "case": 38,
+        "gt_mm3": 0.0,
+        "is_tumor": false,
+        "run": "fold0",
+        "checkpoint": "runs/fold0/best.pt",
+        "fp_raw": {
+          "fp_voxels": 4156,
+          "fp_mm3": 4156.0,
+          "n_lesions": 19,
+          "lesion_volume_mm3": 4156.0,
+          "largest_mm3": 1910.0,
+          "largest_z_range": [
+            139,
+            172
+          ]
+        },
+        "fp_clean": {
+          "fp_voxels": 4045,
+          "fp_mm3": 4045.0,
+          "n_lesions": 6,
+          "lesion_volume_mm3": 4045.0,
+          "largest_mm3": 1910.0,
+          "largest_z_range": [
+            139,
+            172
+          ]
+        },
+        "pred_lesions_raw": {
+          "n": 19,
+          "volumes_mm3": [
+            3.0,
+            6.0,
+            6.0,
+            8.0,
+            2.0,
+            1.0,
+            2.0,
+            1.0,
+            1009.0,
+            1910.0,
+            293.0,
+            7.0,
+            15.0,
+            58.0,
+            582.0,
+            34.0,
+            193.0,
+            14.0,
+            12.0
+          ]
+        },
+        "pred_lesions_clean": {
+          "n": 6,
+          "volumes_mm3": [
+            1009.0,
+            1910.0,
+            293.0,
+            58.0,
+            582.0,
+            193.0
+          ]
+        },
+        "postprocess": {
+          "min_lesion_mm3": 50.0,
+          "n_removed": 13,
+          "volume_removed_mm3": 111.0
+        },
+        "prob_peak": 0.999504,
+        "infer_seconds": 2.205
+      },
+      {
+        "case": 41,
+        "gt_mm3": 0.0,
+        "is_tumor": false,
+        "run": "fold0",
+        "checkpoint": "runs/fold0/best.pt",
+        "fp_raw": {
+          "fp_voxels": 16778,
+          "fp_mm3": 16778.0,
+          "n_lesions": 17,
+          "lesion_volume_mm3": 16778.0,
+          "largest_mm3": 14074.0,
+          "largest_z_range": [
+            77,
+            130
+          ]
+        },
+        "fp_clean": {
+          "fp_voxels": 16640,
+          "fp_mm3": 16640.0,
+          "n_lesions": 11,
+          "lesion_volume_mm3": 16640.0,
+          "largest_mm3": 14074.0,
+          "largest_z_range": [
+            77,
+            130
+          ]
+        },
+        "pred_lesions_raw": {
+          "n": 17,
+          "volumes_mm3": [
+            14074.0,
+            8.0,
+            320.0,
+            213.0,
+            16.0,
+            280.0,
+            228.0,
+            6.0,
+            29.0,
+            98.0,
+            39.0,
+            136.0,
+            40.0,
+            391.0,
+            639.0,
+            111.0,
+            150.0
+          ]
+        },
+        "pred_lesions_clean": {
+          "n": 11,
+          "volumes_mm3": [
+            14074.0,
+            320.0,
+            213.0,
+            280.0,
+            228.0,
+            98.0,
+            136.0,
+            391.0,
+            639.0,
+            111.0,
+            150.0
+          ]
+        },
+        "postprocess": {
+          "min_lesion_mm3": 50.0,
+          "n_removed": 6,
+          "volume_removed_mm3": 138.0
+        },
+        "prob_peak": 0.999538,
+        "infer_seconds": 1.891
+      },
+      {
+        "case": 47,
+        "gt_mm3": 0.0,
+        "is_tumor": false,
+        "run": "fold0",
+        "checkpoint": "runs/fold0/best.pt",
+        "fp_raw": {
+          "fp_voxels": 14031,
+          "fp_mm3": 14031.0,
+          "n_lesions": 7,
+          "lesion_volume_mm3": 14031.0,
+          "largest_mm3": 9412.0,
+          "largest_z_range": [
+            160,
+            209
+          ]
+        },
+        "fp_clean": {
+          "fp_voxels": 14021,
+          "fp_mm3": 14021.0,
+          "n_lesions": 5,
+          "lesion_volume_mm3": 14021.0,
+          "largest_mm3": 9412.0,
+          "largest_z_range": [
+            160,
+            209
+          ]
+        },
+        "pred_lesions_raw": {
+          "n": 7,
+          "volumes_mm3": [
+            9412.0,
+            9.0,
+            4177.0,
+            92.0,
+            204.0,
+            136.0,
+            1.0
+          ]
+        },
+        "pred_lesions_clean": {
+          "n": 5,
+          "volumes_mm3": [
+            9412.0,
+            4177.0,
+            92.0,
+            204.0,
+            136.0
+          ]
+        },
+        "postprocess": {
+          "min_lesion_mm3": 50.0,
+          "n_removed": 2,
+          "volume_removed_mm3": 10.0
+        },
+        "prob_peak": 0.999117,
+        "infer_seconds": 2.567
+      }
+    ],
+    "summary": {
+      "status": "ok",
+      "n_cases": 5,
+      "cases": [
+        32,
+        34,
+        38,
+        41,
+        47
+      ],
+      "n_cases_with_lesion": 5,
+      "rate_with_lesion": 1.0,
+      "n_cases_with_any_fp_voxels": 5,
+      "fp_volume_mm3": {
+        "mean": 119956.6,
+        "std": 175396.723,
+        "min": 4156.0,
+        "max": 414694.0,
+        "median": 16778.0,
+        "p95": 361780.0
+      },
+      "fp_volume_mm3_clean": {
+        "mean": 119843.8,
+        "std": 175361.897,
+        "min": 4045.0,
+        "max": 414530.0,
+        "median": 16640.0,
+        "p95": 361620.6
+      },
+      "fp_lesions_raw": {
+        "mean": 20.4,
+        "std": 12.954,
+        "min": 7.0,
+        "max": 42.0,
+        "median": 17.0,
+        "p95": 37.4
+      },
+      "fp_lesions_clean": {
+        "mean": 10.2,
+        "std": 6.979,
+        "min": 5.0,
+        "max": 22.0,
+        "median": 7.0,
+        "p95": 19.8
+      },
+      "largest_lesion_mm3": {
+        "mean": 81548.8,
+        "std": 106009.626,
+        "min": 1910.0,
+        "max": 240255.0,
+        "median": 14074.0,
+        "p95": 220622.6
+      },
+      "checkpoint": "runs/fold0/best.pt",
+      "run": "fold0"
+    }
+  },
+  "cases": [
+    {
+      "case": 33,
+      "is_tumor": true,
+      "gt_mm3": 434721.0,
+      "best_cover": 0.5727,
+      "run": "fold0",
+      "checkpoint": "runs/fold0/best.pt",
+      "fold": 0,
+      "threshold": 0.5,
+      "z_context": 1,
+      "in_channels": 3,
+      "orig_hw": [
+        512,
+        512
+      ],
+      "pad_offset": [
+        0,
+        0
+      ],
+      "n_slices": 135,
+      "prob_peak": 0.999855,
+      "infer_seconds": 3.378,
+      "voxel_raw": {
+        "dice": 0.574975,
+        "iou": 0.403484,
+        "precision": 0.729556,
+        "recall": 0.474447,
+        "precision_defined": true,
+        "tp": 206252,
+        "fp": 76457,
+        "fn": 228469,
+        "pred_voxels": 282709,
+        "gt_voxels": 434721,
+        "tp_mm3": 206252.0,
+        "fp_mm3": 76457.0,
+        "fn_mm3": 228469.0,
+        "pred_mm3": 282709.0,
+        "gt_mm3": 434721.0
+      },
+      "voxel_clean": {
+        "dice": 0.575025,
+        "iou": 0.403534,
+        "precision": 0.72991,
+        "recall": 0.474366,
+        "precision_defined": true,
+        "tp": 206217,
+        "fp": 76307,
+        "fn": 228504,
+        "pred_voxels": 282524,
+        "gt_voxels": 434721,
+        "tp_mm3": 206217.0,
+        "fp_mm3": 76307.0,
+        "fn_mm3": 228504.0,
+        "pred_mm3": 282524.0,
+        "gt_mm3": 434721.0
+      },
+      "lesion_raw": {
+        "n_gt": 15,
+        "n_detected": 15,
+        "n_missed": 0,
+        "n_hit_overlap": 8,
+        "n_hit_big": 15,
+        "n_gt_big": 15,
+        "detection_rate": 1.0,
+        "detection_rate_big": 1.0,
+        "detect_min_mm3": 10.0,
+        "n_covered": 4,
+        "n_covered_strict": 2,
+        "cover_frac": 0.2,
+        "cover_frac_strict": 0.5,
+        "mean_overlap_frac": 0.137442,
+        "max_overlap_frac": 0.57272,
+        "overlap_bins": [
+          0.0,
+          0.1,
+          0.25,
+          0.5,
+          0.75
+        ],
+        "size_bin": "raw",
+        "n_per_lesion": 15,
+        "volumes_mm3": [
+          357147.0,
+          6333.0,
+          445.0,
+          605.0,
+          12118.0,
+          24897.0,
+          1911.0,
+          1118.0,
+          1782.0,
+          10680.0,
+          711.0,
+          798.0,
+          14095.0,
+          722.0,
+          1359.0
+        ],
+        "overlap_fracs": [
+          0.5085,
+          0.0,
+          0.0,
+          0.0,
+          0.3227,
+          0.5727,
+          0.0884,
+          0.0,
+          0.0067,
+          0.4632,
+          0.0,
+          0.0,
+          0.0951,
+          0.0042,
+          0.0
+        ],
+        "hit_overlap": [
+          true,
+          false,
+          false,
+          false,
+          true,
+          true,
+          true,
+          false,
+          true,
+          true,
+          false,
+          false,
+          true,
+          true,
+          false
+        ],
+        "hit_big": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "covered": [
+          true,
+          false,
+          false,
+          false,
+          true,
+          true,
+          false,
+          false,
+          false,
+          true,
+          false,
+          false,
+          false,
+          false,
+          false
+        ],
+        "covered_strict": [
+          true,
+          false,
+          false,
+          false,
+          false,
+          true,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      },
+      "lesion_clean": {
+        "n_gt": 15,
+        "n_detected": 15,
+        "n_missed": 0,
+        "n_hit_overlap": 7,
+        "n_hit_big": 15,
+        "n_gt_big": 15,
+        "detection_rate": 1.0,
+        "detection_rate_big": 1.0,
+        "detect_min_mm3": 10.0,
+        "n_covered": 4,
+        "n_covered_strict": 2,
+        "cover_frac": 0.2,
+        "cover_frac_strict": 0.5,
+        "mean_overlap_frac": 0.137159,
+        "max_overlap_frac": 0.57272,
+        "overlap_bins": [
+          0.0,
+          0.1,
+          0.25,
+          0.5,
+          0.75
+        ],
+        "size_bin": "clean",
+        "n_per_lesion": 15,
+        "volumes_mm3": [
+          357147.0,
+          6333.0,
+          445.0,
+          605.0,
+          12118.0,
+          24897.0,
+          1911.0,
+          1118.0,
+          1782.0,
+          10680.0,
+          711.0,
+          798.0,
+          14095.0,
+          722.0,
+          1359.0
+        ],
+        "overlap_fracs": [
+          0.5084,
+          0.0,
+          0.0,
+          0.0,
+          0.3227,
+          0.5727,
+          0.0884,
+          0.0,
+          0.0067,
+          0.4632,
+          0.0,
+          0.0,
+          0.0951,
+          0.0,
+          0.0
+        ],
+        "hit_overlap": [
+          true,
+          false,
+          false,
+          false,
+          true,
+          true,
+          true,
+          false,
+          true,
+          true,
+          false,
+          false,
+          true,
+          false,
+          false
+        ],
+        "hit_big": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "covered": [
+          true,
+          false,
+          false,
+          false,
+          true,
+          true,
+          false,
+          false,
+          false,
+          true,
+          false,
+          false,
+          false,
+          false,
+          false
+        ],
+        "covered_strict": [
+          true,
+          false,
+          false,
+          false,
+          false,
+          true,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      },
+      "fp_raw": {
+        "fp_voxels": 76457,
+        "fp_mm3": 76457.0,
+        "n_lesions": 21,
+        "lesion_volume_mm3": 45949.0,
+        "largest_mm3": 15642.0,
+        "largest_z_range": [
+          287,
+          354
+        ]
+      },
+      "fp_clean": {
+        "fp_voxels": 76307,
+        "fp_mm3": 76307.0,
+        "n_lesions": 14,
+        "lesion_volume_mm3": 45804.0,
+        "largest_mm3": 15642.0,
+        "largest_z_range": [
+          287,
+          354
+        ]
+      },
+      "gt_lesions": {
+        "n": 15,
+        "volumes_mm3": [
+          357147.0,
+          6333.0,
+          445.0,
+          605.0,
+          12118.0,
+          24897.0,
+          1911.0,
+          1118.0,
+          1782.0,
+          10680.0,
+          711.0,
+          798.0,
+          14095.0,
+          722.0,
+          1359.0
+        ],
+        "total_mm3": 434721.0,
+        "by_size_bin": {
+          "微型 <100": 0,
+          "小型 100–1k": 5,
+          "中型 1k–10k": 5,
+          "大型 10k–100k": 4,
+          "巨块 ≥100k": 1
+        }
+      },
+      "pred_lesions_raw": {
+        "n": 35,
+        "volumes_mm3": [
+          141825.0,
+          2868.0,
+          1095.0,
+          14672.0,
+          169.0,
+          22812.0,
+          2.0,
+          3845.0,
+          4947.0,
+          26.0,
+          27.0,
+          43146.0,
+          11.0,
+          1341.0,
+          46.0,
+          34.0,
+          6.0,
+          136.0,
+          5.0,
+          2.0,
+          15642.0,
+          157.0,
+          13.0,
+          51.0,
+          911.0,
+          6559.0,
+          1398.0,
+          3351.0,
+          167.0,
+          886.0,
+          4445.0,
+          10930.0,
+          849.0,
+          322.0,
+          13.0
+        ]
+      },
+      "pred_lesions_clean": {
+        "n": 24,
+        "volumes_mm3": [
+          141825.0,
+          2868.0,
+          1095.0,
+          14672.0,
+          169.0,
+          22812.0,
+          3845.0,
+          4947.0,
+          43146.0,
+          1341.0,
+          136.0,
+          15642.0,
+          157.0,
+          51.0,
+          911.0,
+          6559.0,
+          1398.0,
+          3351.0,
+          167.0,
+          886.0,
+          4445.0,
+          10930.0,
+          849.0,
+          322.0
+        ]
+      },
+      "postprocess": {
+        "min_lesion_mm3": 50.0,
+        "n_removed": 11,
+        "volume_removed_mm3": 185.0,
+        "seconds": 5.8
+      }
+    },
+    {
+      "case": 57,
+      "is_tumor": true,
+      "gt_mm3": 4046.0,
+      "best_cover": 0.0,
+      "run": "fold0",
+      "checkpoint": "runs/fold0/best.pt",
+      "fold": 0,
+      "threshold": 0.5,
+      "z_context": 1,
+      "in_channels": 3,
+      "orig_hw": [
+        360,
+        360
+      ],
+      "pad_offset": [
+        76,
+        76
+      ],
+      "n_slices": 458,
+      "prob_peak": 0.997622,
+      "infer_seconds": 5.223,
+      "voxel_raw": {
+        "dice": 0.0,
+        "iou": 0.0,
+        "precision": 0.0,
+        "recall": 0.0,
+        "precision_defined": true,
+        "tp": 0,
+        "fp": 45057,
+        "fn": 4046,
+        "pred_voxels": 45057,
+        "gt_voxels": 4046,
+        "tp_mm3": 0.0,
+        "fp_mm3": 45057.0,
+        "fn_mm3": 4046.0,
+        "pred_mm3": 45057.0,
+        "gt_mm3": 4046.0
+      },
+      "voxel_clean": {
+        "dice": 0.0,
+        "iou": 0.0,
+        "precision": 0.0,
+        "recall": 0.0,
+        "precision_defined": true,
+        "tp": 0,
+        "fp": 45051,
+        "fn": 4046,
+        "pred_voxels": 45051,
+        "gt_voxels": 4046,
+        "tp_mm3": 0.0,
+        "fp_mm3": 45051.0,
+        "fn_mm3": 4046.0,
+        "pred_mm3": 45051.0,
+        "gt_mm3": 4046.0
+      },
+      "lesion_raw": {
+        "n_gt": 2,
+        "n_detected": 2,
+        "n_missed": 0,
+        "n_hit_overlap": 0,
+        "n_hit_big": 2,
+        "n_gt_big": 2,
+        "detection_rate": 1.0,
+        "detection_rate_big": 1.0,
+        "detect_min_mm3": 10.0,
+        "n_covered": 0,
+        "n_covered_strict": 0,
+        "cover_frac": 0.2,
+        "cover_frac_strict": 0.5,
+        "mean_overlap_frac": 0.0,
+        "max_overlap_frac": 0.0,
+        "overlap_bins": [
+          0.0,
+          0.1,
+          0.25,
+          0.5,
+          0.75
+        ],
+        "size_bin": "raw",
+        "n_per_lesion": 2,
+        "volumes_mm3": [
+          594.0,
+          3452.0
+        ],
+        "overlap_fracs": [
+          0.0,
+          0.0
+        ],
+        "hit_overlap": [
+          false,
+          false
+        ],
+        "hit_big": [
+          true,
+          true
+        ],
+        "covered": [
+          false,
+          false
+        ],
+        "covered_strict": [
+          false,
+          false
+        ]
+      },
+      "lesion_clean": {
+        "n_gt": 2,
+        "n_detected": 2,
+        "n_missed": 0,
+        "n_hit_overlap": 0,
+        "n_hit_big": 2,
+        "n_gt_big": 2,
+        "detection_rate": 1.0,
+        "detection_rate_big": 1.0,
+        "detect_min_mm3": 10.0,
+        "n_covered": 0,
+        "n_covered_strict": 0,
+        "cover_frac": 0.2,
+        "cover_frac_strict": 0.5,
+        "mean_overlap_frac": 0.0,
+        "max_overlap_frac": 0.0,
+        "overlap_bins": [
+          0.0,
+          0.1,
+          0.25,
+          0.5,
+          0.75
+        ],
+        "size_bin": "clean",
+        "n_per_lesion": 2,
+        "volumes_mm3": [
+          594.0,
+          3452.0
+        ],
+        "overlap_fracs": [
+          0.0,
+          0.0
+        ],
+        "hit_overlap": [
+          false,
+          false
+        ],
+        "hit_big": [
+          true,
+          true
+        ],
+        "covered": [
+          false,
+          false
+        ],
+        "covered_strict": [
+          false,
+          false
+        ]
+      },
+      "fp_raw": {
+        "fp_voxels": 45057,
+        "fp_mm3": 45057.0,
+        "n_lesions": 11,
+        "lesion_volume_mm3": 45057.0,
+        "largest_mm3": 23772.0,
+        "largest_z_range": [
+          147,
+          199
+        ]
+      },
+      "fp_clean": {
+        "fp_voxels": 45051,
+        "fp_mm3": 45051.0,
+        "n_lesions": 10,
+        "lesion_volume_mm3": 45051.0,
+        "largest_mm3": 23772.0,
+        "largest_z_range": [
+          147,
+          199
+        ]
+      },
+      "gt_lesions": {
+        "n": 2,
+        "volumes_mm3": [
+          594.0,
+          3452.0
+        ],
+        "total_mm3": 4046.0,
+        "by_size_bin": {
+          "微型 <100": 0,
+          "小型 100–1k": 1,
+          "中型 1k–10k": 1,
+          "大型 10k–100k": 0,
+          "巨块 ≥100k": 0
+        }
+      },
+      "pred_lesions_raw": {
+        "n": 11,
+        "volumes_mm3": [
+          1096.0,
+          1728.0,
+          3698.0,
+          10479.0,
+          92.0,
+          23772.0,
+          333.0,
+          6.0,
+          138.0,
+          1566.0,
+          2149.0
+        ]
+      },
+      "pred_lesions_clean": {
+        "n": 10,
+        "volumes_mm3": [
+          1096.0,
+          1728.0,
+          3698.0,
+          10479.0,
+          92.0,
+          23772.0,
+          333.0,
+          138.0,
+          1566.0,
+          2149.0
+        ]
+      },
+      "postprocess": {
+        "min_lesion_mm3": 50.0,
+        "n_removed": 1,
+        "volume_removed_mm3": 6.0,
+        "seconds": 9.173
+      }
+    },
+    {
+      "case": 59,
+      "is_tumor": true,
+      "gt_mm3": 652.0,
+      "best_cover": 0.0,
+      "run": "fold0",
+      "checkpoint": "runs/fold0/best.pt",
+      "fold": 0,
+      "threshold": 0.5,
+      "z_context": 1,
+      "in_channels": 3,
+      "orig_hw": [
+        351,
+        351
+      ],
+      "pad_offset": [
+        80,
+        80
+      ],
+      "n_slices": 432,
+      "prob_peak": 0.99851,
+      "infer_seconds": 4.015,
+      "voxel_raw": {
+        "dice": 0.0,
+        "iou": 0.0,
+        "precision": 0.0,
+        "recall": 0.0,
+        "precision_defined": true,
+        "tp": 0,
+        "fp": 53837,
+        "fn": 652,
+        "pred_voxels": 53837,
+        "gt_voxels": 652,
+        "tp_mm3": 0.0,
+        "fp_mm3": 53837.0,
+        "fn_mm3": 652.0,
+        "pred_mm3": 53837.0,
+        "gt_mm3": 652.0
+      },
+      "voxel_clean": {
+        "dice": 0.0,
+        "iou": 0.0,
+        "precision": 0.0,
+        "recall": 0.0,
+        "precision_defined": true,
+        "tp": 0,
+        "fp": 53721,
+        "fn": 652,
+        "pred_voxels": 53721,
+        "gt_voxels": 652,
+        "tp_mm3": 0.0,
+        "fp_mm3": 53721.0,
+        "fn_mm3": 652.0,
+        "pred_mm3": 53721.0,
+        "gt_mm3": 652.0
+      },
+      "lesion_raw": {
+        "n_gt": 1,
+        "n_detected": 1,
+        "n_missed": 0,
+        "n_hit_overlap": 0,
+        "n_hit_big": 1,
+        "n_gt_big": 1,
+        "detection_rate": 1.0,
+        "detection_rate_big": 1.0,
+        "detect_min_mm3": 10.0,
+        "n_covered": 0,
+        "n_covered_strict": 0,
+        "cover_frac": 0.2,
+        "cover_frac_strict": 0.5,
+        "mean_overlap_frac": 0.0,
+        "max_overlap_frac": 0.0,
+        "overlap_bins": [
+          0.0,
+          0.1,
+          0.25,
+          0.5,
+          0.75
+        ],
+        "size_bin": "raw",
+        "n_per_lesion": 1,
+        "volumes_mm3": [
+          652.0
+        ],
+        "overlap_fracs": [
+          0.0
+        ],
+        "hit_overlap": [
+          false
+        ],
+        "hit_big": [
+          true
+        ],
+        "covered": [
+          false
+        ],
+        "covered_strict": [
+          false
+        ]
+      },
+      "lesion_clean": {
+        "n_gt": 1,
+        "n_detected": 1,
+        "n_missed": 0,
+        "n_hit_overlap": 0,
+        "n_hit_big": 1,
+        "n_gt_big": 1,
+        "detection_rate": 1.0,
+        "detection_rate_big": 1.0,
+        "detect_min_mm3": 10.0,
+        "n_covered": 0,
+        "n_covered_strict": 0,
+        "cover_frac": 0.2,
+        "cover_frac_strict": 0.5,
+        "mean_overlap_frac": 0.0,
+        "max_overlap_frac": 0.0,
+        "overlap_bins": [
+          0.0,
+          0.1,
+          0.25,
+          0.5,
+          0.75
+        ],
+        "size_bin": "clean",
+        "n_per_lesion": 1,
+        "volumes_mm3": [
+          652.0
+        ],
+        "overlap_fracs": [
+          0.0
+        ],
+        "hit_overlap": [
+          false
+        ],
+        "hit_big": [
+          true
+        ],
+        "covered": [
+          false
+        ],
+        "covered_strict": [
+          false
+        ]
+      },
+      "fp_raw": {
+        "fp_voxels": 53837,
+        "fp_mm3": 53837.0,
+        "n_lesions": 26,
+        "lesion_volume_mm3": 53837.0,
+        "largest_mm3": 43490.0,
+        "largest_z_range": [
+          82,
+          143
+        ]
+      },
+      "fp_clean": {
+        "fp_voxels": 53721,
+        "fp_mm3": 53721.0,
+        "n_lesions": 6,
+        "lesion_volume_mm3": 53721.0,
+        "largest_mm3": 43490.0,
+        "largest_z_range": [
+          82,
+          143
+        ]
+      },
+      "gt_lesions": {
+        "n": 1,
+        "volumes_mm3": [
+          652.0
+        ],
+        "total_mm3": 652.0,
+        "by_size_bin": {
+          "微型 <100": 0,
+          "小型 100–1k": 1,
+          "中型 1k–10k": 0,
+          "大型 10k–100k": 0,
+          "巨块 ≥100k": 0
+        }
+      },
+      "pred_lesions_raw": {
+        "n": 26,
+        "volumes_mm3": [
+          1391.0,
+          1462.0,
+          43490.0,
+          6820.0,
+          2.0,
+          7.0,
+          1.0,
+          4.0,
+          1.0,
+          500.0,
+          33.0,
+          58.0,
+          1.0,
+          37.0,
+          1.0,
+          10.0,
+          1.0,
+          3.0,
+          1.0,
+          7.0,
+          1.0,
+          1.0,
+          2.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "pred_lesions_clean": {
+        "n": 6,
+        "volumes_mm3": [
+          1391.0,
+          1462.0,
+          43490.0,
+          6820.0,
+          500.0,
+          58.0
+        ]
+      },
+      "postprocess": {
+        "min_lesion_mm3": 50.0,
+        "n_removed": 20,
+        "volume_removed_mm3": 116.0,
+        "seconds": 8.254
+      }
+    },
+    {
+      "case": 60,
+      "is_tumor": true,
+      "gt_mm3": 14558.0,
+      "best_cover": 0.6906,
+      "run": "fold0",
+      "checkpoint": "runs/fold0/best.pt",
+      "fold": 0,
+      "threshold": 0.5,
+      "z_context": 1,
+      "in_channels": 3,
+      "orig_hw": [
+        409,
+        409
+      ],
+      "pad_offset": [
+        51,
+        51
+      ],
+      "n_slices": 488,
+      "prob_peak": 0.999576,
+      "infer_seconds": 4.739,
+      "voxel_raw": {
+        "dice": 0.547469,
+        "iou": 0.376907,
+        "precision": 0.453475,
+        "recall": 0.690617,
+        "precision_defined": true,
+        "tp": 10054,
+        "fp": 12117,
+        "fn": 4504,
+        "pred_voxels": 22171,
+        "gt_voxels": 14558,
+        "tp_mm3": 10054.0,
+        "fp_mm3": 12117.0,
+        "fn_mm3": 4504.0,
+        "pred_mm3": 22171.0,
+        "gt_mm3": 14558.0
+      },
+      "voxel_clean": {
+        "dice": 0.548709,
+        "iou": 0.378084,
+        "precision": 0.455179,
+        "recall": 0.690617,
+        "precision_defined": true,
+        "tp": 10054,
+        "fp": 12034,
+        "fn": 4504,
+        "pred_voxels": 22088,
+        "gt_voxels": 14558,
+        "tp_mm3": 10054.0,
+        "fp_mm3": 12034.0,
+        "fn_mm3": 4504.0,
+        "pred_mm3": 22088.0,
+        "gt_mm3": 14558.0
+      },
+      "lesion_raw": {
+        "n_gt": 1,
+        "n_detected": 1,
+        "n_missed": 0,
+        "n_hit_overlap": 1,
+        "n_hit_big": 1,
+        "n_gt_big": 1,
+        "detection_rate": 1.0,
+        "detection_rate_big": 1.0,
+        "detect_min_mm3": 10.0,
+        "n_covered": 1,
+        "n_covered_strict": 1,
+        "cover_frac": 0.2,
+        "cover_frac_strict": 0.5,
+        "mean_overlap_frac": 0.690617,
+        "max_overlap_frac": 0.690617,
+        "overlap_bins": [
+          0.0,
+          0.1,
+          0.25,
+          0.5,
+          0.75
+        ],
+        "size_bin": "raw",
+        "n_per_lesion": 1,
+        "volumes_mm3": [
+          14558.0
+        ],
+        "overlap_fracs": [
+          0.6906
+        ],
+        "hit_overlap": [
+          true
+        ],
+        "hit_big": [
+          true
+        ],
+        "covered": [
+          true
+        ],
+        "covered_strict": [
+          true
+        ]
+      },
+      "lesion_clean": {
+        "n_gt": 1,
+        "n_detected": 1,
+        "n_missed": 0,
+        "n_hit_overlap": 1,
+        "n_hit_big": 1,
+        "n_gt_big": 1,
+        "detection_rate": 1.0,
+        "detection_rate_big": 1.0,
+        "detect_min_mm3": 10.0,
+        "n_covered": 1,
+        "n_covered_strict": 1,
+        "cover_frac": 0.2,
+        "cover_frac_strict": 0.5,
+        "mean_overlap_frac": 0.690617,
+        "max_overlap_frac": 0.690617,
+        "overlap_bins": [
+          0.0,
+          0.1,
+          0.25,
+          0.5,
+          0.75
+        ],
+        "size_bin": "clean",
+        "n_per_lesion": 1,
+        "volumes_mm3": [
+          14558.0
+        ],
+        "overlap_fracs": [
+          0.6906
+        ],
+        "hit_overlap": [
+          true
+        ],
+        "hit_big": [
+          true
+        ],
+        "covered": [
+          true
+        ],
+        "covered_strict": [
+          true
+        ]
+      },
+      "fp_raw": {
+        "fp_voxels": 12117,
+        "fp_mm3": 12117.0,
+        "n_lesions": 15,
+        "lesion_volume_mm3": 11517.0,
+        "largest_mm3": 3002.0,
+        "largest_z_range": [
+          161,
+          235
+        ]
+      },
+      "fp_clean": {
+        "fp_voxels": 12034,
+        "fp_mm3": 12034.0,
+        "n_lesions": 10,
+        "lesion_volume_mm3": 11434.0,
+        "largest_mm3": 3002.0,
+        "largest_z_range": [
+          161,
+          235
+        ]
+      },
+      "gt_lesions": {
+        "n": 1,
+        "volumes_mm3": [
+          14558.0
+        ],
+        "total_mm3": 14558.0,
+        "by_size_bin": {
+          "微型 <100": 0,
+          "小型 100–1k": 0,
+          "中型 1k–10k": 0,
+          "大型 10k–100k": 1,
+          "巨块 ≥100k": 0
+        }
+      },
+      "pred_lesions_raw": {
+        "n": 16,
+        "volumes_mm3": [
+          775.0,
+          383.0,
+          2670.0,
+          3002.0,
+          522.0,
+          10.0,
+          655.0,
+          24.0,
+          89.0,
+          179.0,
+          4.0,
+          1.0,
+          2712.0,
+          10654.0,
+          447.0,
+          44.0
+        ]
+      },
+      "pred_lesions_clean": {
+        "n": 11,
+        "volumes_mm3": [
+          775.0,
+          383.0,
+          2670.0,
+          3002.0,
+          522.0,
+          655.0,
+          89.0,
+          179.0,
+          2712.0,
+          10654.0,
+          447.0
+        ]
+      },
+      "postprocess": {
+        "min_lesion_mm3": 50.0,
+        "n_removed": 5,
+        "volume_removed_mm3": 83.0,
+        "seconds": 12.635
+      }
+    }
+  ]
+}
