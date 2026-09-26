@@ -8,7 +8,8 @@
        CosineAnnealingLR；bf16 autocast（**bf16 不需要 GradScaler**，见 ``src/utils.make_grad_scaler``）；
     3. 每个 epoch 训练完，按 ``train.val_every`` 用 ``src.infer.predict_volume`` 对验证集的
        每一例做**整卷推理**，逐例算整卷肿瘤 Dice 再取平均（macro 口径，用户拍板）——
-       不做「逐层平均」，否则大量空切片会把指标稀释得看不出来；
+       不做「逐层平均」，否则大量空切片会把指标稀释得看不出来；同一份逐例结果还会顺带算出
+       **病灶级检出率**（``src.metrics.lesion_detection``，只在日志里报，不参与选优）；
     4. 以该 macro Dice 选 ``runs/fold<k>/best.pt`` 并按 ``train.early_stop_patience`` 早停；
        每轮都覆盖 ``last.pt``（``--resume`` 靠它续跑），追加 ``metrics.csv``、写 TensorBoard；
     5. 产物全部在 ``runs/fold<k>/``（不入库）：``best.pt`` / ``last.pt`` / ``metrics.csv`` /
@@ -69,6 +70,13 @@ try:
     )
     from src.infer import load_label_volume, predict_volume
     from src.losses import build_loss
+    from src.metrics import (
+        detection_stats,
+        dice,
+        lesion_detection,
+        voxel_metrics,
+        voxel_spacing,
+    )
     from src.unet import build_unet, count_parameters, load_encoder_pretrained
     from src.utils import (
         autocast_context,
@@ -97,6 +105,13 @@ except ModuleNotFoundError:  # pragma: no cover - 兜底：把仓库根塞进 sy
     )
     from src.infer import load_label_volume, predict_volume  # type: ignore
     from src.losses import build_loss  # type: ignore
+    from src.metrics import (  # type: ignore
+        detection_stats,
+        dice,
+        lesion_detection,
+        voxel_metrics,
+        voxel_spacing,
+    )
     from src.unet import build_unet, count_parameters, load_encoder_pretrained  # type: ignore
     from src.utils import (  # type: ignore
         autocast_context,
@@ -125,12 +140,14 @@ EXIT_INTERRUPTED = 130
 
 #: metrics.csv 的列（顺序固定；续跑时沿用同一表头，便于直接 pandas.read_csv）
 #: 第 4 轮在**末尾追加**了 val_iou_mean / val_precision_mean / val_recall_mean /
-#: val_pred_voxels / val_prob_peak（不改旧列，第 4 轮的 evaluate 读旧 csv 也不会炸）。
+#: val_pred_voxels / val_prob_peak（不改旧列，第 4 轮的 evaluate 读旧 csv 也不会炸）；
+#: 第 5 轮再追加 val_detected_lesions / val_gt_lesions / val_detection_rate（病灶级检出）。
 CSV_COLUMNS = [
     "epoch", "lr", "train_loss", "train_dice", "train_ce", "train_batches",
     "train_pos_ratio", "train_seconds", "val_dice_mean", "val_dice_min", "val_dice_max",
     "val_seconds", "is_best", "best_dice", "patience", "epoch_seconds", "gpu_peak_mb",
     "val_iou_mean", "val_precision_mean", "val_recall_mean", "val_pred_voxels", "val_prob_peak",
+    "val_detected_lesions", "val_gt_lesions", "val_detection_rate",
 ]
 
 
@@ -529,51 +546,31 @@ def train_one_epoch(model: nn.Module, loader, criterion, optimizer, scaler, devi
 
 
 def volume_dice(pred_bin, gt_bin, eps: float = 1e-6) -> float:
-    """整卷二值 Dice：``(2|A∩B| + eps) / (|A| + |B| + eps)``。
+    """整卷二值 Dice —— ``src.metrics.dice`` 的薄转发（**口径只有一处定义**）。
 
-    与第 4 轮 ``src/metrics.py::dice`` 用**同一公式**（含 eps、以及"两边都空记 1.0"的口径），
-    这样训练期的早停指标与最终评估报告可以直接对照。第 5 轮如需换成公共实现，
-    只要公式不变，数值就一一对应。
+    第 5 轮把指标实现搬到了 ``src/metrics.py``（训练期验证与整卷评估报告必须用同一份代码，
+    否则「早停选的权重」与「报告里的 Dice」可能悄悄用了两套 eps / 空集口径）。
+    这里保留同名函数是为了不动 `--debug` 等既有调用点。
+
+    ``eps`` 默认 1e-6、两边都空记 1.0（训练期与评估侧一致）。
     """
-    pred = np.asarray(pred_bin) > 0
-    gt = np.asarray(gt_bin) > 0
-    intersection = float(np.count_nonzero(pred & gt))
-    denominator = float(np.count_nonzero(pred)) + float(np.count_nonzero(gt))
-    return float((2.0 * intersection + eps) / (denominator + eps))
+    return dice(pred_bin, gt_bin, eps=eps)
 
 
 def volume_metrics(pred_bin, gt_bin, eps: float = 1e-6) -> dict:
-    """整卷二值指标：Dice / IoU / Precision / Recall（一次算完 TP/FP/FN）。
+    """整卷二值指标（Dice / IoU / Precision / Recall）—— ``src.metrics.voxel_metrics`` 的薄转发。
 
-    口径（第 4 轮新增，与 ``volume_dice`` 以及第 4 轮 ``src/metrics.py`` 保持一致）：
+    口径（第 4 轮定稿，第 5 轮连同实现一起搬进 ``src/metrics.py``，公式未变）：
       * ``dice = (2TP + eps) / (2TP + FP + FN + eps)``，两边都空记 1.0；
       * ``iou = (TP + eps) / (TP + FP + FN + eps)``，两边都空记 1.0；
-      * ``precision = TP / (TP + FP)``：**预测为空时记 0.0 并把 ``precision_defined=False``**
-        —— 这是刻意的：塌缩成全背景时 precision 在数学上未定义，若记 1.0 会让日志看起来"完美"，
-        而实际 recall = 0（第 3 轮首折就是这么骗过眼睛的；判读口径见 docs/preprocess_notes.md 第三节的验证行）；
-      * ``recall = TP / (TP + FN)``：GT 为空时记 0.0（本项目验证集恒有肿瘤，不会走到）。
+      * ``precision = TP / (TP + FP)``：**预测为空时记 0.0 并标 ``precision_defined=False``**
+        —— 塌缩成全背景时 precision 数学上未定义，记 1.0 会让日志看起来"完美"；
+      * ``recall = TP / (TP + FN)``：GT 为空时记 0.0。
 
     返回 dict：``dice / iou / precision / recall / precision_defined / tp / fp / fn /
-    pred_voxels / gt_voxels``。
+    pred_voxels / gt_voxels``（与 ``src.metrics.voxel_metrics`` 完全同构）。
     """
-    pred = np.asarray(pred_bin) > 0
-    gt = np.asarray(gt_bin) > 0
-    tp = float(np.count_nonzero(pred & gt))
-    fp = float(np.count_nonzero(pred & ~gt))
-    fn = float(np.count_nonzero(~pred & gt))
-    both_empty = (tp + fp + fn) == 0.0
-    dice = 1.0 if both_empty else float((2.0 * tp + eps) / (2.0 * tp + fp + fn + eps))
-    iou = 1.0 if both_empty else float((tp + eps) / (tp + fp + fn + eps))
-    precision_defined = (tp + fp) > 0.0
-    return {
-        "dice": dice,
-        "iou": iou,
-        "precision": float(tp / (tp + fp)) if precision_defined else 0.0,
-        "recall": float(tp / (tp + fn)) if (tp + fn) > 0.0 else 0.0,
-        "precision_defined": bool(precision_defined),
-        "tp": int(tp), "fp": int(fp), "fn": int(fn),
-        "pred_voxels": int(tp + fp), "gt_voxels": int(tp + fn),
-    }
+    return voxel_metrics(pred_bin, gt_bin, eps=eps)
 
 
 def validate(model: nn.Module, cases, cache_dir, cfg: dict, device: torch.device,
@@ -586,14 +583,22 @@ def validate(model: nn.Module, cases, cache_dir, cfg: dict, device: torch.device
     指标：Dice（选 best.pt 与早停用）+ IoU / Precision / Recall（第 4 轮新增的诊断项），
     外加两个**一眼就能看出塌缩**的量：``pred_voxels_total``（全预测背景时恒 0）与
     ``prob_peak_max``（第 3 轮首折全程只有 0.005）。
+
+    第 5 轮追加：用 ``src.metrics.lesion_detection`` 顺带算**病灶级检出率**（判据是与 GT 有重叠，
+    或该 GT 病灶 >= ``eval.detect_min_mm3``），放进 ``lesion`` 字段。它**不参与**选 best / 早停
+    （选优口径仍是 macro Dice，保持不变），只作为日志里的诊断项——小病灶长期 Dice 为 0 时，
+    这一项能看出「是根本没检出，还是检出了但重叠太少」。
     """
     eval_cfg = (cfg or {}).get("eval") or {}
     model_cfg = (cfg or {}).get("model") or {}
     threshold = float(eval_cfg.get("threshold", 0.5) or 0.5)
+    detect_min_mm3 = float(eval_cfg.get("detect_min_mm3", 10.0) or 0.0)
+    spacing = voxel_spacing(cfg)
     if batch_slices is None:
         batch_slices = int(eval_cfg.get("infer_batch_slices", 8) or 8)
     pad_to_multiple = int(model_cfg.get("pad_to_multiple", 16) or 16)
     per_case: dict = {}
+    lesion_records: list = []
     started = time.perf_counter()
     for case in cases:
         prob, pred, meta = predict_volume(model, case, cache_dir, cfg, device,
@@ -605,18 +610,22 @@ def validate(model: nn.Module, cases, cache_dir, cfg: dict, device: torch.device
             raise RuntimeError(f"case {case}：预测卷 {tuple(pred.shape)} 与 GT 卷 {tuple(gt.shape)} "
                                f"形状不一致（轴序或 pad_offset 裁回出错）")
         metrics = volume_metrics(pred, gt)
+        lesion = lesion_detection(pred, gt, spacing, detect_min_mm3)
+        lesion_records.append({"case": int(case), **lesion})
         per_case[int(case)] = {
             **{k: (round(v, 6) if isinstance(v, float) else v) for k, v in metrics.items()},
             "prob_peak": meta.get("prob_peak"),
             "seconds": meta.get("seconds"),
         }
     seconds = time.perf_counter() - started
+    lesion_summary = detection_stats(lesion_records)
     keys = ("dice", "iou", "precision", "recall")
     if not per_case:
         empty = {key: float("nan") for key in keys}
         return {"cases": {}, **{f"{key}_mean": value for key, value in empty.items()},
                 "dice_min": float("nan"), "dice_max": float("nan"), "seconds": seconds,
-                "gt_voxels_total": 0, "pred_voxels_total": 0, "prob_peak_max": 0.0}
+                "gt_voxels_total": 0, "pred_voxels_total": 0, "prob_peak_max": 0.0,
+                "lesion": lesion_summary}
     dice_values = [float(v["dice"]) for v in per_case.values()]
     means = {f"{key}_mean": float(np.mean([float(v[key]) for v in per_case.values()]))
              for key in keys}
@@ -629,6 +638,7 @@ def validate(model: nn.Module, cases, cache_dir, cfg: dict, device: torch.device
         "gt_voxels_total": int(sum(int(v["gt_voxels"]) for v in per_case.values())),
         "pred_voxels_total": int(sum(int(v["pred_voxels"]) for v in per_case.values())),
         "prob_peak_max": float(max(float(v.get("prob_peak") or 0.0) for v in per_case.values())),
+        "lesion": lesion_summary,
     }
 
 
@@ -1199,6 +1209,8 @@ def main(argv=None) -> int:
                     patience += 1
 
             epoch_seconds = time.perf_counter() - epoch_started
+            # 病灶级检出（第 5 轮）：只在日志/CSV 里报，**不参与选 best 与早停**（口径仍是 macro Dice）
+            lesion_now = dict(val_stats.get("lesion") or {}) if val_stats else {}
             row = {
                 "epoch": epoch,
                 "lr": f"{epoch_lr:.6g}",
@@ -1223,6 +1235,11 @@ def main(argv=None) -> int:
                 "val_recall_mean": round(val_stats["recall_mean"], 6) if val_stats else "",
                 "val_pred_voxels": int(val_stats["pred_voxels_total"]) if val_stats else "",
                 "val_prob_peak": round(float(val_stats["prob_peak_max"]), 6) if val_stats else "",
+                # 第 5 轮追加：病灶级检出（诊断项，不参与选优）
+                "val_detected_lesions": int(lesion_now.get("n_detected", 0)) if val_stats else "",
+                "val_gt_lesions": int(lesion_now.get("n_gt", 0)) if val_stats else "",
+                "val_detection_rate": (round(float(lesion_now.get("detection_rate", 0.0)), 6)
+                                       if val_stats else ""),
             }
             append_metrics_row(out_dir / "metrics.csv", row)
 
@@ -1245,6 +1262,9 @@ def main(argv=None) -> int:
                     writer.add_scalar("val/pred_voxels", val_stats["pred_voxels_total"], epoch)
                     writer.add_scalar("val/prob_peak", val_stats["prob_peak_max"], epoch)
                     writer.add_scalar("val/best_dice", float(best["dice"]), epoch)
+                    if lesion_now:
+                        writer.add_scalar("val/detection_rate", lesion_now.get("detection_rate", 0.0), epoch)
+                        writer.add_scalar("val/detected_lesions", lesion_now.get("n_detected", 0), epoch)
                     for case_id, rec in sorted(val_stats["cases"].items()):
                         writer.add_scalar(f"val/dice_case_{int(case_id)}", rec["dice"], epoch)
                 writer.flush()
@@ -1256,7 +1276,7 @@ def main(argv=None) -> int:
                             "%d 个 batch / %.1f s［取数 %.1f s + 计算 %.1f s］| "
                             "验证整卷 Dice %.4f［%s；min %.3f max %.3f］/ %.1f s | "
                             "IoU %.4f 精确率 %.4f 召回率 %.4f | 预测体素 %d（GT %d）峰值概率 %.4f | "
-                            "best %.4f@ep%d | patience %d/%d | 峰值显存 %.0f MB",
+                            "病灶检出 %d/%d = %.2f | best %.4f@ep%d | patience %d/%d | 峰值显存 %.0f MB",
                             epoch, epochs, epoch_lr, train_stats["loss"], train_stats["dice_loss"],
                             train_stats["ce_loss"], train_stats["batches"], train_stats["seconds"],
                             train_stats["data_seconds"], train_stats["compute_seconds"],
@@ -1266,6 +1286,8 @@ def main(argv=None) -> int:
                             val_stats["recall_mean"],
                             int(val_stats["pred_voxels_total"]), int(val_stats["gt_voxels_total"]),
                             float(val_stats["prob_peak_max"]),
+                            int(lesion_now.get("n_detected", 0)), int(lesion_now.get("n_gt", 0)),
+                            float(lesion_now.get("detection_rate", 0.0)),
                             float(best["dice"]),
                             int(best["epoch"]), patience, early_stop, train_stats["peak_memory_mb"])
                 if int(val_stats["pred_voxels_total"]) == 0:

@@ -12,45 +12,32 @@ CT 肝脏肿瘤分割 · 待办与约束
   三通道强度增强自检误判，见 `23b8cd6` / `e28229e`）。
   远程 12 轮短跑 best 整卷 Dice **0.1983**（`runs/smoke_fold0_fixed`；case 33 0.76，小病灶 57/59 仍为 0）；
   **修 bug 之前同一配置只有 0.0048** ⇒ 此前的所有指标结论一律作废。
+- 第 5 轮：整卷推理 → 3D 后处理 → 指标 → 评估报告
+  （`src/postprocess.py` / `src/metrics.py` / `src/evaluate.py`，见 `docs/baseline.md` 第 2.6 节）。
+  指标实现搬进 `src/metrics.py` 成为**唯一口径**（`src/train.py` 的两个同名函数改为转发）；
+  训练日志与 `metrics.csv` 追加「病灶检出」。**代码已就绪，远程尚未跑过**
+  ⇒ 第一次跑 `python -m src.evaluate --fold 0 --run-dir runs/smoke_fold0_fixed` 时按第 2.6 节判读。
 
 --------------------------------------------------------
-■ 第 5 轮（下一步）：整卷推理 → 3D 后处理 → 指标 → 评估报告
+■ 第 6 轮（下一步）：先拿可信基线，再调参
 --------------------------------------------------------
-交付：`src/postprocess.py`、`src/metrics.py`、`src/evaluate.py`
-（`src/infer.py` 已落地：`predict_volume` / `seg_prob_to_label` / `load_label_volume`）
-
-  src/postprocess.py：
-    def remove_small_lesions(binary3d, min_voxels, spacing) -> (cleaned, n_removed, removed_mm3)
-    def label_lesions(binary3d) -> (int_labels, n_lesions, per_lesion_mm3)
-      # 连通域统一用 scipy.ndimage.label（6 邻域，与预处理统计口径一致；别用 SimpleITK 的 ConnectedComponent）
-  src/metrics.py：
-    def dice(pred, gt, eps=1e-6) / iou(pred, gt, eps=1e-6) / precision / recall
-      # 公式必须与 src/train.py 的 volume_metrics 完全一致（eps=1e-6、两边都空记 1.0）
-    def lesion_detection(pred_bin, gt_bin, spacing, detect_min_mm3) -> dict
-      # 判据（两条 OR）：与 GT 有任意重叠，或单病灶体积 ≥ 10 mm³ 即算检出
-    def evaluate_case(pred_bin, gt_bin, spacing, cfg) -> dict
-  src/evaluate.py：python -m src.evaluate --fold 0 | --all [--run-dir runs/smoke_fold0_fixed]
-    - 载入 `runs/<run>/best.pt` → 该折 4 例验证病人：整卷推理 → 后处理（删 <50 mm³ 孤立块）→ 指标；
-    - **开发阶段先用 `runs/smoke_fold0_fixed/best.pt`**（12 epoch 烟测权重，非结果）：
-      case 33 有真实检出、57/59/60 为 0，正好能把后处理与病灶级检出的分支都走到；
-    - 5 例仅肝脏病人（32/34/38/41/47）单独报告：FP 病例数/5 + 每例 FP 体积与最大连通块（后处理前后各一份）；
-    - 输出 `reports/eval_fold<k>.json`、`reports/eval_summary.{json,md}`：
-      **给 mean±std 与逐例值**（小病灶长期为 0，只看均值会误导），另报病灶检出率与 5 例仅肝脏 FP 率；
-    - `--save-pred` 时把预测卷存 `runs/<run>/pred/<case>.nii.gz`（保留 affine，便于叠图核对）。
-
---------------------------------------------------------
-■ 第 6 轮：按评测结果调参（按优先级，别同时改多个变量）
---------------------------------------------------------
-1. **先确认基线可信**：第 4 轮修掉两处 bug（`load_label_volume` 多转置一维导致方形病例 Dice 静默≈0、
-   三通道强度增强自检误判），修好前后同一配置 best 从 0.0048 → 0.1983 —— 旧的一切结论都作废。
-   本轮先跑一次完整 5 折（`for f in 0 1 2 3 4`）拿到可信基线，再谈调参；
-2. **小病灶长期为 0**（case 57 = 4 046 体素、59 = 652 体素）：
-   `data.pos_ratio_train` 0.5 → 0.6、按病灶中心加权采样；
-   损失形状候选（每次只试一个）：Tversky（`1 − TP/(TP + α·FP + β·FN)`，α=0.7 压假阳性）、
-   逐样本 Dice（`loss.batch=false`）、把阴性样本重新纳入 Dice（`loss.dice_positive_only=false`）；
-   注意 `ce_class_weights=[0.2,1.0]` 已试过一档，方向是错的（预测体积更大），已回退为 `null`；
+0. **先跑通第 5 轮的评估链路**（fold 0 的烟测权重即可），确认报告能生成、四条口径都读得懂；
+   任何报错按 `docs/baseline.md` 第 3 节贴回；
+1. **再跑完整 5 折拿可信基线**（`for f in 0 1 2 3 4; do python -m src.train --fold $f; done`
+   → `python -m src.evaluate --all`）。第 4 轮修掉两处 bug（`load_label_volume` 多转置一维导致
+   方形病例 Dice 静默≈0、三通道强度增强自检误判），修好前后同一配置 best 从 0.0048 → 0.1983
+   —— 旧的一切结论都作废，本轮之前先别谈调参；
+2. **按评估报告的分档检出率决定先动哪个杠杆**（每次只改一个变量，别同时改多个）：
+   - 小病灶档（<100 / 100–1k mm³）检出率 ≈0 → 采样与损失：
+     `data.pos_ratio_train` 0.5 → 0.6、按病灶中心加权采样；
+     损失形状候选（每次只试一个）：Tversky（`1 − TP/(TP + α·FP + β·FN)`，α=0.7 压假阳性）、
+     逐样本 Dice（`loss.batch=false`）、把阴性样本重新纳入 Dice（`loss.dice_positive_only=false`）；
+     注意 `ce_class_weights=[0.2,1.0]` 已试过一档，方向是错的（预测体积更大），已回退为 `null`；
+   - 仅肝脏 5 例 FP 率高 → 后处理阈值（`eval.min_lesion_mm3`）或精确率侧损失；
+   - 后处理把召回砍掉 → 调小 `eval.min_lesion_mm3`（报告里 `raw` / `clean` 对照能直接看出来）；
 3. lr / 调度器 / 早停耐心：等 1、2 有对照曲线再动。
-已定稿不再讨论：`train.batch_size=16`（2.5D 实测峰值 10969 MB）、每批 8 正 8 阴、全阴性 batch 0。
+已定稿不再讨论：`train.batch_size=16`（2.5D 实测峰值 10969 MB）、每批 8 正 8 阴、全阴性 batch 0、
+评估主表用后处理之后的数字（raw 一并写进 JSON）。
 
 --------------------------------------------------------
 ■ 第 7 轮：文档与运行手册收尾

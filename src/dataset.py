@@ -505,7 +505,8 @@ class GridAffine2D:
         tensor = torch.from_numpy(np.ascontiguousarray(src))[None]   # (1, C, H, W)
         grid = self.grid(height, width)                              # (1, H, W, 2)
         out = F.grid_sample(tensor, grid, mode=mode, padding_mode="zeros", align_corners=True)
-        squeezed = out[0].numpy().astype(np.float32, copy=False)
+        # 张量 → numpy 一律走 np.asarray（见 docs/preprocess_notes.md 第四节第 7 条）
+        squeezed = np.asarray(out[0], dtype=np.float32)
         return squeezed[0] if np.asarray(array).ndim == 2 else squeezed
 
 

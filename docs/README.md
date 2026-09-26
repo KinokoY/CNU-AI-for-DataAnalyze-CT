@@ -41,6 +41,7 @@ python -m src.selfcheck_data                                    # 数据回归�
 python -m src.train --fold 0 --debug --set train.batch_size=16   # 冒烟自检（不落盘）
 python -m src.train --fold 0 --out-dir runs/smoke_fold0 --set train.epochs=12   # 12 轮短跑
 python -m src.train --fold 0                                    # 正式训练（--resume 续跑）
+python -m src.evaluate --fold 0 --run-dir runs/smoke_fold0_fixed # 整卷评估（报告见 reports/）
 python scripts/probe_axis.py --case 31                          # 只在改动写盘逻辑后需要重跑
 ```
 
@@ -55,7 +56,10 @@ python scripts/probe_axis.py --case 31                          # 只在改动�
 | `src/unet.py` | 手搓 2D U-Net（`DoubleConv2d` / `UNet2D`）；`in_channels` 与 `data.z_context` 两处自洽校验 |
 | `src/losses.py` | 手搓 `DiceCELoss`（softmax + CE + soft Dice，`dice_positive_only` 只对含前景样本算 Dice）与 `build_loss(cfg)` |
 | `src/infer.py` | 整卷推理：`predict_volume` / `seg_prob_to_label` / `load_label_volume`（拼卷逻辑与输入通道数无关） |
-| `src/train.py` | 训练入口：前置校验 → 训练 → 每轮整卷验证（Dice/IoU/精确率/召回率/塌缩指标）→ 早停 → checkpoint / metrics.csv / TensorBoard；`--debug` / `--resume` |
+| `src/train.py` | 训练入口：前置校验 → 训练 → 每轮整卷验证（Dice/IoU/精确率/召回率/塌缩/病灶检出）→ 早停 → checkpoint / metrics.csv / TensorBoard；`--debug` / `--resume` |
+| `src/postprocess.py` | 3D 后处理：6 邻域连通域标记、删 <50 mm³ 孤立块、病灶体积分档（口径见下） |
+| `src/metrics.py` | 指标定义**唯一处**：体素级 Dice/IoU/精确率/召回率、病灶级检出、假阳性统计、macro/池化汇总 |
+| `src/evaluate.py` | 整卷评估入口：载入 `best.pt` → 该折验证集推理 → 后处理 → 指标 → `reports/eval_*`；`--all` / `--save-pred` |
 | `src/selfcheck_data.py` | 数据侧回归自检（只读 cache）：补边 / 2.5D 三层窗 / 增强 / 平衡采样器 / 病人级隔离 |
 
 ## 其他约定

@@ -37,7 +37,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import random
 import sys
 import time
@@ -942,10 +941,6 @@ def check_augment_pipeline(cfg: dict, problems: list) -> dict:
                 len(names), names, geo_ok, photo_ok)
     return {"ok": bool(ok and geo_ok and photo_ok), "steps": names, "expected": expected,
             "geo_synced": geo_ok, "photo_image_only": photo_ok}
-    if not ok:
-        problems.append(f"增强步骤与约定不一致：实际 {names}，期望 {expected}")
-    LOGGER.info("增强流水线：%d 步 %s", len(names), names)
-    return {"ok": bool(ok), "steps": names, "expected": expected}
 
 
 def check_sampler(ds: CTSliceDataset, cfg: dict, problems: list) -> dict:

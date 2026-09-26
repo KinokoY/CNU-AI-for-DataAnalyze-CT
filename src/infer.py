@@ -237,7 +237,9 @@ def predict_volume(model: torch.nn.Module, case, cache_dir, cfg: dict, device=No
                     raise ValueError(f"tumor_channel={tumor_channel} 超出输出通道数 {channels}"
                                      f"（2 分类用 1；三分类背景/肝脏/肿瘤用 2）")
                 probs = torch.softmax(logits.float(), dim=1)[:, tumor_channel]
-            block = probs.detach().to("cpu").numpy()               # (b, target_h, target_w)
+            # 张量 → numpy 一律走 np.asarray（**不要用 .numpy()**：本地假 torch 没有这个方法，
+            # 而 np.asarray 对真 torch 的 CPU 张量走 __array__，两边都能用）
+            block = np.asarray(probs.detach().to("cpu"))           # (b, target_h, target_w)
             for offset, sample in enumerate(samples):
                 z = int(sample["z"])
                 if block[offset].shape != (target_h, target_w):
