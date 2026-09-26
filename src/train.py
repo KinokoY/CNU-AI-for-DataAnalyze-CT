@@ -841,9 +841,29 @@ def load_checkpoint(path, device: torch.device) -> dict:
 
 
 def append_metrics_row(csv_path, row: dict) -> None:
-    """把一行指标追加到 ``metrics.csv``（文件不存在时先写表头；列顺序固定）。"""
+    """把一行指标追加到 ``metrics.csv``（文件不存在时先写表头；列顺序固定）。
+
+    幂等处理（第 5 轮末补）：如果文件最后一行已经是同一个 ``epoch``，就**替换**它而不是再追加一行。
+    触发场景：该 epoch 的 csv 已写、但 ``last.pt`` 还没写完时进程被杀 ⇒ ``--resume`` 会重跑这一轮，
+    旧的追加写法会让同一个 epoch 出现两次。**只动最后一行**，不回头改更早的历史行。
+    """
     csv_path = Path(csv_path)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
+    epoch = row.get("epoch")
+    if csv_path.exists() and epoch is not None:
+        try:
+            with open(csv_path, "r", newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            if rows and str(rows[-1].get("epoch", "")) == str(epoch):
+                rows[-1] = {key: row.get(key, "") for key in CSV_COLUMNS}
+                with open(csv_path, "w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                LOGGER.info("metrics.csv 最后一行已是 epoch %s（上次中断在写盘前后）→ 覆盖该行", epoch)
+                return
+        except (OSError, csv.Error, ValueError) as exc:   # noqa: BLE001 - 读不动就退回"追加"这条稳路径
+            LOGGER.warning("metrics.csv 去重检查失败（%s: %s）：按追加处理", type(exc).__name__, exc)
     new_file = not csv_path.exists()
     with open(csv_path, "a", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS)
@@ -1402,7 +1422,7 @@ def main(argv=None) -> int:
                 "val_detection_rate": (round(float(lesion_now.get("detection_rate", 0.0)), 6)
                                        if val_stats else ""),
             }
-            append_metrics_row(out_dir / "metrics.csv", row)
+            # 注意：这一行在 checkpoint **之后**才写盘（见下面的顺序说明）
 
             if writer is not None:
                 writer.add_scalar("train/loss", train_stats["loss"], epoch)
@@ -1450,6 +1470,10 @@ def main(argv=None) -> int:
                 best=best, patience=patience, info=info, amp_name=amp["name"],
                 optimizer=optimizer, scheduler=scheduler, scaler=amp["scaler"],
                 include_optimizer=True, log_line=epoch_line))
+            # metrics.csv 放在 checkpoint **之后**写：checkpoint 是续跑的权威状态，
+            # 先落盘就不会出现「csv 有这一轮、last.pt 没有」的窗口；
+            # 万一仍撞上，append_metrics_row 的幂等逻辑会覆盖重复的最后一行。
+            append_metrics_row(out_dir / "metrics.csv", row)
             if is_best:
                 save_checkpoint(out_dir / "best.pt", checkpoint_payload(
                     model=model, cfg=cfg, fold=fold, epoch=epoch, metrics=val_stats, best=best,
