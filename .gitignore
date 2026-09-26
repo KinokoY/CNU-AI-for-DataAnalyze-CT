@@ -1,11 +1,16 @@
-# ===== 数据（原始/中间/输出数据一律不入库，仅保留目录占位与说明）=====
+# ===== 数据（原始/中间/预测数据不入库；仅放行明确列出的评估结果）=====
 data/*
 !data/.gitkeep
 !data/README.md
 !data/splits.json
 !data/exclude_cases.json
 cache/
-reports/
+# 仅允许整卷评估的文本结果入库；预处理统计、探测产物等继续忽略。
+reports/*
+!reports/README.md
+!reports/eval_fold[0-4].json
+!reports/eval_summary.json
+!reports/eval_summary.md
 runs/
 
 # ===== Python =====
