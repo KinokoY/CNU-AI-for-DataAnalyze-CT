@@ -68,6 +68,17 @@ EPS = 1e-6
 #: 病灶级检出的默认体积阈值（mm³）：单病灶 >= 该体积即算检出（``eval.detect_min_mm3``）
 DEFAULT_DETECT_MIN_MM3 = 10.0
 
+#: 重叠比例的默认分档（``每病灶 交集体素 / GT 病灶体素``）。用途：把「检出」拆成
+#: 「微不足道的碰边」和「真的覆盖住了」，因为 ``eval.detect_min_mm3`` 那条判据在真实数据尺度下
+#: **可能是恒真的**（fold 0 的 19 个 GT 病灶最小 652 mm³ ⇒ 全都 >= 10 mm³），
+#: 于是 ``detection_rate`` 会恒等于 1.000、完全没有区分度（第 5 轮用短跑权重实测撞上）。
+OVERLAP_BINS: tuple = (0.0, 0.1, 0.25, 0.5, 0.75)
+
+#: 「算覆盖住了」的重叠比例阈值（交集 / GT 病灶体素）。0.2 是宽松线（覆盖五分之一），
+#: 0.5 是严格线。两个都报，读者可以按自己的容忍度取用（口径见 docs/preprocess_notes.md 第三·补节）。
+COVER_FRAC = 0.2
+COVER_FRAC_STRICT = 0.5
+
 #: 体素级混淆矩阵的键（跨病例汇总时按这些键累加）
 CONFUSION_KEYS = ("tp", "fp", "fn")
 
@@ -229,14 +240,22 @@ def lesion_detection(pred_bin, gt_bin, spacing, detect_min_mm3: float = DEFAULT_
       2. **体积达标**：该 GT 病灶自身体积 ``>= detect_min_mm3``（默认 10 mm³）即算检出
          —— 「这么小的目标本来就难定位，模型没标出来不应算失败」。
 
+    ⚠️ **判据 2 在真实数据尺度下可能是恒真的**：本数据集 20 例含肿瘤病人的肿瘤体积下限是
+    652 mm³（fold 0 的 case 59，见 ``data/splits.json``），远大于 10 mm³ ⇒ 只要阈值还是 10，
+    ``detection_rate`` 就恒为 1.000、**没有任何区分度**（第 5 轮用短跑权重实测撞到：
+    fold 0 报 19/19，而 case 57/59 的体素级 Dice 明明是 0.0000）。
+    因此每个病灶额外给出 **``overlap_frac``（交集 / GT 病灶体素）** 与
+    ``covered`` / ``covered_strict`` 两个更严的判定，汇总侧（``detection_stats``）用它出分档表。
+    两条判据仍按原样保留，是为了与既有报告/日志字段兼容。
+
     返回：
         ``{"n_gt", "n_detected", "n_missed", "n_hit_overlap", "n_hit_big", "n_gt_big",
-           "detection_rate", "detection_rate_big", "per_lesion": [...]}``
+           "detection_rate", "detection_rate_big", "n_covered", "n_covered_strict",
+           "cover_frac", "cover_frac_strict", "mean_overlap_frac", "max_overlap_frac",
+           "overlap_bins", "per_lesion": [...]}``
         ``detection_rate`` = 检出的 GT 病灶数 / GT 病灶总数（GT 为空时记 0.0、``n_gt=0``）；
-        ``detection_rate_big`` 只在 ``>= detect_min_mm3`` 的病灶上算，是与阈值无关的那个分母。
-
-    ``gt_slices`` 允许直接传入已经算好的 ``lesion_stats(...)[2]``，避免对同一张 GT 卷重复标记
-    （``case_metrics`` 就是这么用的）。
+        ``detection_rate_big`` 只在 ``>= detect_min_mm3`` 的病灶上算，是与阈值无关的那个分母；
+        ``n_covered`` / ``n_covered_strict`` = overlap_frac >= 0.2 / >= 0.5 的病灶数（有区分度的两条）。
     """
     pred = _as_bool3d(pred_bin, "pred_bin")
     gt = _as_bool3d(gt_bin, "gt_bin")
@@ -253,19 +272,36 @@ def lesion_detection(pred_bin, gt_bin, spacing, detect_min_mm3: float = DEFAULT_
 
     empty = {"n_gt": 0, "n_detected": 0, "n_missed": 0, "n_hit_overlap": 0, "n_hit_big": 0,
              "n_gt_big": 0, "detection_rate": 0.0, "detection_rate_big": 0.0,
-             "detect_min_mm3": threshold, "per_lesion": []}
+             "detect_min_mm3": threshold, "n_covered": 0, "n_covered_strict": 0,
+             "cover_frac": float(COVER_FRAC), "cover_frac_strict": float(COVER_FRAC_STRICT),
+             "mean_overlap_frac": 0.0, "max_overlap_frac": 0.0,
+             "overlap_bins": [float(b) for b in OVERLAP_BINS], "per_lesion": []}
     if n_gt <= 0:
         return (empty, []) if return_detected else empty
 
     if gt_marks is None:
         gt_marks, _, _ = label_lesions(gt, spacing)
-    # 一次 bincount 判出「哪些 GT 病灶被预测碰到过」：比逐病灶切片快得多
-    hit = np.bincount(gt_marks[pred].ravel(), minlength=n_gt + 1) > 0
+    # 一次 bincount 判出「哪些 GT 病灶被预测碰到过」+「各碰到多少体素」：比逐病灶切片快得多。
+    # ``np.bincount(gt_marks[pred], weights=pred[...], minlength=...)`` 的 weights 全 1 ⇒ 直接得到交集体素数。
+    hit_counts = np.bincount(gt_marks[pred].ravel(), minlength=n_gt + 1)
+    factor = to_mm3(1, spacing, unit=True)
     per_lesion: list = []
     detected_flags: list = []
+    n_covered = n_covered_strict = 0
+    overlap_fracs: list = []
     for index in range(1, n_gt + 1):
         volume = float(gt_volumes[index - 1])
-        hit_overlap = bool(hit[index])
+        inter_voxels = int(hit_counts[index]) if index < hit_counts.size else 0
+        # 重叠比例的分母是**该 GT 病灶的体素总数**（不是 GT∪预测），因此模型撒得再大也不会把这一项撑到 1；
+        # 它就是病灶级的召回率/灵敏度，是当前唯一有区分度的病灶级口径。
+        overlap_frac = float(inter_voxels / (volume / factor)) if volume > 0 else 0.0
+        overlap_frac = max(0.0, min(1.0, overlap_frac))
+        is_cover = bool(overlap_frac >= COVER_FRAC)
+        is_cover_strict = bool(overlap_frac >= COVER_FRAC_STRICT)
+        n_covered += int(is_cover)
+        n_covered_strict += int(is_cover_strict)
+        overlap_fracs.append(overlap_frac)
+        hit_overlap = bool(inter_voxels > 0)
         hit_big = bool(volume >= threshold)
         detected = bool(hit_overlap or hit_big)
         detected_flags.append(detected)
@@ -276,6 +312,10 @@ def lesion_detection(pred_bin, gt_bin, spacing, detect_min_mm3: float = DEFAULT_
             "volume_mm3": round(volume, 3),
             "size_bin": lesion_size_bin(volume),
             "bbox": record.get("bbox"),
+            "intersection_mm3": round(float(inter_voxels) * factor, 3),
+            "overlap_frac": round(overlap_frac, 4),
+            "covered": is_cover,
+            "covered_strict": is_cover_strict,
             "hit_overlap": hit_overlap,
             "hit_big": hit_big,
             "detected": detected,
@@ -295,6 +335,14 @@ def lesion_detection(pred_bin, gt_bin, spacing, detect_min_mm3: float = DEFAULT_
         "detection_rate_big": (float(sum(1 for f in big_flags if f) / len(big_flags))
                                if big_flags else 0.0),
         "detect_min_mm3": threshold,
+        # 有区分度的几条（两条常数判据被数据尺度撑满时，看这些）
+        "n_covered": int(n_covered),
+        "n_covered_strict": int(n_covered_strict),
+        "cover_frac": float(COVER_FRAC),
+        "cover_frac_strict": float(COVER_FRAC_STRICT),
+        "mean_overlap_frac": float(np.mean(overlap_fracs)) if overlap_fracs else 0.0,
+        "max_overlap_frac": float(np.max(overlap_fracs)) if overlap_fracs else 0.0,
+        "overlap_bins": [float(b) for b in OVERLAP_BINS],
         "per_lesion": per_lesion,
     }
     return (stats, detected_flags) if return_detected else stats
@@ -303,12 +351,15 @@ def lesion_detection(pred_bin, gt_bin, spacing, detect_min_mm3: float = DEFAULT_
 def detection_stats(records: Sequence[dict], bins: Sequence = DEFAULT_SIZE_BINS) -> dict:
     """把多个病例的病灶级结果合并成分层检出率。
 
-    ``records`` 的每一项需要含 ``n_gt`` / ``n_detected``（``lesion_detection`` 的返回值即可），
-    含 ``detected``（bool 列表，逐病灶）时会额外给出**按体积分档**的检出率与逐个 GT 病灶的身高。
-
-    口径说明：这里同样**先合并再算比率**（分母是所有 GT 病灶），并同时给出
+    ``records`` 的每一项需要含 ``n_gt`` / ``n_detected`` / ``detected``（``lesion_detection`` 的
+    返回值即可）。这里同样**先合并再算比率**（分母是所有 GT 病灶），并同时给出
     ``detection_rate_per_case_mean``（逐例检出率的平均，macro）——两者在小病灶占比重时差别很大，
     一起给才不会误导。
+
+    除了原始的两条 OR 判据，还会给出**重叠比例分档**（``by_overlap_frac`` / ``overlap_grades``）：
+    当 ``eval.detect_min_mm3`` 那条判据被数据尺度撑成恒真时（见 ``lesion_detection`` 的说明），
+    ``detection_rate`` 会恒等于 1.000，此时**只有分档表能说明模型到底覆盖住了多少病灶**
+    —— 因此报告里两套必须并列，不能只看一个数。
     """
     usable = [rec for rec in (records or []) if isinstance(rec, dict) and rec.get("detected") is not None]
     if not usable:
@@ -316,15 +367,24 @@ def detection_stats(records: Sequence[dict], bins: Sequence = DEFAULT_SIZE_BINS)
     n_gt = int(sum(len(rec["detected"]) for rec in usable))
     n_detected = int(sum(1 for rec in usable for flag in rec["detected"] if flag))
     per_case_rates = [float(rec.get("detection_rate", 0.0)) for rec in usable]
+    bins_used = [float(v) for v in (usable[0].get("overlap_bins") or OVERLAP_BINS)]
     binned: dict = {}
+    overlap_fracs: list = []
+    n_covered = n_covered_strict = 0
+    n_hit_overlap = n_gt_trivial = 0
     for rec in usable:
-        lesions = rec.get("per_lesion") or []
-        for lesion in lesions:
+        n_hit_overlap += int(rec.get("n_hit_overlap", 0))
+        n_gt_trivial += int(rec.get("n_gt_big", 0))
+        n_covered += int(rec.get("n_covered", 0))
+        n_covered_strict += int(rec.get("n_covered_strict", 0))
+        for lesion in (rec.get("per_lesion") or []):
             name = str(lesion.get("size_bin") or lesion_size_bin(lesion.get("volume_mm3", 0.0), bins))
-            slot = binned.setdefault(name, {"n_gt": 0, "n_detected": 0})
+            slot = binned.setdefault(name, {"n_gt": 0, "n_detected": 0, "n_hit_overlap": 0})
             slot["n_gt"] += 1
+            slot["n_hit_overlap"] += int(bool(lesion.get("hit_overlap")))
             if lesion.get("detected"):
                 slot["n_detected"] += 1
+            overlap_fracs.append(float(lesion.get("overlap_frac", 0.0)))
     by_bin = {}
     for name, slot in sorted(binned.items(),
                              key=lambda item: min(float(b[0]) for b in bins if b[2] == item[0])
@@ -333,12 +393,24 @@ def detection_stats(records: Sequence[dict], bins: Sequence = DEFAULT_SIZE_BINS)
             "n_gt": int(slot["n_gt"]),
             "n_detected": int(slot["n_detected"]),
             "rate": float(slot["n_detected"] / slot["n_gt"]) if slot["n_gt"] else 0.0,
+            "n_hit_overlap": int(slot["n_hit_overlap"]),
+            "overlap_rate": (float(slot["n_hit_overlap"] / slot["n_gt"]) if slot["n_gt"] else 0.0),
         }
+    # 重叠比例分档：**当前唯一能区分「碰边」与「覆盖住」的病灶级口径**
+    grades = []
+    for low, high in zip(bins_used, list(bins_used[1:]) + [float("inf")]):
+        hit = sum(1 for value in overlap_fracs if float(low) <= value < float(high))
+        grades.append({
+            "low": float(low), "high": (None if high == float("inf") else float(high)),
+            "n_lesions": int(hit),
+            "rate": (float(hit / len(overlap_fracs)) if overlap_fracs else 0.0),
+        })
     big_n = int(sum(1 for rec in usable for lesion in (rec.get("per_lesion") or [])
                     if float(lesion.get("volume_mm3", 0.0)) >= float(rec.get("detect_min_mm3", 0.0))))
     big_hit = int(sum(1 for rec in usable for lesion in (rec.get("per_lesion") or [])
                       if float(lesion.get("volume_mm3", 0.0)) >= float(rec.get("detect_min_mm3", 0.0))
                       and lesion.get("detected")))
+    trivial_all = bool(n_gt > 0 and n_gt_trivial >= n_gt)
     return {
         "status": "ok",
         "n_cases": int(len(usable)),
@@ -351,6 +423,21 @@ def detection_stats(records: Sequence[dict], bins: Sequence = DEFAULT_SIZE_BINS)
         "n_detected_big": big_hit,
         "detection_rate_big": float(big_hit / big_n) if big_n else 0.0,
         "by_size_bin": by_bin,
+        # ---- 以下三项是「排除恒真判据」之后真正说明问题的量 ----
+        "n_gt_trivially_detected": int(n_gt_trivial),
+        "criterion_b_is_trivial": trivial_all,
+        "note": ("criterion_b_is_trivial=True：所有 GT 病灶都 >= detect_min_mm3 ⇒ detection_rate "
+                 "恒为 1.000，该列没有区分度，请只看 overlap_frac 分档表"
+                 if trivial_all else ""),
+        "n_hit_overlap": int(n_hit_overlap),
+        "n_covered": int(n_covered),
+        "n_covered_strict": int(n_covered_strict),
+        "cover_frac": float(usable[0].get("cover_frac", COVER_FRAC)),
+        "cover_frac_strict": float(usable[0].get("cover_frac_strict", COVER_FRAC_STRICT)),
+        "mean_overlap_frac": float(np.mean(overlap_fracs)) if overlap_fracs else 0.0,
+        "median_overlap_frac": float(np.median(overlap_fracs)) if overlap_fracs else 0.0,
+        "by_overlap_frac": grades,
+        "overlap_fracs": [round(float(v), 4) for v in overlap_fracs],
     }
 
 

@@ -16,16 +16,21 @@
        （体素级 Dice/IoU/精确率/召回率 + 病灶级检出 + 假阳性统计）；
     6. **报告**：``reports/eval_fold<k>.json`` 逐折、``reports/eval_summary.{json,md}`` 汇总。
 
-**报告口径（第 5 轮拍板，改前先读 ``docs/preprocess_notes.md`` 第三节）**：
+**报告口径（第 5 轮拍板，改前先读 ``docs/preprocess_notes.md`` 第三节「三·补」）**：
 
   * **主表用后处理之后的数字**（``clean``）；后处理**之前**（``raw``）的同一组指标一并写进 JSON，
     便于回答「删掉那些小块到底值多少 Dice / 召回」——但主表不并排两套，避免读者挑着看；
   * 一律给 **mean ± std 与逐例值**：肿瘤体积跨 3 个数量级（``data/splits.json`` 的
     ``tumor_volume_mm3`` 0.65–435 cm³），只看均值会被大病灶主导（fold 0 的 case 33 单独就能到
     0.76，而 57/59 长期 0）；
-  * 另报两条**与均值无关**的口径：**病灶级检出率**（逐 GT 病灶）与**仅肝脏病人的假阳性率**；
   * 汇总时区分 macro（逐例平均，与训练期早停同口径）与池化（所有体素合并后再算比率）——
-    两者在小病灶占比高时差别很大，一起给。
+    两者在小病灶占比高时差别很大，一起给；
+  * 病灶级给**两套**：原判据（``detection_rate``）与**覆盖质量**（``overlap_frac`` = 交集/GT 体素）。
+    ⚠️ 原判据里的「该 GT 病灶 >= ``eval.detect_min_mm3``（10 mm³）即算检出」在本数据集上**恒真**
+    （20 例含肿瘤病人的肿瘤最小 652 mm³）⇒ 那一列实测报 19/19，**没有区分度**；
+    报告会显式打 ``criterion_b_is_trivial`` 警告，并把覆盖比例分档表作为主口径。
+    逐例表另给 ``best_cover``（该例覆盖得最好的那个病灶的比例），与 Dice 并排即可区分
+    「没找到」（两者都低）与「找歪了/撒太大」（cover 高、Dice 低）。
 
 **5 例仅肝脏病人（32/34/38/41/47）**：它们不在任何折的验证集里（跨轮约束：只进训练集），
 所以它们的假阳性数字**只能**用一个具体权重跑一遍。本版统一用 fold 0 的权重（``--fp-ckpt`` 可换），
@@ -61,6 +66,7 @@ try:
     from src.metrics import (
         DEFAULT_DETECT_MIN_MM3,
         DEFAULT_SIZE_BINS,
+        OVERLAP_BINS,
         case_metrics,
         summarize,
         voxel_spacing,      # 定义在 src.postprocess，由 src.metrics 显式再导出（导入口径只有一处）
@@ -95,6 +101,7 @@ except ModuleNotFoundError:  # pragma: no cover - 兜底：把仓库根塞进 sy
     from src.metrics import (  # type: ignore
         DEFAULT_DETECT_MIN_MM3,
         DEFAULT_SIZE_BINS,
+        OVERLAP_BINS,
         case_metrics,
         summarize,
         voxel_spacing,
@@ -135,7 +142,7 @@ REPORT_SCHEMA = "ct-liver-tumor-eval/1"
 
 #: 逐例指标表的固定列（markdown 与 JSON 用同一份口径）
 CASE_COLUMNS = ["case", "gt_mm3", "dice", "iou", "prec", "recall",
-                "pred_mm3", "gt_lesions", "detected", "fp_mm3", "fp_lesions"]
+                "pred_mm3", "gt_lesions", "detected", "best_cover", "fp_mm3", "fp_lesions"]
 
 #: 浮点数的报告精度（JSON 里保留 6 位小数足够，避免报告充满无意义的尾数）
 ROUND = 6
@@ -437,6 +444,11 @@ def run_fold(*, cfg: dict, fold: int, ckpt_path, cache_dir, split_record: dict, 
             "case": int(case),
             "is_tumor": bool(is_tumor),
             "gt_mm3": round(gt_volume, 3),
+            # 该例**覆盖得最好**的那个 GT 病灶的比例（交集/GT）：与 Dice 并排就能区分
+            # 「没找到」（两者都低）与「找歪了/撒太大」（cover 高、Dice 低）
+            "best_cover": (max((float(item.get("overlap_frac", 0.0))
+                                for item in metrics["lesion_clean"].get("per_lesion", [])), default=None)
+                           if is_tumor else None),
             "run": ckpt_info["run"],
             "checkpoint": ckpt_info["path"],
             "fold": int(fold),
@@ -594,10 +606,26 @@ def assess_fold(records, *, fold: int, ckpt_info: dict, threshold: float, min_le
     lesion_now = assessment["lesion_clean"]
     if lesion_now.get("status") == "ok":
         bins = "；".join(f"{name}: {slot['n_detected']}/{slot['n_gt']}"
-                         for name, slot in lesion_now["by_size_bin"].items())
+                         for name, slot in lesion_now["by_size_bin"].items()) or "（无 GT 病灶）"
         LOGGER.info("病灶级检出（后处理之后）：%d/%d = %.3f（逐例平均 %.3f）；按体积分档 %s",
                     lesion_now["n_detected"], lesion_now["n_gt"], lesion_now["detection_rate"],
                     lesion_now["detection_rate_per_case_mean"], bins)
+        # 「与 GT 有重叠」「病灶 >= detect_min_mm3」这两条判据在当前数据尺度下可能恒真：
+        # 恒真时 detection_rate 一定是 1.000，必须把重叠比例分档一起打出来，否则这一列是噪声。
+        if lesion_now.get("criterion_b_is_trivial"):
+            LOGGER.warning("注意：%d/%d 个 GT 病灶都 >= detect_min_mm3=%.1f mm³ ⇒ 上面那个检出率"
+                           "**恒为 1.000、没有区分度**（模型一个体素都不预测也会是这个数）。"
+                           "请看下面的重叠比例分档与 n_covered。",
+                           lesion_now["n_gt_trivially_detected"], lesion_now["n_gt"],
+                           float(lesion_now.get("detect_min_mm3", 0.0)))
+        LOGGER.info("病灶覆盖质量（每病灶 交集/GT 体素；这才是有区分度的口径）：均值 %.3f 中位 %.3f；"
+                    "有重叠 %d/%d、覆盖 >=%.2f 的 %d/%d、>=%.2f 的 %d/%d",
+                    lesion_now["mean_overlap_frac"], lesion_now["median_overlap_frac"],
+                    lesion_now["n_hit_overlap"], lesion_now["n_gt"],
+                    float(lesion_now.get("cover_frac", 0.2)),
+                    lesion_now["n_covered"], lesion_now["n_gt"],
+                    float(lesion_now.get("cover_frac_strict", 0.5)),
+                    lesion_now["n_covered_strict"], lesion_now["n_gt"])
     LOGGER.info("后处理：删掉 %d 块 / %s mm³；逐例 Dice 平均变化 %+.5f（后处理 - 原始）",
                 assessment["postprocess"]["n_removed_total"],
                 assessment["postprocess"]["volume_removed_mm3"],
@@ -780,6 +808,9 @@ def build_summary(*, cfg, args, folds: list, fold_reports: list, skipped: list,
             "detection_rate": assessment["lesion_clean"].get("detection_rate", 0.0),
             "n_gt_lesions": assessment["lesion_clean"].get("n_gt", 0),
             "n_detected_lesions": assessment["lesion_clean"].get("n_detected", 0),
+            "n_covered": assessment["lesion_clean"].get("n_covered", 0),
+            "mean_overlap_frac": assessment["lesion_clean"].get("mean_overlap_frac", 0.0),
+            "criterion_b_is_trivial": bool(assessment["lesion_clean"].get("criterion_b_is_trivial")),
             "gt_volume_mm3": assessment["gt_volume_mm3"],
             "pred_volume_mm3": assessment["pred_volume_mm3_clean"],
             "sec_per_case": (round(float(assessment["infer_seconds"]) / max(1, assessment["n_cases"]), 2)),
@@ -811,6 +842,7 @@ def build_summary(*, cfg, args, folds: list, fold_reports: list, skipped: list,
                                                                  DEFAULT_DETECT_MIN_MM3)) or 0.0),
             "spacing": [float(v) for v in spacing],
             "size_bins": [str(name) for _, _, name in DEFAULT_SIZE_BINS],
+            "overlap_bins": [float(v) for v in OVERLAP_BINS],
             "z_context": int(data_config(cfg).get("z_context", 0) or 0),
             "target_hw": [int(v) for v in data_config(cfg).get("target_hw", [])],
             "save_pred": bool(args.save_pred),
@@ -873,15 +905,16 @@ def render_markdown(summary: dict) -> str:
     push("## 1. 逐折结果（后处理之后；macro = 逐例等权）")
     push("")
     push("| 折 | run | epoch | 病例 | Dice mean±std | Dice min/max | IoU | 精确率 | 召回率 "
-         "| 检出率 | 秒/例 |")
-    push("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+         "| 检出率 | 覆盖≥0.2 | 秒/例 |")
+    push("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for row in summary["folds"]:
         push(f"| {row['fold']} | `{row['run']}` | {row['epoch']} | {row['n_cases']} "
              f"| **{row['dice_mean']:.4f} ± {row['dice_std']:.4f}** "
              f"| {row['dice_min']:.4f} / {row['dice_max']:.4f} "
              f"| {row['iou_mean']:.4f} | {row['precision_mean']:.4f} | {row['recall_mean']:.4f} "
              f"| {row['n_detected_lesions']}/{row['n_gt_lesions']} "
-             f"({row['detection_rate']:.2f}) | {row['sec_per_case']:.2f} |")
+             f"| {row['n_covered']}/{row['n_gt_lesions']} "
+             f"| {row['sec_per_case']:.2f} |")
     if not summary["folds"]:
         push("| — | — | — | — | — | — | — | — | — | — | — |")
     push("")
@@ -904,31 +937,62 @@ def render_markdown(summary: dict) -> str:
          f"| {pooled['precision']:.4f} | {pooled['recall']:.4f} | 由大病灶主导 |")
     push("")
     if lesion.get("status") == "ok":
-        push(f"**病灶级检出（后处理之后，与 Dice 无关的另一条口径）**："
-             f"{lesion['n_detected']}/{lesion['n_gt']} = **{lesion['detection_rate']:.3f}**"
-             f"（逐例平均 {lesion['detection_rate_per_case_mean']:.3f}）；"
+        push(f"**病灶级检出（后处理之后）**：{lesion['n_detected']}/{lesion['n_gt']} = "
+             f"**{lesion['detection_rate']:.3f}**（逐例平均 {lesion['detection_rate_per_case_mean']:.3f}）；"
              f"漏检 {lesion['n_missed']} 个。"
              f"只看 ≥{settings['detect_min_mm3']} mm³ 的病灶："
              f"{lesion['n_detected_big']}/{lesion['n_gt_big']} = {lesion['detection_rate_big']:.3f}。")
+        if lesion.get("criterion_b_is_trivial"):
+            push("")
+            push(f"> ⚠️ **上面这个检出率当前没有区分度**：{lesion['n_gt_trivially_detected']}/"
+                 f"{lesion['n_gt']} 个 GT 病灶的体积都 ≥ `eval.detect_min_mm3`"
+                 f"（{settings['detect_min_mm3']} mm³）⇒ 「体积达标即算检出」这条判据恒真，"
+                 f"**模型一个体素都不预测也会报 {lesion['n_gt']}/{lesion['n_gt']}**。"
+                 f"请只看下面的重叠比例分档（第 2.2 节）与逐例 Dice。")
+        push("")
+        push(f"**病灶覆盖质量（每病灶 ``交集 / GT 病灶体素``，= 病灶级灵敏度）**："
+             f"均值 **{lesion['mean_overlap_frac']:.3f}**、中位 {lesion['median_overlap_frac']:.3f}；"
+             f"有任意重叠 {lesion['n_hit_overlap']}/{lesion['n_gt']}、"
+             f"覆盖 ≥{lesion.get('cover_frac', 0.2):.2f} 的 {lesion['n_covered']}/{lesion['n_gt']}、"
+             f"覆盖 ≥{lesion.get('cover_frac_strict', 0.5):.2f} 的 "
+             f"{lesion['n_covered_strict']}/{lesion['n_gt']}。")
     else:
         push(f"**病灶级检出**：{lesion.get('status')}")
     push("")
-    push("### 2.1 按病灶体积分档的检出率（后处理之后）")
+    push("### 2.1 按病灶体积分档（后处理之后）")
     push("")
-    push("| 体积档 (mm³) | GT 病灶 | 检出 | 检出率 |")
-    push("| --- | --- | --- | --- |")
+    push("| 体积档 (mm³) | GT 病灶 | 判据检出 | 检出率 | 有任意重叠 | 重叠率 |")
+    push("| --- | --- | --- | --- | --- | --- |")
     by_bin = lesion.get("by_size_bin") or {}
     for name in settings["size_bins"]:
         slot = by_bin.get(name)
         if slot:
-            push(f"| {name} | {slot['n_gt']} | {slot['n_detected']} | {slot['rate']:.3f} |")
+            push(f"| {name} | {slot['n_gt']} | {slot['n_detected']} | {slot['rate']:.3f} "
+                 f"| {slot['n_hit_overlap']} | {slot['overlap_rate']:.3f} |")
         else:
-            push(f"| {name} | 0 | 0 | — |")
+            push(f"| {name} | 0 | 0 | — | 0 | — |")
+    push("")
+    push("### 2.2 按病灶覆盖比例分档（判据恒真时**只看这张表**）")
+    push("")
+    push("| 覆盖比例 = 交集/GT | GT 病灶 | 占比 |")
+    push("| --- | --- | --- |")
+    grades = lesion.get("by_overlap_frac") or []
+    for grade in grades:
+        high = "1.0" if grade["high"] is None else f"{grade['high']:.2f}"
+        label = f"[{grade['low']:.2f}, {high})"
+        push(f"| {label} | {grade['n_lesions']} | {grade['rate']:.3f} |")
+    if not grades:
+        push("| — | 0 | — |")
+    push("")
+    push("> 解读：覆盖比例落在 `[0.00, 0.10)` 基本等于「模型撒的大片正好压到了一点」；"
+         "要到 `[0.50, 1.0)` 才算真的把病灶标出来了。"
+         "`mean_overlap_frac` 与逐例 Dice 一起看，才能区分「没找到」和「找歪了」。")
     push("")
     push("## 3. 逐例指标（后处理之后）")
     push("")
     rows = []
     for rec in summary["cases"]:
+        cover = rec.get("best_cover")
         rows.append({
             "case": rec["case"],
             "gt_mm3": rec["gt_mm3"] if rec["is_tumor"] else "仅肝脏",
@@ -939,13 +1003,16 @@ def render_markdown(summary: dict) -> str:
             "pred_mm3": rec["voxel_clean"]["pred_voxels"],
             "gt_lesions": rec["lesion_clean"]["n_gt"],
             "detected": rec["lesion_clean"]["n_detected"],
+            "best_cover": (None if cover is None else round(float(cover), 3)),
             "fp_mm3": round(float(rec["fp_clean"]["fp_mm3"]), 1),
             "fp_lesions": rec["fp_clean"]["n_lesions"],
         })
     push(format_kv_table(rows, CASE_COLUMNS))
     push("")
     push("> `pred_mm3` / `fp_mm3` 在 spacing=(1,1,1) 下与体素数相同；"
-         "`detected` 的分母 `gt_lesions` 是**该例的 GT 病灶数**（不是体素级的）。")
+         "`detected` 的分母 `gt_lesions` 是**该例的 GT 病灶数**（不是体素级的）；"
+         "`best_cover` = 该例**覆盖得最好的那个** GT 病灶的 `交集/GT`（有病灶时才给），"
+         "把它和 `dice` 并排看就能区分「没找到」（两者都低）与「找歪了/撒太大」（cover 高、dice 低）。")
     push("")
     push("## 4. 仅肝脏病人假阳性")
     push("")
@@ -985,9 +1052,14 @@ def render_markdown(summary: dict) -> str:
          f"| {aggregate['macro_clean']['recall']['mean']:.4f} |")
     lesion_raw = aggregate.get("lesion_raw") or {}
     if lesion_raw.get("status") == "ok" and lesion.get("status") == "ok":
-        push(f"| 病灶检出率 | {lesion_raw['detection_rate']:.3f} "
+        push(f"| 病灶检出率（判据） | {lesion_raw['detection_rate']:.3f} "
              f"({lesion_raw['n_detected']}/{lesion_raw['n_gt']}) "
              f"| {lesion['detection_rate']:.3f} ({lesion['n_detected']}/{lesion['n_gt']}) |")
+        push(f"| 病灶覆盖 ≥{lesion.get('cover_frac', 0.2):.2f}（有区分度） "
+             f"| {lesion_raw['n_covered']}/{lesion_raw['n_gt']} "
+             f"| {lesion['n_covered']}/{lesion['n_gt']} |")
+        push(f"| 平均覆盖比例 | {lesion_raw['mean_overlap_frac']:.3f} "
+             f"| {lesion['mean_overlap_frac']:.3f} |")
     push("")
     push("各折后处理明细见 `reports/eval_fold<k>.json` 的 `assessment.postprocess`"
          "（逐例删了几块、删掉多少 mm³ 见 `cases[].postprocess`）。")

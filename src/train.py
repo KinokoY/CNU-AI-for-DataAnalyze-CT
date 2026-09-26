@@ -588,6 +588,11 @@ def validate(model: nn.Module, cases, cache_dir, cfg: dict, device: torch.device
     或该 GT 病灶 >= ``eval.detect_min_mm3``），放进 ``lesion`` 字段。它**不参与**选 best / 早停
     （选优口径仍是 macro Dice，保持不变），只作为日志里的诊断项——小病灶长期 Dice 为 0 时，
     这一项能看出「是根本没检出，还是检出了但重叠太少」。
+
+    ⚠️ 上面那条判据在本数据集上**恒真**（20 例含肿瘤病人的肿瘤最小 652 mm³，全都 >= 10 mm³），
+    所以日志里的检出率实测会一直是满值；真正有区分度的是同一份 ``lesion`` 里的
+    ``n_covered`` / ``mean_overlap_frac``（``src.evaluate`` 的报告主口径），
+    逐例明细见 ``reports/eval_fold<k>.json``。
     """
     eval_cfg = (cfg or {}).get("eval") or {}
     model_cfg = (cfg or {}).get("model") or {}
