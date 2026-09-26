@@ -54,10 +54,13 @@
    `src.dataset.pad_offset_of` 是唯一口径。
 3. **`collate_samples` 是唯一 batch 契约**（别用 DataLoader 默认 collate：它会把 `orig_hw` 这类 tuple 列表转置）。
 4. **不要拿 batch 内阳性比例当损失好坏的判据**：真正的判据是训练 soft Dice 与 `val_dice_mean`。
-5. **训练不稳定（第 4 轮发现）**：同一份配置两次 12 轮短跑 best Dice 差 40 倍（0.0048 vs 0.1983）
-   ⇒ 单次短跑的绝对数值不能当结论，5 折必须报 mean±std 与逐例值。
+5. **轴序必须处处一致（第 4 轮最大的坑）**：`predict_volume` 的画布是 `(H,W,Z)`，
+   逐层写入的是 dataset 的 `[:, :, z]`（= nibabel 轴序），因此 `load_label_volume` **不能再转置前两维**。
+   旧版多转置一次，方形病例（512×512）形状相同 ⇒ **形状检查发现不了，Dice 静默接近 0**。
+   实测代价：修之前 fold 0 短跑 best 0.0048、修之后 0.1983（同一份损失/采样配置）。
+   ⇒ 改动读盘/拼卷/裁回任一环节后，都要用 `--debug` 的「GT 434721 体素」+ 逐例 Dice 复核。
 6. **小病灶系统性为 0**：fold 0 上 case 57（4 046 体素）/59（652）长期 0，case 33（434 721）能到 0.76
-   ⇒ 报告要按病灶大小分层看，别只看均值。
+   ⇒ 报告要按病灶大小分层看，别只看均值；单次短跑也不足以定论，5 折报 mean±std 与逐例值。
 7. **本地 `_selftest.py` 用的是假 torch**，比真库宽松（假 `Tensor` 有 `.array` / `astype()` 等私有接口）
    ⇒ `src/` 里"张量 → numpy"一律写 `np.asarray(张量)`；改完 `src/` 跑一次只读扫描
    `Select-String -Path src/*.py -Pattern '\.array\b|\.numpy\(\)'`。
